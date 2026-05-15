@@ -1,0 +1,5 @@
+2026-05-15 12:27:38,032 | INFO | URL inicial: https://tdn.totvs.com/display/tec/Application+Server
+2026-05-15 12:27:38,032 | INFO | Diretório de saída: output
+2026-05-15 12:27:38,032 | INFO | Iniciando crawl em https://tdn.totvs.com/display/tec/Application+Server
+2026-05-15 12:27:38,032 | INFO | Escopo: dominio=tdn.totvs.com | path_prefix=/display/tec/Application+Server/ | space=Application+Server
+2026-05-15 12:27:38,532 | INFO | Mapeando (1/∞, fila=0): https://tdn.totvs.com/display/tec/Application+Server
