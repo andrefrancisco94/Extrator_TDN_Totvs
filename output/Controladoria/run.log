@@ -1,0 +1,144 @@
+2026-05-25 17:46:14,909 | INFO | URL inicial: https://tdn.totvs.com/display/public/PROT/Controladoria+-+Protheus+12
+2026-05-25 17:46:14,912 | INFO | Diretorio de saida: C:\Users\andre.francisco\Desktop\GitHub (Repositorios)\Extrator_TDN_Totvs\output\Controladoria
+2026-05-25 17:46:14,914 | INFO | Iniciando crawl em https://tdn.totvs.com/display/public/PROT/Controladoria+-+Protheus+12
+2026-05-25 17:46:14,915 | INFO | Escopo: dominio=tdn.totvs.com | path_prefix=/display/public/PROT/ | space=PROT
+2026-05-25 17:46:14,916 | INFO | Orcamento por pagina: 120s total | 30s DOM | slow >= 60s
+2026-05-25 17:46:15,703 | INFO | Mapeando (1/infinito, fila=0): https://tdn.totvs.com/display/public/PROT/Controladoria+-+Protheus+12
+2026-05-25 17:46:16,686 | INFO | REST API: 5 filhos em https://tdn.totvs.com/display/public/PROT/Controladoria+-+Protheus+12
+2026-05-25 17:46:16,688 | INFO | Mapeando (2/infinito, fila=4): https://tdn.totvs.com/pages/viewpage.action?pageId=620766731
+2026-05-25 17:46:17,452 | INFO | REST API: 0 filhos em https://tdn.totvs.com/pages/viewpage.action?pageId=620766731
+2026-05-25 17:46:17,456 | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/pages/viewpage.action?pageId=620766731
+2026-05-25 17:46:17,459 | INFO | Mapeando (3/infinito, fila=3): https://tdn.totvs.com/display/public/PROT/Controladoria+-+Ativo+Fixo+-+Protheus+12
+2026-05-25 17:46:47,513 | ERROR | TIMEOUT no crawl apos 30.0s (limite 120s): https://tdn.totvs.com/display/public/PROT/Controladoria+-+Ativo+Fixo+-+Protheus+12
+2026-05-25 17:46:47,609 | INFO | Mapeando (4/infinito, fila=2): https://tdn.totvs.com/display/public/PROT/Controladoria+-+Contabilidade+Gerencial+-+Protheus+12
+2026-05-25 17:47:01,378 | INFO | REST API: 23 filhos em https://tdn.totvs.com/display/public/PROT/Controladoria+-+Contabilidade+Gerencial+-+Protheus+12
+2026-05-25 17:47:01,384 | INFO | Mapeando (5/infinito, fila=24): https://tdn.totvs.com/display/public/PROT/Controladoria+-+PCO+-+Protheus+12
+2026-05-25 17:47:07,752 | INFO | REST API: 12 filhos em https://tdn.totvs.com/display/public/PROT/Controladoria+-+PCO+-+Protheus+12
+2026-05-25 17:47:07,757 | INFO | Mapeando (6/infinito, fila=35): https://tdn.totvs.com/pages/viewpage.action?pageId=780029163
+2026-05-25 17:47:08,522 | INFO | REST API: 0 filhos em https://tdn.totvs.com/pages/viewpage.action?pageId=780029163
+2026-05-25 17:47:08,525 | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/pages/viewpage.action?pageId=780029163
+2026-05-25 17:47:08,529 | INFO | Mapeando (7/infinito, fila=34): https://tdn.totvs.com/pages/viewpage.action?pageId=312160875
+2026-05-25 17:47:09,300 | INFO | REST API: 18 filhos em https://tdn.totvs.com/pages/viewpage.action?pageId=312160875
+2026-05-25 17:47:09,303 | INFO | Mapeando (8/infinito, fila=51): https://tdn.totvs.com/display/public/PROT/Conceitos+-+Contabilidade+Gerencial+-+P12
+2026-05-25 17:47:10,553 | INFO | REST API: 45 filhos em https://tdn.totvs.com/display/public/PROT/Conceitos+-+Contabilidade+Gerencial+-+P12
+2026-05-25 17:47:10,559 | INFO | Mapeando (9/infinito, fila=95): https://tdn.totvs.com/pages/viewpage.action?pageId=525797795
+2026-05-25 17:47:11,722 | INFO | REST API: 68 filhos em https://tdn.totvs.com/pages/viewpage.action?pageId=525797795
+2026-05-25 17:47:11,731 | INFO | Mapeando (10/infinito, fila=162): https://tdn.totvs.com/display/public/PROT/Controle+de+dados+protegidos+-+Contabilidade+Gerencial+-+P12
+2026-05-25 17:47:12,552 | INFO | REST API: 0 filhos em https://tdn.totvs.com/display/public/PROT/Controle+de+dados+protegidos+-+Contabilidade+Gerencial+-+P12
+2026-05-25 17:47:12,556 | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/display/public/PROT/Controle+de+dados+protegidos+-+Contabilidade+Gerencial+-+P12
+2026-05-25 17:47:12,562 | INFO | Mapeando (11/infinito, fila=161): https://tdn.totvs.com/pages/viewpage.action?pageId=525797786
+2026-05-25 17:47:13,137 | INFO | REST API: 3 filhos em https://tdn.totvs.com/pages/viewpage.action?pageId=525797786
+2026-05-25 17:47:13,142 | INFO | Mapeando (12/infinito, fila=163): https://tdn.totvs.com/pages/viewpage.action?pageId=466323371
+2026-05-25 17:47:13,746 | INFO | REST API: 2 filhos em https://tdn.totvs.com/pages/viewpage.action?pageId=466323371
+2026-05-25 17:47:13,748 | INFO | Mapeando (13/infinito, fila=164): https://tdn.totvs.com/pages/viewpage.action?pageId=525021790
+2026-05-25 17:47:14,367 | INFO | REST API: 4 filhos em https://tdn.totvs.com/pages/viewpage.action?pageId=525021790
+2026-05-25 17:47:14,370 | INFO | Mapeando (14/infinito, fila=167): https://tdn.totvs.com/display/public/PROT/Pontos+de+Entrada+-+Contabilidade+Gerencial+-+P12
+2026-05-25 17:47:21,198 | INFO | REST API: 250 filhos em https://tdn.totvs.com/display/public/PROT/Pontos+de+Entrada+-+Contabilidade+Gerencial+-+P12
+2026-05-25 17:47:21,207 | INFO | Mapeando (15/infinito, fila=416): https://tdn.totvs.com/display/public/PROT/Localizaciones+-+Contabilidad+Gerencial+-+P12
+2026-05-25 17:47:21,921 | INFO | REST API: 32 filhos em https://tdn.totvs.com/display/public/PROT/Localizaciones+-+Contabilidad+Gerencial+-+P12
+2026-05-25 17:47:21,925 | INFO | Mapeando (16/infinito, fila=447): https://tdn.totvs.com/display/public/PROT/Smart+View+-+Contabilidade+Gerencial
+2026-05-25 17:47:23,370 | INFO | REST API: 63 filhos em https://tdn.totvs.com/display/public/PROT/Smart+View+-+Contabilidade+Gerencial
+2026-05-25 17:47:23,374 | INFO | Mapeando (17/infinito, fila=509): https://tdn.totvs.com/pages/viewpage.action?pageId=806762291
+2026-05-25 17:47:23,996 | INFO | REST API: 2 filhos em https://tdn.totvs.com/pages/viewpage.action?pageId=806762291
+2026-05-25 17:47:23,999 | INFO | Mapeando (18/infinito, fila=510): https://tdn.totvs.com/display/public/PROT/Ciclo+de+Vida+-+Contabilidade
+2026-05-25 17:47:24,617 | INFO | REST API: 2 filhos em https://tdn.totvs.com/display/public/PROT/Ciclo+de+Vida+-+Contabilidade
+2026-05-25 17:47:24,619 | INFO | Mapeando (19/infinito, fila=511): https://tdn.totvs.com/display/public/PROT/PE+CTB040GR
+2026-05-25 17:47:25,246 | INFO | REST API: 0 filhos em https://tdn.totvs.com/display/public/PROT/PE+CTB040GR
+2026-05-25 17:47:25,249 | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/display/public/PROT/PE+CTB040GR
+2026-05-25 17:47:25,254 | INFO | Mapeando (20/infinito, fila=510): https://tdn.totvs.com/display/public/PROT/PE+CT161TOK
+2026-05-25 17:47:25,961 | INFO | REST API: 0 filhos em https://tdn.totvs.com/display/public/PROT/PE+CT161TOK
+2026-05-25 17:47:25,965 | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/display/public/PROT/PE+CT161TOK
+2026-05-25 17:47:25,973 | INFO | Mapeando (21/infinito, fila=509): https://tdn.totvs.com/display/public/PROT/PE+CT220DOC
+2026-05-25 17:47:26,593 | INFO | REST API: 0 filhos em https://tdn.totvs.com/display/public/PROT/PE+CT220DOC
+2026-05-25 17:47:26,598 | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/display/public/PROT/PE+CT220DOC
+2026-05-25 17:47:26,603 | INFO | Mapeando (22/infinito, fila=508): https://tdn.totvs.com/display/public/PROT/PE+CONOUTR
+2026-05-25 17:47:27,393 | INFO | REST API: 0 filhos em https://tdn.totvs.com/display/public/PROT/PE+CONOUTR
+2026-05-25 17:47:27,395 | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/display/public/PROT/PE+CONOUTR
+2026-05-25 17:47:27,398 | INFO | Mapeando (23/infinito, fila=507): https://tdn.totvs.com/display/public/PROT/PE+CT160TOK
+2026-05-25 17:47:27,967 | INFO | REST API: 0 filhos em https://tdn.totvs.com/display/public/PROT/PE+CT160TOK
+2026-05-25 17:47:27,971 | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/display/public/PROT/PE+CT160TOK
+2026-05-25 17:47:27,976 | INFO | Mapeando (24/infinito, fila=506): https://tdn.totvs.com/display/public/PROT/PE+CT276RFB
+2026-05-25 17:47:28,532 | INFO | REST API: 0 filhos em https://tdn.totvs.com/display/public/PROT/PE+CT276RFB
+2026-05-25 17:47:28,537 | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/display/public/PROT/PE+CT276RFB
+2026-05-25 17:47:28,541 | INFO | Mapeando (25/infinito, fila=505): https://tdn.totvs.com/display/public/PROT/PE+CT130GRV
+2026-05-25 17:47:29,185 | INFO | REST API: 0 filhos em https://tdn.totvs.com/display/public/PROT/PE+CT130GRV
+2026-05-25 17:47:29,189 | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/display/public/PROT/PE+CT130GRV
+2026-05-25 17:47:29,194 | INFO | Mapeando (26/infinito, fila=504): https://tdn.totvs.com/display/public/PROT/PE+CTBSLDLP
+2026-05-25 17:47:29,769 | INFO | REST API: 0 filhos em https://tdn.totvs.com/display/public/PROT/PE+CTBSLDLP
+2026-05-25 17:47:29,772 | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/display/public/PROT/PE+CTBSLDLP
+2026-05-25 17:47:29,776 | INFO | Mapeando (27/infinito, fila=503): https://tdn.totvs.com/display/public/PROT/PE+CT101TOK
+2026-05-25 17:47:30,440 | INFO | REST API: 0 filhos em https://tdn.totvs.com/display/public/PROT/PE+CT101TOK
+2026-05-25 17:47:30,443 | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/display/public/PROT/PE+CT101TOK
+2026-05-25 17:47:30,447 | INFO | Mapeando (28/infinito, fila=502): https://tdn.totvs.com/pages/viewpage.action?pageId=939238501
+2026-05-25 17:47:31,048 | INFO | REST API: 0 filhos em https://tdn.totvs.com/pages/viewpage.action?pageId=939238501
+2026-05-25 17:47:31,052 | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/pages/viewpage.action?pageId=939238501
+2026-05-25 17:47:31,057 | INFO | Mapeando (29/infinito, fila=501): https://tdn.totvs.com/display/public/PROT/Smart+X+-+Contabilidade+Gerencial
+2026-05-25 17:47:31,812 | INFO | REST API: 37 filhos em https://tdn.totvs.com/display/public/PROT/Smart+X+-+Contabilidade+Gerencial
+2026-05-25 17:47:31,818 | INFO | Mapeando (30/infinito, fila=537): https://tdn.totvs.com/pages/viewpage.action?pageId=312175564
+2026-05-25 17:47:32,465 | INFO | REST API: 9 filhos em https://tdn.totvs.com/pages/viewpage.action?pageId=312175564
+2026-05-25 17:47:32,471 | INFO | Mapeando (31/infinito, fila=545): https://tdn.totvs.com/display/public/PROT/Conceitos+-+PCO+-+P12
+2026-05-25 17:47:33,007 | INFO | REST API: 6 filhos em https://tdn.totvs.com/display/public/PROT/Conceitos+-+PCO+-+P12
+2026-05-25 17:47:33,012 | INFO | Mapeando (32/infinito, fila=550): https://tdn.totvs.com/pages/viewpage.action?pageId=525797857
+2026-05-25 17:47:33,764 | INFO | REST API: 16 filhos em https://tdn.totvs.com/pages/viewpage.action?pageId=525797857
+2026-05-25 17:47:33,767 | INFO | Mapeando (33/infinito, fila=565): https://tdn.totvs.com/display/public/PROT/Controle+de+dados+protegidos+-+PCO+-+P12
+2026-05-25 17:47:34,591 | INFO | REST API: 0 filhos em https://tdn.totvs.com/display/public/PROT/Controle+de+dados+protegidos+-+PCO+-+P12
+2026-05-25 17:47:34,596 | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/display/public/PROT/Controle+de+dados+protegidos+-+PCO+-+P12
+2026-05-25 17:47:34,601 | INFO | Mapeando (34/infinito, fila=564): https://tdn.totvs.com/pages/viewpage.action?pageId=525797863
+2026-05-25 17:47:35,068 | INFO | REST API: 0 filhos em https://tdn.totvs.com/pages/viewpage.action?pageId=525797863
+2026-05-25 17:47:35,072 | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/pages/viewpage.action?pageId=525797863
+2026-05-25 17:47:35,078 | INFO | Mapeando (35/infinito, fila=563): https://tdn.totvs.com/pages/viewpage.action?pageId=525797869
+2026-05-25 17:47:35,606 | INFO | REST API: 3 filhos em https://tdn.totvs.com/pages/viewpage.action?pageId=525797869
+2026-05-25 17:47:35,611 | INFO | Mapeando (36/infinito, fila=565): https://tdn.totvs.com/display/public/PROT/Pontos+de+Entrada+-+PCO+-+P12
+2026-05-25 17:47:37,651 | INFO | REST API: 185 filhos em https://tdn.totvs.com/display/public/PROT/Pontos+de+Entrada+-+PCO+-+P12
+2026-05-25 17:47:37,661 | INFO | Mapeando (37/infinito, fila=749): https://tdn.totvs.com/pages/viewpage.action?pageId=793192635
+2026-05-25 17:47:38,455 | INFO | REST API: 3 filhos em https://tdn.totvs.com/pages/viewpage.action?pageId=793192635
+2026-05-25 17:47:38,460 | INFO | Mapeando (38/infinito, fila=751): https://tdn.totvs.com/pages/viewpage.action?pageId=806762332
+2026-05-25 17:47:39,066 | INFO | REST API: 2 filhos em https://tdn.totvs.com/pages/viewpage.action?pageId=806762332
+2026-05-25 17:47:39,071 | INFO | Mapeando (39/infinito, fila=752): https://tdn.totvs.com/display/public/PROT/Ciclo+de+Vida+-+PCO
+2026-05-25 17:47:39,975 | INFO | REST API: 1 filhos em https://tdn.totvs.com/display/public/PROT/Ciclo+de+Vida+-+PCO
+2026-05-25 17:47:39,978 | INFO | Mapeando (40/infinito, fila=752): https://tdn.totvs.com/display/public/PROT/PE+PCOA3105
+2026-05-25 17:47:40,628 | INFO | REST API: 0 filhos em https://tdn.totvs.com/display/public/PROT/PE+PCOA3105
+2026-05-25 17:47:40,631 | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/display/public/PROT/PE+PCOA3105
+2026-05-25 17:47:40,638 | INFO | Mapeando (41/infinito, fila=751): https://tdn.totvs.com/pages/viewpage.action?pageId=1062894457
+2026-05-25 17:47:41,145 | INFO | REST API: 4 filhos em https://tdn.totvs.com/pages/viewpage.action?pageId=1062894457
+2026-05-25 17:47:41,148 | INFO | Mapeando (42/infinito, fila=754): https://tdn.totvs.com/pages/viewpage.action?pageId=338374312
+2026-05-25 17:47:41,708 | INFO | REST API: 6 filhos em https://tdn.totvs.com/pages/viewpage.action?pageId=338374312
+2026-05-25 17:47:41,711 | INFO | Mapeando (43/infinito, fila=759): https://tdn.totvs.com/pages/viewpage.action?pageId=312160848
+2026-05-25 17:47:42,189 | INFO | REST API: 3 filhos em https://tdn.totvs.com/pages/viewpage.action?pageId=312160848
+2026-05-25 17:47:42,196 | INFO | Mapeando (44/infinito, fila=761): https://tdn.totvs.com/pages/viewpage.action?pageId=312160849
+2026-05-25 17:47:42,650 | INFO | REST API: 1 filhos em https://tdn.totvs.com/pages/viewpage.action?pageId=312160849
+2026-05-25 17:47:42,656 | INFO | Mapeando (45/infinito, fila=761): https://tdn.totvs.com/pages/viewpage.action?pageId=312160850
+2026-05-25 17:47:43,125 | INFO | REST API: 2 filhos em https://tdn.totvs.com/pages/viewpage.action?pageId=312160850
+2026-05-25 17:47:43,130 | INFO | Mapeando (46/infinito, fila=762): https://tdn.totvs.com/pages/viewpage.action?pageId=312160851
+2026-05-25 17:47:43,677 | INFO | REST API: 1 filhos em https://tdn.totvs.com/pages/viewpage.action?pageId=312160851
+2026-05-25 17:47:43,682 | INFO | Mapeando (47/infinito, fila=762): https://tdn.totvs.com/pages/viewpage.action?pageId=338379880
+2026-05-25 17:47:44,461 | INFO | REST API: 4 filhos em https://tdn.totvs.com/pages/viewpage.action?pageId=338379880
+2026-05-25 17:47:44,464 | INFO | Mapeando (48/infinito, fila=765): https://tdn.totvs.com/pages/viewpage.action?pageId=312160907
+2026-05-25 17:47:45,244 | INFO | REST API: 15 filhos em https://tdn.totvs.com/pages/viewpage.action?pageId=312160907
+2026-05-25 17:47:45,249 | INFO | Mapeando (49/infinito, fila=779): https://tdn.totvs.com/pages/viewpage.action?pageId=338379260
+2026-05-25 17:47:45,915 | INFO | REST API: 5 filhos em https://tdn.totvs.com/pages/viewpage.action?pageId=338379260
+2026-05-25 17:47:45,919 | INFO | Mapeando (50/infinito, fila=783): https://tdn.totvs.com/pages/viewpage.action?pageId=338381605
+2026-05-25 17:47:46,439 | INFO | REST API: 1 filhos em https://tdn.totvs.com/pages/viewpage.action?pageId=338381605
+2026-05-25 17:47:46,443 | INFO | Mapeando (51/infinito, fila=783): https://tdn.totvs.com/pages/viewpage.action?pageId=338382242
+2026-05-25 17:47:46,447 | INFO | Rotacionando pagina apos 50 URLs
+2026-05-25 17:47:47,429 | INFO | REST API: 5 filhos em https://tdn.totvs.com/pages/viewpage.action?pageId=338382242
+2026-05-25 17:47:47,432 | INFO | Mapeando (52/infinito, fila=787): https://tdn.totvs.com/pages/viewpage.action?pageId=338382244
+2026-05-25 17:47:48,038 | INFO | REST API: 4 filhos em https://tdn.totvs.com/pages/viewpage.action?pageId=338382244
+2026-05-25 17:47:48,043 | INFO | Mapeando (53/infinito, fila=790): https://tdn.totvs.com/pages/viewpage.action?pageId=338382247
+2026-05-25 17:47:48,573 | INFO | REST API: 8 filhos em https://tdn.totvs.com/pages/viewpage.action?pageId=338382247
+2026-05-25 17:47:48,578 | INFO | Mapeando (54/infinito, fila=797): https://tdn.totvs.com/pages/viewpage.action?pageId=338382253
+2026-05-25 17:47:49,198 | INFO | REST API: 15 filhos em https://tdn.totvs.com/pages/viewpage.action?pageId=338382253
+2026-05-25 17:47:49,204 | INFO | Mapeando (55/infinito, fila=811): https://tdn.totvs.com/pages/viewpage.action?pageId=630022553
+2026-05-25 17:47:50,125 | INFO | REST API: 0 filhos em https://tdn.totvs.com/pages/viewpage.action?pageId=630022553
+2026-05-25 17:47:50,129 | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/pages/viewpage.action?pageId=630022553
+2026-05-25 17:47:50,136 | INFO | Mapeando (56/infinito, fila=810): https://tdn.totvs.com/pages/viewpage.action?pageId=674549852
+2026-05-25 17:47:50,678 | INFO | REST API: 0 filhos em https://tdn.totvs.com/pages/viewpage.action?pageId=674549852
+2026-05-25 17:47:50,681 | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/pages/viewpage.action?pageId=674549852
+2026-05-25 17:47:50,687 | INFO | Mapeando (57/infinito, fila=809): https://tdn.totvs.com/pages/viewpage.action?pageId=780015567
+2026-05-25 17:47:51,347 | INFO | REST API: 0 filhos em https://tdn.totvs.com/pages/viewpage.action?pageId=780015567
+2026-05-25 17:47:51,350 | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/pages/viewpage.action?pageId=780015567
+2026-05-25 17:47:51,353 | INFO | Mapeando (58/infinito, fila=808): https://tdn.totvs.com/pages/viewpage.action?pageId=977835319
+2026-05-25 17:47:51,965 | INFO | REST API: 7 filhos em https://tdn.totvs.com/pages/viewpage.action?pageId=977835319
+2026-05-25 17:47:51,968 | INFO | Mapeando (59/infinito, fila=814): https://tdn.totvs.com/pages/viewpage.action?pageId=347451139
+2026-05-25 17:47:52,729 | INFO | REST API: 16 filhos em https://tdn.totvs.com/pages/viewpage.action?pageId=347451139
+2026-05-25 17:47:52,735 | INFO | Mapeando (60/infinito, fila=829): https://tdn.totvs.com/pages/viewpage.action?pageId=602625663

@@ -9,12 +9,27 @@ REM ============================================================
 net session >nul 2>&1
 if %errorlevel% neq 0 (
     echo Solicitando privilegios de administrador...
-    powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
+    powershell -NoProfile -Command "try { Start-Process -FilePath '%~f0' -Verb RunAs -ErrorAction Stop } catch { exit 1 }"
+    if errorlevel 1 (
+        echo.
+        echo [AVISO] Elevacao negada ou cancelada.
+        echo Este script precisa de privilegios de administrador para funcionar.
+        echo.
+        pause
+        exit /b 1
+    )
     exit /b
 )
 
 REM Quando elevado via UAC, o CWD vira system32. Forcar pasta do bat:
 cd /d "%~dp0"
+
+REM ============================================================
+REM  Setup do console: fonte Cascadia Mono, buffer p/ scroll, janela maior.
+REM ============================================================
+if exist "console_setup.ps1" (
+    powershell -NoProfile -ExecutionPolicy Bypass -File "console_setup.ps1" >nul 2>nul
+)
 
 cls
 echo.
@@ -139,18 +154,24 @@ echo.
 echo ============================================================
 echo   Menu Principal
 echo ============================================================
-echo   [1] Execucao rapida   (so URL, demais com padroes)
-echo   [2] Execucao avancada (configura todas as opcoes)
-echo   [3] Reinstalar dependencias (forcar refresh)
-echo   [4] Sair
+echo   [1] Execucao rapida    (so URL, resume automatico)
+echo   [2] Execucao avancada  (configura todas as opcoes)
+echo   [3] Verificar atualizacoes da TDN (--update: busca paginas novas)
+echo   [4] Regenerar todos os PDFs (--regenerate: refaz tudo)
+echo   [5] Reinstalar dependencias Python
+echo   [6] Reinstalar Chromium (use se der erro de ICU/launch)
+echo   [7] Sair
 echo ============================================================
 set "OPC="
-set /p "OPC=Escolha uma opcao [1-4]: "
+set /p "OPC=Escolha uma opcao [1-7]: "
 
 if "%OPC%"=="1" goto QUICK
 if "%OPC%"=="2" goto ADVANCED
-if "%OPC%"=="3" goto REINSTALL
-if "%OPC%"=="4" goto END
+if "%OPC%"=="3" goto UPDATE_MODE
+if "%OPC%"=="4" goto REGENERATE_MODE
+if "%OPC%"=="5" goto REINSTALL
+if "%OPC%"=="6" goto REINSTALL_CHROME
+if "%OPC%"=="7" goto END
 echo Opcao invalida.
 echo.
 goto MENU
@@ -161,6 +182,7 @@ echo.
 echo --- Execucao Rapida ---
 set "URL="
 set /p "URL=URL inicial da documentacao TDN: "
+if defined URL set "URL=%URL:"=%"
 if "%URL%"=="" (
     echo [ERRO] URL obrigatoria.
     echo.
@@ -171,10 +193,17 @@ echo Executando com:
 echo   URL          = %URL%
 echo   Saida        = output
 echo   Consolidado  = TDN_TOTVS_consolidado.pdf
-echo   Timeout      = 60s
+echo   Timeout      = 120s (2min por pagina)
+echo   Slow log     = paginas que demorarem 60s ou mais
 echo   Headless     = sim
 echo.
-"%VENV_PY%" -m src.main run "%URL%" --output-dir output --timeout-seconds 60 --headless
+"%VENV_PY%" -m src.main run "%URL%" --output-dir output --timeout-seconds 120 --slow-threshold-seconds 60 --headless
+set "EXITCODE=%errorlevel%"
+if not "%EXITCODE%"=="0" (
+    echo.
+    echo [ERRO] A execucao terminou com codigo %EXITCODE%. Veja a mensagem acima.
+    pause
+)
 goto AFTER_RUN
 
 REM ---------- Execucao avancada ----------
@@ -185,6 +214,7 @@ echo.
 
 set "URL="
 set /p "URL=URL inicial da documentacao TDN: "
+if defined URL set "URL=%URL:"=%"
 if "%URL%"=="" (
     echo [ERRO] URL obrigatoria.
     echo.
@@ -193,15 +223,35 @@ if "%URL%"=="" (
 
 set "OUTDIR=output"
 set /p "OUTDIR=Pasta de saida [output]: "
+if defined OUTDIR set "OUTDIR=%OUTDIR:"=%"
 if "%OUTDIR%"=="" set "OUTDIR=output"
 
 set "CONSOL=TDN_TOTVS_consolidado.pdf"
 set /p "CONSOL=Nome do PDF consolidado [TDN_TOTVS_consolidado.pdf]: "
+if defined CONSOL set "CONSOL=%CONSOL:"=%"
 if "%CONSOL%"=="" set "CONSOL=TDN_TOTVS_consolidado.pdf"
 
-set "TIMEOUT=60"
-set /p "TIMEOUT=Timeout por pagina em segundos [60]: "
-if "%TIMEOUT%"=="" set "TIMEOUT=60"
+set "TIMEOUT=120"
+set /p "TIMEOUT=Timeout por pagina em segundos [120]: "
+if defined TIMEOUT set "TIMEOUT=%TIMEOUT:"=%"
+if "%TIMEOUT%"=="" set "TIMEOUT=120"
+echo %TIMEOUT%| findstr /r "^[1-9][0-9]*$" >nul
+if errorlevel 1 (
+    echo [ERRO] Timeout deve ser inteiro positivo. Recebido: %TIMEOUT%
+    echo.
+    goto MENU
+)
+
+set "SLOW=60"
+set /p "SLOW=Limite para marcar como 'lenta' em segundos [60]: "
+if defined SLOW set "SLOW=%SLOW:"=%"
+if "%SLOW%"=="" set "SLOW=60"
+echo %SLOW%| findstr /r "^[1-9][0-9]*$" >nul
+if errorlevel 1 (
+    echo [ERRO] Slow threshold deve ser inteiro positivo. Recebido: %SLOW%
+    echo.
+    goto MENU
+)
 
 set "HEADLESS_OPT=--headless"
 set "HEADLESS_TXT=sim"
@@ -214,8 +264,17 @@ if /i "%HEAD%"=="n" (
 
 set "MAX="
 set /p "MAX=Limite de paginas (vazio = sem limite): "
+if defined MAX set "MAX=%MAX:"=%"
 set "MAX_OPT="
-if not "%MAX%"=="" set "MAX_OPT=--max-pages %MAX%"
+if not "%MAX%"=="" (
+    echo %MAX%| findstr /r "^[1-9][0-9]*$" >nul
+    if errorlevel 1 (
+        echo [ERRO] Max paginas deve ser inteiro positivo. Recebido: %MAX%
+        echo.
+        goto MENU
+    )
+    set "MAX_OPT=--max-pages %MAX%"
+)
 
 echo.
 echo Executando com:
@@ -223,6 +282,7 @@ echo   URL          = %URL%
 echo   Saida        = %OUTDIR%
 echo   Consolidado  = %CONSOL%
 echo   Timeout      = %TIMEOUT%s
+echo   Slow log     = %SLOW%s
 echo   Headless     = %HEADLESS_TXT%
 if "%MAX%"=="" (
     echo   Max paginas  = sem limite
@@ -231,13 +291,82 @@ if "%MAX%"=="" (
 )
 echo.
 
-"%VENV_PY%" -m src.main run "%URL%" --output-dir "%OUTDIR%" --consolidated-name "%CONSOL%" --timeout-seconds %TIMEOUT% %HEADLESS_OPT% %MAX_OPT%
+"%VENV_PY%" -m src.main run "%URL%" --output-dir "%OUTDIR%" --consolidated-name "%CONSOL%" --timeout-seconds %TIMEOUT% --slow-threshold-seconds %SLOW% %HEADLESS_OPT% %MAX_OPT%
+set "EXITCODE=%errorlevel%"
+if not "%EXITCODE%"=="0" (
+    echo.
+    echo [ERRO] A execucao terminou com codigo %EXITCODE%. Veja a mensagem acima.
+    pause
+)
+goto AFTER_RUN
+
+REM ---------- Verificar atualizacoes (--update) ----------
+:UPDATE_MODE
+echo.
+echo --- Verificar Atualizacoes da TDN ---
+echo Re-mapeia a arvore procurando paginas novas.
+echo PDFs ja gerados em runs anteriores serao reaproveitados.
+echo.
+set "URL="
+set /p "URL=URL inicial da documentacao TDN: "
+if defined URL set "URL=%URL:"=%"
+if "%URL%"=="" (
+    echo [ERRO] URL obrigatoria.
+    echo.
+    goto MENU
+)
+set "OUTDIR=output"
+set /p "OUTDIR=Pasta de saida [output]: "
+if defined OUTDIR set "OUTDIR=%OUTDIR:"=%"
+if "%OUTDIR%"=="" set "OUTDIR=output"
+echo.
+echo Executando em modo UPDATE...
+echo.
+"%VENV_PY%" -m src.main run "%URL%" --output-dir "%OUTDIR%" --timeout-seconds 120 --slow-threshold-seconds 60 --headless --update --yes
+set "EXITCODE=%errorlevel%"
+if not "%EXITCODE%"=="0" (
+    echo.
+    echo [ERRO] A execucao terminou com codigo %EXITCODE%. Veja a mensagem acima.
+    pause
+)
+goto AFTER_RUN
+
+REM ---------- Regenerar tudo (--regenerate) ----------
+:REGENERATE_MODE
+echo.
+echo --- Regenerar Todos os PDFs ---
+echo Re-mapeia a arvore E regenera TODOS os PDFs.
+echo Use isto quando suspeitar que paginas foram modificadas.
+echo Mantem o manifest.json para historico.
+echo.
+set "URL="
+set /p "URL=URL inicial da documentacao TDN: "
+if defined URL set "URL=%URL:"=%"
+if "%URL%"=="" (
+    echo [ERRO] URL obrigatoria.
+    echo.
+    goto MENU
+)
+set "OUTDIR=output"
+set /p "OUTDIR=Pasta de saida [output]: "
+if defined OUTDIR set "OUTDIR=%OUTDIR:"=%"
+if "%OUTDIR%"=="" set "OUTDIR=output"
+echo.
+echo Executando em modo REGENERATE (pode demorar - refaz todos os PDFs)...
+echo.
+"%VENV_PY%" -m src.main run "%URL%" --output-dir "%OUTDIR%" --timeout-seconds 120 --slow-threshold-seconds 60 --headless --regenerate --yes
+set "EXITCODE=%errorlevel%"
+if not "%EXITCODE%"=="0" (
+    echo.
+    echo [ERRO] A execucao terminou com codigo %EXITCODE%. Veja a mensagem acima.
+    pause
+)
 goto AFTER_RUN
 
 REM ---------- Reinstalar dependencias ----------
 :REINSTALL
 echo.
-echo --- Forcando reinstalacao das dependencias ---
+echo --- Forcando reinstalacao das dependencias Python ---
 if exist "%DEPS_MARKER%" del "%DEPS_MARKER%"
 "%VENV_PY%" -m pip install --upgrade pip
 "%VENV_PY%" -m pip install --upgrade -r requirements.txt
@@ -249,6 +378,23 @@ if errorlevel 1 (
 echo. > "%DEPS_MARKER%"
 echo.
 echo Dependencias reinstaladas.
+echo.
+goto MENU
+
+REM ---------- Reinstalar Chromium (corrige corrupcao) ----------
+:REINSTALL_CHROME
+echo.
+echo --- Forcando download limpo do Chromium ---
+echo Isso baixa o Chromium novamente (~150MB). Pode demorar.
+echo.
+"%VENV_PY%" -m playwright install --force chromium
+if errorlevel 1 (
+    echo [ERRO] Falha ao reinstalar o Chromium.
+    pause
+    goto MENU
+)
+echo.
+echo Chromium reinstalado com sucesso.
 echo.
 goto MENU
 

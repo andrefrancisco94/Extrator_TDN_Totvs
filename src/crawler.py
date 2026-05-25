@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import time
 from collections import deque
-from urllib.parse import urljoin
+from dataclasses import dataclass, field
+from urllib.parse import urljoin, urlparse
 
 from playwright.async_api import Error as PlaywrightError
-from playwright.async_api import Page, async_playwright
+from playwright.async_api import Page
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import async_playwright
 from rich.progress import (
     BarColumn,
     Progress,
@@ -14,12 +18,29 @@ from rich.progress import (
 )
 from tenacity import (
     retry,
-    retry_if_exception_type,
+    retry_if_exception,
     stop_after_attempt,
     wait_exponential,
 )
 
-from .utils import CrawlScope, canonicalize_url, get_console, is_url_in_scope, parse_scope
+from .utils import (
+    Checkpoint,
+    CrawlScope,
+    SlowPageRecord,
+    canonicalize_url,
+    get_console,
+    is_url_in_scope,
+    parse_scope,
+)
+
+_DISPLAY_PREFIX = "/display/"
+_DISPLAY_PUBLIC_PREFIX = "/display/public/"
+
+# Maximo de paginas/pagina REST API page (Confluence default 25, max 200)
+_API_PAGE_SIZE = 200
+# Hard cap de paginacao REST API (200 * 20 = 4000 filhos diretos, ja muito alem do real)
+_API_MAX_PAGES = 20
+_API_TIMEOUT_MS = 30_000
 
 _TREE_ROOTS = (
     ".plugin_pagetree",
@@ -39,12 +60,183 @@ _LOAD_SELECTORS = (
     "#main-content",
 )
 
+_PAGE_ROTATION_INTERVAL = 50
 
-def _selector_timeouts(timeout_ms: int) -> tuple[int, int]:
-    """Calcula timeouts dos seletores escalando com o timeout principal."""
-    sidebar_load = max(8_000, timeout_ms // 4)
-    tree_loading = max(5_000, timeout_ms // 6)
-    return sidebar_load, tree_loading
+# Maximo de tentativas de relancar o browser antes de abortar o pipeline
+_MAX_BROWSER_LAUNCH_ATTEMPTS = 3
+
+# Se mais de X% das paginas crawladas deram timeout, nao marca crawl_complete
+# (evita resume futuro com lista parcial confundida com completa).
+_CRAWL_TIMEOUT_RATIO_THRESHOLD = 0.20
+
+
+@dataclass
+class CrawlState:
+    """Estado mutavel do crawl (BFS + slow records)."""
+    ordered_urls: list[str] = field(default_factory=list)
+    slow_records: list[SlowPageRecord] = field(default_factory=list)
+    seen: set[str] = field(default_factory=set)
+    queued: set[str] = field(default_factory=set)
+    queue: deque = field(default_factory=deque)
+
+
+@dataclass
+class CrawlConfig:
+    timeout_ms: int
+    dom_budget_ms: int
+    slow_threshold_seconds: float
+    max_pages: int | None
+    headless: bool
+
+
+@dataclass
+class BrowserSession:
+    browser: object = None
+    context: object = None
+    page: Page | None = None
+
+
+def _is_retryable(exc: BaseException) -> bool:
+    if isinstance(exc, PlaywrightTimeoutError):
+        return False
+    return isinstance(exc, PlaywrightError)
+
+
+async def _new_page(context, timeout_ms: int) -> Page:
+    page = await context.new_page()
+    page.set_default_timeout(timeout_ms)
+    return page
+
+
+async def _safe_close_page(page: Page | None) -> None:
+    if page is None:
+        return
+    try:
+        if not page.is_closed():
+            await page.close()
+    except PlaywrightError:
+        pass
+
+
+def _match_start_url_format(url: str, scope: CrawlScope) -> str:
+    """Ajusta /display/ vs /display/public/ para bater com formato do start URL.
+
+    REST API retorna webui sempre como /display/X/... sem /public/. Se o
+    escopo veio de /display/public/X/..., normaliza pra ter /public/ tambem.
+    """
+    if _DISPLAY_PUBLIC_PREFIX in scope.path_prefix:
+        if _DISPLAY_PREFIX in url and _DISPLAY_PUBLIC_PREFIX not in url:
+            return url.replace(_DISPLAY_PREFIX, _DISPLAY_PUBLIC_PREFIX, 1)
+    elif _DISPLAY_PUBLIC_PREFIX in url:
+        return url.replace(_DISPLAY_PUBLIC_PREFIX, _DISPLAY_PREFIX, 1)
+    return url
+
+
+async def _get_page_id(page: Page) -> str | None:
+    """Le meta ajs-page-id da pagina (Confluence Server/DC)."""
+    try:
+        return await page.evaluate(
+            "() => document.querySelector('meta[name=\"ajs-page-id\"]')?.getAttribute('content') || null"
+        )
+    except PlaywrightError:
+        return None
+
+
+async def _fetch_api_page(
+    page: Page, api_url: str, logger,
+) -> list[dict] | None:
+    """Faz uma chamada REST API e retorna lista de results, ou None em erro."""
+    try:
+        response = await page.request.get(api_url, timeout=_API_TIMEOUT_MS)
+    except PlaywrightError as exc:
+        logger.debug("REST API falhou em %s: %s", api_url, exc)
+        return None
+    if not response.ok:
+        logger.debug("REST API status %s em %s", response.status, api_url)
+        return None
+    try:
+        data = await response.json()
+    except (PlaywrightError, ValueError) as exc:
+        logger.debug("REST API JSON invalido: %s", exc)
+        return None
+    if not isinstance(data, dict):
+        return None
+    results = data.get("results", []) or []
+    return results if isinstance(results, list) else []
+
+
+def _extract_urls_from_results(
+    results: list[dict], base: str, scope: CrawlScope,
+) -> list[str]:
+    urls: list[str] = []
+    for r in results:
+        link = (r.get("_links") or {}).get("webui", "")
+        if link:
+            urls.append(_match_start_url_format(base + link, scope))
+    return urls
+
+
+async def _get_children_via_api(
+    page: Page,
+    current_url: str,
+    scope: CrawlScope,
+    logger,
+) -> list[str] | None:
+    """Tenta buscar paginas filhas via Confluence REST API.
+
+    Endpoint padrao: /rest/api/content/{pageId}/child/page
+    Mais confiavel que parsing da sidebar (que carrega lazy via AJAX).
+    Retorna list[str] (pode ser vazia) ou None se a API nao pode ser usada.
+    """
+    page_id = await _get_page_id(page)
+    if not page_id:
+        logger.debug("Sem ajs-page-id em %s; pulando REST API", current_url)
+        return None
+
+    parsed = urlparse(current_url)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    urls: list[str] = []
+    start = 0
+
+    for _ in range(_API_MAX_PAGES):
+        api_url = (
+            f"{base}/rest/api/content/{page_id}/child/page"
+            f"?limit={_API_PAGE_SIZE}&start={start}"
+        )
+        results = await _fetch_api_page(page, api_url, logger)
+        if results is None:
+            return None
+        urls.extend(_extract_urls_from_results(results, base, scope))
+        if len(results) < _API_PAGE_SIZE:
+            break
+        start += _API_PAGE_SIZE
+
+    return urls
+
+
+async def _try_expand_current_node(page: Page) -> None:
+    """Click no toggle do no atual na sidebar (fallback para REST API)."""
+    try:
+        await page.evaluate(
+            """() => {
+                const pageId = document.querySelector(
+                    'meta[name="ajs-page-id"]'
+                )?.content;
+                if (!pageId) return;
+                const el = document.querySelector(`[data-page-id="${pageId}"]`);
+                if (!el) return;
+                const li = el.closest('li');
+                if (!li) return;
+                if (li.querySelector('ul li')) return;  // ja tem filhos
+                const toggle = li.querySelector(
+                    '.plugin_pagetree_childtoggle, .icon-page-tree-expand, '
+                    + '.expand-control-icon, button[aria-expanded="false"]'
+                );
+                if (toggle) toggle.click();
+            }"""
+        )
+    except PlaywrightError:
+        pass
 
 
 async def _extract_child_links(page: Page, current_url: str) -> list[str]:
@@ -148,126 +340,392 @@ async def _extract_child_links(page: Page, current_url: str) -> list[str]:
 
 
 @retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=2, max=10),
-    retry=retry_if_exception_type(PlaywrightError),
+    stop=stop_after_attempt(2),
+    wait=wait_exponential(multiplier=1, min=2, max=8),
+    retry=retry_if_exception(_is_retryable),
     reraise=True,
 )
-async def _goto_with_retry(page: Page, url: str, timeout_ms: int) -> None:
-    await page.goto(url, wait_until="load", timeout=timeout_ms)
+async def _goto_dom_ready(page: Page, url: str, timeout_ms: int) -> None:
+    await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+
+
+async def _launch_browser_session(
+    playwright, headless: bool, timeout_ms: int, logger=None,
+) -> BrowserSession:
+    """Lança browser com retry; aborta se falhar repetidamente (chromium ausente, etc)."""
+    last_error: Exception | None = None
+    for attempt in range(1, _MAX_BROWSER_LAUNCH_ATTEMPTS + 1):
+        try:
+            browser = await playwright.chromium.launch(
+                headless=headless, channel="chromium",
+            )
+            context = await browser.new_context()
+            page = await _new_page(context, timeout_ms)
+            return BrowserSession(browser=browser, context=context, page=page)
+        except PlaywrightError as exc:
+            last_error = exc
+            if logger is not None:
+                logger.warning(
+                    "Falha ao lancar browser (tentativa %d/%d): %s",
+                    attempt, _MAX_BROWSER_LAUNCH_ATTEMPTS, exc,
+                )
+    raise RuntimeError(
+        "Nao foi possivel iniciar o navegador apos "
+        f"{_MAX_BROWSER_LAUNCH_ATTEMPTS} tentativas. "
+        "Verifique se o Chromium esta instalado (rode 'playwright install chromium' "
+        f"ou use a opcao [4] do menu). Ultimo erro: {last_error}"
+    )
+
+
+def _is_browser_alive(session: BrowserSession) -> bool:
+    """Wrapper safe para is_connected (pode lancar se processo ja morreu)."""
+    if session.browser is None:
+        return False
+    try:
+        return bool(session.browser.is_connected())
+    except (PlaywrightError, Exception):  # noqa: BLE001 - defensive
+        return False
+
+
+async def _teardown_session(session: BrowserSession, logger) -> None:
+    if session.context is not None:
+        try:
+            await session.context.close()
+        except PlaywrightError as exc:
+            logger.warning("Falha ao fechar context: %s", exc)
+    if session.browser is not None:
+        try:
+            await session.browser.close()
+        except PlaywrightError as exc:
+            logger.warning("Falha ao fechar browser: %s", exc)
+
+
+async def _ensure_browser_alive(
+    session: BrowserSession, playwright, cfg: CrawlConfig, logger,
+) -> None:
+    if _is_browser_alive(session):
+        return
+    logger.warning("Browser desconectou. Relancando...")
+    try:
+        if session.browser is not None:
+            await session.browser.close()
+    except PlaywrightError:
+        pass
+    new_session = await _launch_browser_session(
+        playwright, cfg.headless, cfg.timeout_ms, logger,
+    )
+    session.browser = new_session.browser
+    session.context = new_session.context
+    session.page = new_session.page
 
 
 async def crawl_confluence_tree(
     start_url: str,
+    checkpoint: Checkpoint,
     logger,
     headless: bool = True,
-    timeout_ms: int = 45_000,
+    timeout_ms: int = 120_000,
     max_pages: int | None = None,
-) -> list[str]:
-    """BFS pela árvore de páginas do Confluence."""
+    slow_threshold_seconds: float = 60.0,
+    force_recrawl: bool = False,
+) -> tuple[list[str], list[SlowPageRecord]]:
+    """BFS pela arvore de paginas do Confluence.
+
+    Se force_recrawl=False e o checkpoint indicar crawl ja completo, retorna
+    a lista cacheada (modo resume). Com force_recrawl=True, sempre re-mapeia
+    para detectar novas paginas.
+    """
     start_canonical = canonicalize_url(start_url)
     scope: CrawlScope = parse_scope(start_canonical)
-    sidebar_timeout, tree_timeout = _selector_timeouts(timeout_ms)
+    # DOM tem ate metade do orcamento, capado em 60s (algumas paginas TDN
+    # com muitos macros demoram mais que 30s soh pra renderizar o DOM).
+    dom_budget_ms = min(60_000, timeout_ms // 2)
+
+    cfg = CrawlConfig(
+        timeout_ms=timeout_ms, dom_budget_ms=dom_budget_ms,
+        slow_threshold_seconds=slow_threshold_seconds,
+        max_pages=max_pages, headless=headless,
+    )
+
+    # Resume: se crawl ja completou e nao foi pedido recrawl, reutiliza.
+    if (
+        not force_recrawl
+        and checkpoint.manifest.crawl_complete
+        and checkpoint.manifest.mapped_urls
+    ):
+        logger.info(
+            "Resume: reutilizando crawl anterior com %d URLs mapeadas.",
+            len(checkpoint.manifest.mapped_urls),
+        )
+        return list(checkpoint.manifest.mapped_urls), []
+
+    if force_recrawl and checkpoint.manifest.mapped_urls:
+        logger.info(
+            "Re-crawl forcado: ignorando %d URLs cacheadas do run anterior.",
+            len(checkpoint.manifest.mapped_urls),
+        )
 
     logger.info("Iniciando crawl em %s", start_canonical)
     logger.info(
         "Escopo: dominio=%s | path_prefix=%s | space=%s",
-        scope.domain,
-        scope.path_prefix,
-        scope.space_key,
+        scope.domain, scope.path_prefix, scope.space_key,
+    )
+    logger.info(
+        "Orcamento por pagina: %.0fs total | %.0fs DOM | slow >= %.0fs",
+        timeout_ms / 1000, dom_budget_ms / 1000, slow_threshold_seconds,
     )
 
-    ordered_urls: list[str] = []
-    seen: set[str] = set()
-    queued: set[str] = {start_canonical}
-    queue: deque[str] = deque([start_canonical])
+    state = CrawlState(queue=deque([start_canonical]), queued={start_canonical})
     console = get_console()
 
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(headless=headless)
-        context = await browser.new_context()
-        page = await context.new_page()
-        page.set_default_timeout(timeout_ms)
+        session = await _launch_browser_session(playwright, headless, timeout_ms, logger)
+        try:
+            await _run_crawl_loop(session, state, scope, playwright, cfg, logger, console)
+            await _safe_close_page(session.page)
+        finally:
+            await _teardown_session(session, logger)
 
-        progress = Progress(
-            SpinnerColumn(),
-            TextColumn("[bold cyan]{task.description}"),
-            BarColumn(bar_width=None),
-            TextColumn("{task.completed} mapeada(s) | fila: {task.fields[queue]}"),
-            TimeElapsedColumn(),
-            console=console,
-            transient=False,
+    # So marca crawl completo se a quantidade de timeouts/falhas estiver dentro do
+    # razoavel. Senao, o resume futuro herdaria uma lista "completa" mas furada.
+    timeout_count = sum(
+        1 for r in state.slow_records if r.phase.endswith("-timeout")
+    )
+    timeout_ratio = (
+        timeout_count / max(1, len(state.ordered_urls))
+    )
+    if state.ordered_urls and timeout_ratio < _CRAWL_TIMEOUT_RATIO_THRESHOLD:
+        checkpoint.record_crawl_complete(state.ordered_urls, max_pages=max_pages)
+    else:
+        logger.warning(
+            "Crawl NAO marcado como completo: %d/%d (%.0f%%) URLs deram timeout. "
+            "Proxima execucao re-mapeara para evitar resume com dados parciais.",
+            timeout_count, len(state.ordered_urls), timeout_ratio * 100,
         )
+        # Salva mesmo assim para preservar exported em paginas que funcionaram
+        checkpoint.manifest.mapped_urls = list(state.ordered_urls)
+        checkpoint.manifest.crawl_max_pages = max_pages
+        checkpoint.save()
 
-        with progress:
-            task = progress.add_task("Mapeando árvore...", total=None, queue=0)
+    logger.info(
+        "Crawl finalizado: %s pagina(s) mapeada(s), %s lenta(s).",
+        len(state.ordered_urls), len(state.slow_records),
+    )
+    return state.ordered_urls, state.slow_records
 
-            while queue:
-                current = queue.popleft()
-                if current in seen:
-                    continue
 
-                seen.add(current)
-                ordered_urls.append(current)
-                short = current if len(current) <= 60 else current[:57] + "..."
-                progress.update(
-                    task,
-                    advance=1,
-                    queue=len(queue),
-                    description=f"Mapeando: {short}",
-                )
+async def _run_crawl_loop(
+    session: BrowserSession,
+    state: CrawlState,
+    scope: CrawlScope,
+    playwright,
+    cfg: CrawlConfig,
+    logger,
+    console,
+) -> None:
+    progress = Progress(
+        SpinnerColumn(),
+        TextColumn("[bold cyan]{task.description}"),
+        BarColumn(bar_width=None),
+        TextColumn("{task.completed} mapeada(s) | fila: {task.fields[queue]}"),
+        TimeElapsedColumn(),
+        console=console,
+        transient=False,
+    )
 
-                logger.info(
-                    "Mapeando (%s/%s, fila=%s): %s",
-                    len(ordered_urls),
-                    max_pages or "∞",
-                    len(queue),
-                    current,
-                )
+    with progress:
+        task = progress.add_task("Mapeando arvore...", total=None, queue=0)
+        pages_processed = 0
 
-                if max_pages and len(ordered_urls) >= max_pages:
-                    logger.warning("Limite max_pages=%s atingido.", max_pages)
-                    break
+        while state.queue:
+            current = state.queue.popleft()
+            if current in state.seen:
+                continue
 
-                try:
-                    await _goto_with_retry(page, current, timeout_ms)
+            state.seen.add(current)
+            state.ordered_urls.append(current)
+            short = current if len(current) <= 60 else current[:57] + "..."
+            progress.update(
+                task, advance=1, queue=len(state.queue),
+                description=f"Mapeando: {short}",
+            )
+            logger.info(
+                "Mapeando (%s/%s, fila=%s): %s",
+                len(state.ordered_urls), cfg.max_pages or "infinito",
+                len(state.queue), current,
+            )
 
-                    load_sel = ",".join(_LOAD_SELECTORS)
-                    try:
-                        await page.wait_for_selector(load_sel, timeout=sidebar_timeout)
-                    except PlaywrightError:
-                        pass
+            if cfg.max_pages and len(state.ordered_urls) >= cfg.max_pages:
+                logger.warning("Limite max_pages=%s atingido.", cfg.max_pages)
+                break
 
-                    try:
-                        await page.wait_for_selector(
-                            ".plugin_pagetree_loading",
-                            state="detached",
-                            timeout=tree_timeout,
-                        )
-                    except PlaywrightError:
-                        pass
-                    await page.wait_for_timeout(800)
+            await _ensure_browser_alive(session, playwright, cfg, logger)
+            await _maybe_rotate_page(session, pages_processed, cfg, logger)
 
-                    raw_hrefs = await _extract_child_links(page, current)
+            page_start = time.monotonic()
+            session.page = await _crawl_one(
+                session.page, session.context, current, state, scope, cfg,
+                page_start, logger,
+            )
+            progress.update(task, queue=len(state.queue))
+            pages_processed += 1
 
-                    for href in raw_hrefs:
-                        if not href or href == "#" or href.lower().startswith("javascript:"):
-                            continue
-                        absolute = canonicalize_url(urljoin(current, href))
-                        if absolute in seen or absolute in queued:
-                            continue
-                        if not is_url_in_scope(absolute, scope):
-                            continue
-                        queued.add(absolute)
-                        queue.append(absolute)
 
-                    progress.update(task, queue=len(queue))
+async def _maybe_rotate_page(
+    session: BrowserSession, pages_processed: int, cfg: CrawlConfig, logger,
+) -> None:
+    if pages_processed == 0 or pages_processed % _PAGE_ROTATION_INTERVAL != 0:
+        return
+    logger.info("Rotacionando pagina apos %s URLs", pages_processed)
+    await _safe_close_page(session.page)
+    session.page = await _new_page(session.context, cfg.timeout_ms)
 
-                except Exception as exc:
-                    logger.error("Falha em %s: %s", current, exc)
 
-        await context.close()
-        await browser.close()
+async def _crawl_one(
+    page: Page,
+    context,
+    current: str,
+    state: CrawlState,
+    scope: CrawlScope,
+    cfg: CrawlConfig,
+    page_start: float,
+    logger,
+) -> Page:
+    """Processa uma URL no crawl. Retorna a page (possivelmente recriada)."""
+    try:
+        await _goto_dom_ready(page, current, cfg.dom_budget_ms)
 
-    logger.info("Crawl finalizado: %s página(s).", len(ordered_urls))
-    return ordered_urls
+        # Estrategia primaria: REST API do Confluence (mais confiavel).
+        raw_hrefs = await _get_children_via_api(page, current, scope, logger)
+
+        if raw_hrefs is not None:
+            logger.info("REST API: %d filhos em %s", len(raw_hrefs), current)
+        else:
+            # Fallback: aguarda sidebar carregar e extrai via DOM.
+            logger.debug("REST API indisponivel, usando fallback DOM em %s", current)
+            await _wait_for_sidebar(page, page_start, cfg)
+            try:
+                raw_hrefs = await _extract_child_links(page, current)
+            except PlaywrightError as exc:
+                logger.warning("Falha ao extrair links em %s: %s", current, exc)
+                raw_hrefs = []
+
+        # page.evaluate pode retornar None em casos limite — normaliza
+        if raw_hrefs is None or not isinstance(raw_hrefs, list):
+            raw_hrefs = []
+
+        if not raw_hrefs:
+            logger.info("Nenhum link filho encontrado em %s", current)
+
+        _enqueue_new_links(raw_hrefs, current, state, scope)
+
+        elapsed_total = time.monotonic() - page_start
+        if elapsed_total >= cfg.slow_threshold_seconds:
+            state.slow_records.append(
+                SlowPageRecord(url=current, elapsed_seconds=elapsed_total, phase="crawl")
+            )
+            logger.warning("Pagina lenta no crawl (%.1fs): %s", elapsed_total, current)
+
+        return page
+
+    except PlaywrightTimeoutError:
+        elapsed = time.monotonic() - page_start
+        logger.error(
+            "TIMEOUT no crawl apos %.1fs (limite %.0fs): %s",
+            elapsed, cfg.timeout_ms / 1000, current,
+        )
+        state.slow_records.append(
+            SlowPageRecord(url=current, elapsed_seconds=elapsed, phase="crawl-timeout")
+        )
+        await _safe_close_page(page)
+        return await _new_page(context, cfg.timeout_ms)
+
+    except PlaywrightError as exc:
+        logger.error("Falha de Playwright no crawl em %s: %s", current, exc)
+        await _safe_close_page(page)
+        return await _new_page(context, cfg.timeout_ms)
+
+    except Exception:  # noqa: BLE001
+        logger.exception("Erro inesperado no crawl em %s", current)
+        await _safe_close_page(page)
+        return await _new_page(context, cfg.timeout_ms)
+
+
+async def _wait_for_sidebar(page: Page, page_start: float, cfg: CrawlConfig) -> None:
+    """Aguarda sidebar carregar de fato: tree com links + AJAX done + node expandido."""
+    elapsed_ms = (time.monotonic() - page_start) * 1000
+    remaining_ms = max(5_000, int(cfg.timeout_ms - elapsed_ms))
+
+    # 1) Espera que a arvore tenha PELO MENOS 1 link (nao apenas o container vazio).
+    #    O default selector `#main-content` retornava imediato; aqui pedimos
+    #    explicitamente um link dentro do pagetree.
+    try:
+        await page.wait_for_function(
+            """() => {
+                const trees = document.querySelectorAll(
+                    '.plugin_pagetree, .ia-splitter-left, #sidebar, #page-tree'
+                );
+                for (const t of trees) {
+                    if (t.querySelector('a[href]')) return true;
+                }
+                return document.querySelector('#main-content') !== null;
+            }""",
+            timeout=min(remaining_ms, 20_000),
+        )
+    except PlaywrightError:
+        pass
+
+    # 2) Espera o spinner AJAX do pagetree desaparecer.
+    elapsed_ms = (time.monotonic() - page_start) * 1000
+    remaining_ms = max(5_000, int(cfg.timeout_ms - elapsed_ms))
+    try:
+        await page.wait_for_selector(
+            ".plugin_pagetree_loading", state="detached",
+            timeout=min(remaining_ms, 10_000),
+        )
+    except PlaywrightError:
+        pass
+
+    # 3) Tenta forcar expansao do no atual.
+    await _try_expand_current_node(page)
+
+    # 4) Espera o no atual ter filhos OU confirmar que nao tem (loading se foi).
+    try:
+        await page.wait_for_function(
+            """() => {
+                const pageId = document.querySelector(
+                    'meta[name="ajs-page-id"]'
+                )?.content;
+                if (!pageId) return true;
+                const el = document.querySelector(`[data-page-id="${pageId}"]`);
+                if (!el) return true;
+                const li = el.closest('li');
+                if (!li) return true;
+                if (li.querySelector('.plugin_pagetree_loading')) return false;
+                return true;
+            }""",
+            timeout=10_000,
+        )
+    except PlaywrightError:
+        pass
+
+    # 5) Margem para AJAX dos filhos.
+    await page.wait_for_timeout(1_500)
+
+
+def _enqueue_new_links(
+    raw_hrefs: list[str],
+    current: str,
+    state: CrawlState,
+    scope: CrawlScope,
+) -> None:
+    for href in raw_hrefs:
+        if not href or href == "#" or href.lower().startswith("javascript:"):
+            continue
+        absolute = canonicalize_url(urljoin(current, href))
+        if absolute in state.seen or absolute in state.queued:
+            continue
+        if not is_url_in_scope(absolute, scope):
+            continue
+        state.queued.add(absolute)
+        state.queue.append(absolute)
