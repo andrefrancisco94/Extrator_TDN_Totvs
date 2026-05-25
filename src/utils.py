@@ -7,8 +7,22 @@ from pathlib import Path
 from typing import Iterable
 from urllib.parse import parse_qs, urlparse, urlunparse
 
+import colorama
+from rich.console import Console
+from rich.logging import RichHandler
+
+colorama.just_fix_windows_console()
 
 KEEP_QUERY_PARAMS = {"pageId", "spaceKey", "title"}
+
+_console: Console | None = None
+
+
+def get_console() -> Console:
+    global _console
+    if _console is None:
+        _console = Console(highlight=False)
+    return _console
 
 
 @dataclass(frozen=True)
@@ -29,17 +43,22 @@ def setup_logger(log_file: Path) -> logging.Logger:
     logger = logging.getLogger("tdn_extractor")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
-
-    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+    logger.propagate = False
 
     file_handler = logging.FileHandler(log_file, encoding="utf-8")
-    file_handler.setFormatter(formatter)
-
-    stream_handler = logging.StreamHandler()
-    stream_handler.setFormatter(formatter)
-
+    file_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
     logger.addHandler(file_handler)
-    logger.addHandler(stream_handler)
+
+    rich_handler = RichHandler(
+        console=get_console(),
+        show_path=False,
+        show_time=True,
+        rich_tracebacks=True,
+        markup=False,
+    )
+    rich_handler.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(rich_handler)
+
     return logger
 
 
@@ -99,12 +118,9 @@ def is_url_in_scope(url: str, scope: CrawlScope) -> bool:
         return True
 
     if scope.space_key:
-        # Confluence can mix /display/SPACE and /display/public/SPACE for public spaces.
         if re.match(rf"^/display/(public/)?{re.escape(scope.space_key)}/", path):
             return True
 
-        # Confluence usa vários padrões de URL com pageId (viewpage, releaseview, etc.)
-        # Aceita qualquer /pages/*.action com pageId, exceto ações de edição/admin.
         _EDIT_ACTIONS = {"editpage.action", "createpage.action", "editblogpost.action"}
         if path.startswith("/pages/") and path.endswith(".action"):
             action = path.rsplit("/", 1)[-1]

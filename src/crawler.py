@@ -1,21 +1,26 @@
 from __future__ import annotations
 
-import sys
 from collections import deque
 from urllib.parse import urljoin
 
-from playwright.async_api import async_playwright
+from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import Page, async_playwright
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+)
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
-from .utils import CrawlScope, canonicalize_url, is_url_in_scope, parse_scope
+from .utils import CrawlScope, canonicalize_url, get_console, is_url_in_scope, parse_scope
 
-
-def _status(msg: str) -> None:
-    """Sobrescreve a linha de status no terminal."""
-    sys.stdout.write(f"\r\033[2K  {msg}")
-    sys.stdout.flush()
-
-
-# Containers da sidebar/árvore de navegação (em ordem de prioridade)
 _TREE_ROOTS = (
     ".plugin_pagetree",
     ".ia-splitter-left",
@@ -25,7 +30,6 @@ _TREE_ROOTS = (
     "#main-content .childpages-macro",
 )
 
-# Seletores para aguardar carregamento
 _LOAD_SELECTORS = (
     ".plugin_pagetree a[href]",
     ".ia-splitter-left a[href]",
@@ -36,13 +40,14 @@ _LOAD_SELECTORS = (
 )
 
 
-async def _extract_child_links(page, current_url: str) -> list[str]:
-    """Extrai links filhos da página atual na sidebar.
+def _selector_timeouts(timeout_ms: int) -> tuple[int, int]:
+    """Calcula timeouts dos seletores escalando com o timeout principal."""
+    sidebar_load = max(8_000, timeout_ms // 4)
+    tree_loading = max(5_000, timeout_ms // 6)
+    return sidebar_load, tree_loading
 
-    Localiza o <li> da página atual na árvore e retorna os hrefs contidos
-    dentro dele (filhos/descendentes diretos), sem vazar para outras seções.
-    Fallback para #children-section quando a página não é encontrada na árvore.
-    """
+
+async def _extract_child_links(page: Page, current_url: str) -> list[str]:
     return await page.evaluate(
         """
         ([currentUrl, treeRoots]) => {
@@ -54,7 +59,6 @@ async def _extract_child_links(page, current_url: str) -> list[str]:
             } catch { return null; }
           };
 
-          // Gera variante de URL para lidar com /display/public/X vs /display/X
           const altUrl = (() => {
             try {
               const u = new URL(currentUrl);
@@ -83,7 +87,6 @@ async def _extract_child_links(page, current_url: str) -> list[str]:
 
           let li = null;
 
-          // Estratégia 1: meta ajs-page-id → data-page-id no toggle da árvore
           const pageId = document.querySelector('meta[name="ajs-page-id"]')?.getAttribute('content');
           if (pageId) {
             for (const sel of treeRoots) {
@@ -97,7 +100,6 @@ async def _extract_child_links(page, current_url: str) -> list[str]:
             }
           }
 
-          // Estratégia 2: busca por URL nos anchors da sidebar
           if (!li) {
             for (const sel of treeRoots) {
               const container = document.querySelector(sel);
@@ -114,8 +116,6 @@ async def _extract_child_links(page, current_url: str) -> list[str]:
           }
 
           if (li) {
-            // Retorna todos os hrefs dentro do <li> da página atual,
-            // excluindo a própria página (candidatos).
             const childHrefs = new Set();
             li.querySelectorAll('li a[href], ul a[href]').forEach(a => {
               const href = a.getAttribute('href');
@@ -126,8 +126,6 @@ async def _extract_child_links(page, current_url: str) -> list[str]:
             if (childHrefs.size > 0) return Array.from(childHrefs);
           }
 
-          // Estratégia 3: #children-section ou .childpages-macro
-          // (macros do Confluence que listam filhos explicitamente)
           const childSection = document.querySelector(
             '#children-section a[href], .childpages-macro a[href], .children-show-hide a[href]'
           );
@@ -149,6 +147,16 @@ async def _extract_child_links(page, current_url: str) -> list[str]:
     )
 
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type(PlaywrightError),
+    reraise=True,
+)
+async def _goto_with_retry(page: Page, url: str, timeout_ms: int) -> None:
+    await page.goto(url, wait_until="load", timeout=timeout_ms)
+
+
 async def crawl_confluence_tree(
     start_url: str,
     logger,
@@ -156,14 +164,10 @@ async def crawl_confluence_tree(
     timeout_ms: int = 45_000,
     max_pages: int | None = None,
 ) -> list[str]:
-    """BFS pela árvore de páginas do Confluence.
-
-    Visita cada página e extrai apenas os links filhos da página atual
-    na sidebar (não todos os links visíveis). Usa wait_until='load' para
-    evitar travamento por requests de analytics/tracking contínuos.
-    """
+    """BFS pela árvore de páginas do Confluence."""
     start_canonical = canonicalize_url(start_url)
     scope: CrawlScope = parse_scope(start_canonical)
+    sidebar_timeout, tree_timeout = _selector_timeouts(timeout_ms)
 
     logger.info("Iniciando crawl em %s", start_canonical)
     logger.info(
@@ -177,6 +181,7 @@ async def crawl_confluence_tree(
     seen: set[str] = set()
     queued: set[str] = {start_canonical}
     queue: deque[str] = deque([start_canonical])
+    console = get_console()
 
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=headless)
@@ -184,84 +189,83 @@ async def crawl_confluence_tree(
         page = await context.new_page()
         page.set_default_timeout(timeout_ms)
 
-        while queue:
-            current = queue.popleft()
-            if current in seen:
-                continue
+        progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[bold cyan]{task.description}"),
+            BarColumn(bar_width=None),
+            TextColumn("{task.completed} mapeada(s) | fila: {task.fields[queue]}"),
+            TimeElapsedColumn(),
+            console=console,
+            transient=False,
+        )
 
-            seen.add(current)
-            ordered_urls.append(current)
+        with progress:
+            task = progress.add_task("Mapeando árvore...", total=None, queue=0)
 
-            if len(ordered_urls) > 1:
-                sys.stdout.write("\n")
-                sys.stdout.flush()
+            while queue:
+                current = queue.popleft()
+                if current in seen:
+                    continue
 
-            logger.info(
-                "Mapeando (%s/%s, fila=%s): %s",
-                len(ordered_urls),
-                max_pages or "∞",
-                len(queue),
-                current,
-            )
-
-            if max_pages and len(ordered_urls) >= max_pages:
-                logger.warning("Limite max_pages=%s atingido.", max_pages)
-                break
-
-            try:
-                _status("Carregando página...")
-                # "load" = aguarda evento load (recursos iniciais carregados).
-                # "networkidle" trava em sites com analytics/tracking contínuos.
-                await page.goto(current, wait_until="load", timeout=timeout_ms)
-
-                _status("Aguardando sidebar...")
-                load_sel = ",".join(_LOAD_SELECTORS)
-                try:
-                    await page.wait_for_selector(load_sel, timeout=8_000)
-                except Exception:
-                    pass
-
-                # Aguarda o AJAX de carregamento dos filhos da árvore terminar.
-                # O plugin_pagetree do Confluence carrega filhos assincronamente
-                # e exibe um spinner (.plugin_pagetree_loading) enquanto processa.
-                _status("Aguardando AJAX da árvore...")
-                try:
-                    await page.wait_for_selector(
-                        ".plugin_pagetree_loading", state="detached", timeout=5_000
-                    )
-                except Exception:
-                    pass
-                # Margem extra para o DOM estabilizar após o AJAX
-                await page.wait_for_timeout(800)
-
-                _status("Extraindo links filhos...")
-                raw_hrefs = await _extract_child_links(page, current)
-
-                new_links = 0
-                for href in raw_hrefs:
-                    if not href or href == "#" or href.lower().startswith("javascript:"):
-                        continue
-                    absolute = canonicalize_url(urljoin(current, href))
-                    if absolute in seen or absolute in queued:
-                        continue
-                    if not is_url_in_scope(absolute, scope):
-                        continue
-                    queued.add(absolute)
-                    queue.append(absolute)
-                    new_links += 1
-
-                _status(
-                    f"Concluído — {new_links} novo(s) | "
-                    f"fila: {len(queue)} | visitado: {len(seen)}"
+                seen.add(current)
+                ordered_urls.append(current)
+                short = current if len(current) <= 60 else current[:57] + "..."
+                progress.update(
+                    task,
+                    advance=1,
+                    queue=len(queue),
+                    description=f"Mapeando: {short}",
                 )
 
-            except Exception as exc:
-                sys.stdout.write("\n")
-                sys.stdout.flush()
-                logger.error("Falha em %s: %s", current, exc)
+                logger.info(
+                    "Mapeando (%s/%s, fila=%s): %s",
+                    len(ordered_urls),
+                    max_pages or "∞",
+                    len(queue),
+                    current,
+                )
 
-        sys.stdout.write("\n")
-        sys.stdout.flush()
+                if max_pages and len(ordered_urls) >= max_pages:
+                    logger.warning("Limite max_pages=%s atingido.", max_pages)
+                    break
+
+                try:
+                    await _goto_with_retry(page, current, timeout_ms)
+
+                    load_sel = ",".join(_LOAD_SELECTORS)
+                    try:
+                        await page.wait_for_selector(load_sel, timeout=sidebar_timeout)
+                    except PlaywrightError:
+                        pass
+
+                    try:
+                        await page.wait_for_selector(
+                            ".plugin_pagetree_loading",
+                            state="detached",
+                            timeout=tree_timeout,
+                        )
+                    except PlaywrightError:
+                        pass
+                    await page.wait_for_timeout(800)
+
+                    raw_hrefs = await _extract_child_links(page, current)
+
+                    for href in raw_hrefs:
+                        if not href or href == "#" or href.lower().startswith("javascript:"):
+                            continue
+                        absolute = canonicalize_url(urljoin(current, href))
+                        if absolute in seen or absolute in queued:
+                            continue
+                        if not is_url_in_scope(absolute, scope):
+                            continue
+                        queued.add(absolute)
+                        queue.append(absolute)
+
+                    progress.update(task, queue=len(queue))
+
+                except Exception as exc:
+                    logger.error("Falha em %s: %s", current, exc)
+
         await context.close()
         await browser.close()
 
