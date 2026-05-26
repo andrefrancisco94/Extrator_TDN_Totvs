@@ -41,6 +41,20 @@ LARGE_BATCH_THRESHOLD = 500
 _INVALID_FILE_CHARS = re.compile(r"[<>:\"/\\|?*\x00-\x1f]")
 _MAX_FILENAME_LEN = 80
 
+
+def utc_now_iso() -> str:
+    """Timestamp UTC em ISO 8601 com sufixo +00:00 explícito.
+
+    Garante consistencia ao comparar timestamps entre maquinas em TZ diferentes.
+    isoformat() padrao do Python pode omitir o sufixo em alguns casos; aqui
+    forcamos explicitamente.
+    """
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    # Python ja inclui +00:00 quando datetime tem tzinfo, mas garantimos:
+    if not now.endswith(("+00:00", "Z")):
+        now = now + "+00:00"
+    return now
+
 # Nomes de dispositivo reservados no Windows (em qualquer caixa, com ou sem extensao)
 _WINDOWS_RESERVED_NAMES = frozenset({
     "con", "prn", "aux", "nul",
@@ -436,7 +450,7 @@ class Checkpoint:
     def _fresh(start_url: str) -> Manifest:
         return Manifest(
             start_url=start_url,
-            started_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            started_at=utc_now_iso(),
         )
 
     def save(self) -> None:
@@ -449,7 +463,7 @@ class Checkpoint:
         """
         with self._save_lock:
             prev_timestamp = self.manifest.last_updated
-            self.manifest.last_updated = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            self.manifest.last_updated = utc_now_iso()
             self.path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.path.with_suffix(".json.tmp")
             try:
@@ -502,9 +516,15 @@ class Checkpoint:
                 return None
 
     def record_crawl_complete(self, urls: list[str], max_pages: int | None = None) -> None:
+        """Marca crawl como completo. Trim crawl_seen (info redundante apos completo).
+
+        Quando crawl termina, `crawl_seen` eh redundante (== mapped_urls).
+        Limpa pra evitar manifest.json gigante (10k+ URLs * 2 = 20k entries).
+        """
         self.manifest.crawl_complete = True
         self.manifest.mapped_urls = list(urls)
         self.manifest.crawl_queue = []  # fila esvaziada — crawl terminou
+        self.manifest.crawl_seen = []   # redundante apos completo
         self.manifest.crawl_max_pages = max_pages
         self.save()
 
@@ -617,13 +637,22 @@ class Checkpoint:
         title: str,
         size_bytes: int,
         elapsed_seconds: float,
+        pdf_hash: str | None = None,
     ) -> None:
-        self.manifest.exported[url] = {
+        """Registra export bem-sucedido.
+
+        Se `pdf_hash` fornecido (SHA-256), permite validar integridade depois
+        (detecta corrupcao pos-write por antivirus/disco).
+        """
+        entry = {
             "filename": filename,
             "title": title,
             "size_bytes": size_bytes,
             "elapsed_seconds": elapsed_seconds,
         }
+        if pdf_hash:
+            entry["sha256"] = pdf_hash
+        self.manifest.exported[url] = entry
         # Remove de failures se estava la (re-tentativa bem-sucedida)
         self.manifest.failures.pop(url, None)
         # Batched save: evita O(N²) em runs com muitos PDFs
@@ -635,7 +664,7 @@ class Checkpoint:
         self.manifest.failures[url] = {
             "error": error,
             "attempts": attempts,
-            "last_attempt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "last_attempt": utc_now_iso(),
         }
         self._maybe_batched_save()
 
@@ -1191,6 +1220,22 @@ def is_valid_pdf(path: Path) -> bool:
         return b"%%EOF" in tail
     except OSError:
         return False
+
+
+def sha256_file(path: Path, chunk_size: int = 65536) -> str:
+    """Calcula SHA-256 de um arquivo (streaming, memoria O(1)).
+
+    Retorna string hex 64 chars. Levanta OSError se nao conseguir ler.
+    Usado para detectar corrupcao posterior de PDFs (disco ruim, antivirus).
+    """
+    hasher = hashlib.sha256()
+    with path.open("rb") as fp:
+        while True:
+            chunk = fp.read(chunk_size)
+            if not chunk:
+                break
+            hasher.update(chunk)
+    return hasher.hexdigest()
 
 
 def count_pdf_pages(path: Path) -> int:

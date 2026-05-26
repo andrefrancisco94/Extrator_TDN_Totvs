@@ -49,6 +49,7 @@ from .utils import (
     is_blocking_error,
     is_cloudflare_challenge,
     is_valid_pdf,
+    sha256_file,
 )
 
 # Aliases para retrocompat com codigo interno do exporter
@@ -386,18 +387,33 @@ async def _record_export_result(
     size_bytes: int, elapsed_total: float, acc: ExportAccumulators, cfg: ExportConfig,
     logger,
 ) -> None:
-    """Registra um PDF exportado com sucesso (thread-safe)."""
+    """Registra um PDF exportado com sucesso (thread-safe + integridade).
+
+    Calcula SHA-256 do PDF (data integrity) ANTES de pegar o lock — io de hash
+    pode demorar em arquivos grandes, nao quer bloquear outros workers.
+    """
+    # Hash fora do lock (operacao pesada em PDFs grandes)
+    try:
+        pdf_hash = sha256_file(pdf_path)
+    except OSError as exc:
+        logger.warning("Falha ao calcular SHA-256 de %s: %s", pdf_path.name, exc)
+        pdf_hash = None
+
     async with acc.lock:
         acc.exported.append((pdf_path, title))
-    acc.checkpoint.record_export(
-        url=url, filename=file_name, title=title,
-        size_bytes=size_bytes, elapsed_seconds=elapsed_total,
-    )
-    if elapsed_total >= cfg.slow_threshold_seconds:
-        async with acc.lock:
+        acc.checkpoint.record_export(
+            url=url, filename=file_name, title=title,
+            size_bytes=size_bytes, elapsed_seconds=elapsed_total,
+            pdf_hash=pdf_hash,
+        )
+        if elapsed_total >= cfg.slow_threshold_seconds:
             acc.slow_records.append(
                 SlowPageRecord(url=url, elapsed_seconds=elapsed_total, phase="pdf")
             )
+            slow = True
+        else:
+            slow = False
+    if slow:
         logger.warning("Pagina lenta na exportacao (%.1fs): %s", elapsed_total, url)
 
 

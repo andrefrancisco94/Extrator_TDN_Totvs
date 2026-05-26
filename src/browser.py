@@ -6,6 +6,7 @@ comportamento (anti-fingerprinting, storage_state, recovery).
 """
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -15,6 +16,10 @@ from playwright.async_api import Page
 from .utils import build_browser_context_args
 
 _MAX_BROWSER_LAUNCH_ATTEMPTS = 3
+
+# Lock global para save_storage_state — impede 2 workers escreverem
+# simultaneamente o mesmo browser_state.json (corromperia JSON).
+_storage_state_lock = asyncio.Lock()
 
 
 @dataclass
@@ -90,15 +95,21 @@ async def launch_browser_session(
 
 
 async def save_storage_state(session: BrowserSession, logger) -> None:
-    """Salva cookies/storage no caminho configurado (se houver)."""
+    """Salva cookies/storage no caminho configurado (se houver).
+
+    Usa lock global para impedir 2 workers escreverem simultaneamente — race
+    poderia gerar JSON parcial/corrompido. Se save falhar, loga warning mas
+    nao interrompe (cookies podem ser regenerados na proxima sessao).
+    """
     if session.state_path is None or session.context is None:
         return
-    try:
-        session.state_path.parent.mkdir(parents=True, exist_ok=True)
-        await session.context.storage_state(path=str(session.state_path))
-        logger.debug("Storage state salvo em %s", session.state_path)
-    except (PlaywrightError, OSError) as exc:
-        logger.warning("Falha ao salvar storage_state: %s", exc)
+    async with _storage_state_lock:
+        try:
+            session.state_path.parent.mkdir(parents=True, exist_ok=True)
+            await session.context.storage_state(path=str(session.state_path))
+            logger.debug("Storage state salvo em %s", session.state_path)
+        except (PlaywrightError, OSError) as exc:
+            logger.warning("Falha ao salvar storage_state: %s", exc)
 
 
 async def teardown_session(session: BrowserSession, logger) -> None:

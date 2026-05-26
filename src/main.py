@@ -37,7 +37,7 @@ from .utils import (
 
 from .utils import LARGE_BATCH_THRESHOLD  # re-export para retrocompat
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
 
 MIN_DISK_FREE_BYTES = 500 * 1024 * 1024  # 500MB minimo razoavel
 
@@ -60,11 +60,16 @@ async def run_pipeline(
     proxy: str | None = None,
     dry_run: bool = False,
     debug: bool = False,
+    retry_failed_only: bool = False,
+    quiet: bool = False,
 ) -> int:
     pages_dir, log_file = ensure_output_dirs(output_dir)
     correlation_id = generate_correlation_id()
     logger = setup_logger(log_file, debug=debug, correlation_id=correlation_id)
     console = get_console()
+    if quiet:
+        # Suprime output rich (so erros + summary)
+        console.quiet = True
     logger.info("Run iniciado: correlation_id=%s", correlation_id)
 
     # Lock file: impede 2 processos rodando no mesmo output_dir
@@ -79,7 +84,7 @@ async def run_pipeline(
             start_url, output_dir, consolidated_name, headless, timeout_seconds,
             max_pages, slow_threshold_seconds, auto_confirm, force_recrawl,
             force_reexport, rate_limit, max_workers, proxy, dry_run,
-            pages_dir, log_file, logger, console,
+            pages_dir, log_file, logger, console, retry_failed_only,
         )
     finally:
         job_lock.release()
@@ -89,7 +94,7 @@ async def _run_pipeline_inner(
     start_url, output_dir, consolidated_name, headless, timeout_seconds,
     max_pages, slow_threshold_seconds, auto_confirm, force_recrawl,
     force_reexport, rate_limit, max_workers, proxy, dry_run,
-    pages_dir, log_file, logger, console,
+    pages_dir, log_file, logger, console, retry_failed_only=False,
 ) -> int:
     """Pipeline interno (encapsulado no lock). Mantem assinatura original."""
     timeout_ms = timeout_seconds * 1000
@@ -134,25 +139,34 @@ async def _run_pipeline_inner(
         # Mascara credenciais no log para nao vazar password/token
         logger.info("Proxy configurado: %s", sanitize_proxy_for_log(proxy))
 
-    try:
-        urls, slow_crawl = await crawl_confluence_tree(
-            start_url=start_url,
-            checkpoint=checkpoint,
-            logger=logger,
-            headless=headless,
-            timeout_ms=timeout_ms,
-            max_pages=max_pages,
-            slow_threshold_seconds=slow_threshold_seconds,
-            force_recrawl=force_recrawl,
-            rate_limit=rate_limit,
-            max_workers=max_workers,
-            limiter=shared_limiter,
-            state_path=state_path,
-            proxy=proxy,
+    if retry_failed_only:
+        # Modo retry: pula crawl, usa so URLs em failures + mapeadas (force_reexport=False)
+        urls = list(checkpoint.manifest.mapped_urls)
+        slow_crawl = []
+        logger.info(
+            "Modo --retry-failed-only: pulando crawl, %d URLs em mapped, %d em failures",
+            len(urls), len(checkpoint.manifest.failures),
         )
-    except KeyboardInterrupt:
-        logger.warning("Crawl interrompido pelo usuario (Ctrl+C).")
-        raise
+    else:
+        try:
+            urls, slow_crawl = await crawl_confluence_tree(
+                start_url=start_url,
+                checkpoint=checkpoint,
+                logger=logger,
+                headless=headless,
+                timeout_ms=timeout_ms,
+                max_pages=max_pages,
+                slow_threshold_seconds=slow_threshold_seconds,
+                force_recrawl=force_recrawl,
+                rate_limit=rate_limit,
+                max_workers=max_workers,
+                limiter=shared_limiter,
+                state_path=state_path,
+                proxy=proxy,
+            )
+        except KeyboardInterrupt:
+            logger.warning("Crawl interrompido pelo usuario (Ctrl+C).")
+            raise
 
     if not urls:
         logger.error("Nenhuma pagina foi encontrada a partir da URL inicial.")
@@ -605,6 +619,15 @@ def run(
         False, "--debug",
         help="Verbose: ativa DEBUG logging (mais detalhes em run.log).",
     ),
+    retry_failed_only: bool = typer.Option(
+        False, "--retry-failed-only",
+        help="So re-tenta URLs em failures (skip crawl + skip ja exportadas). "
+        "Ideal para resume rapido apos bloqueio.",
+    ),
+    quiet: bool = typer.Option(
+        False, "--quiet", "-q",
+        help="Silencia output (so erros + summary final). Util para CI.",
+    ),
 ) -> None:
     """Mapeia a arvore lateral do Confluence, exporta PDFs e gera consolidado.
 
@@ -681,6 +704,8 @@ def run(
                 proxy=proxy,
                 dry_run=dry_run,
                 debug=debug,
+                retry_failed_only=retry_failed_only,
+                quiet=quiet,
             )
         )
     except KeyboardInterrupt:
@@ -795,6 +820,93 @@ def jobs(
         "\nPara continuar um job: rode novamente com a MESMA URL e --output-dir "
         "apontando para a subpasta. O resume eh automatico."
     )
+
+
+@app.command()
+def status(
+    output_dir: Path = typer.Option(
+        Path("output"), help="Pasta do job para inspecionar.",
+    ),
+    json_output: bool = typer.Option(
+        False, "--json", help="Saida em JSON.",
+    ),
+) -> None:
+    """Mostra snapshot detalhado de um job (mapeadas, exportadas, falhas, disco)."""
+    console = get_console()
+    manifest_path = output_dir / MANIFEST_FILENAME
+    pages_dir = output_dir / "pages"
+
+    if not manifest_path.exists():
+        console.print(f"[red]manifest.json nao encontrado em {output_dir}[/red]")
+        raise typer.Exit(1)
+
+    import json as _json
+    try:
+        with manifest_path.open("r", encoding="utf-8") as fp:
+            data = _json.load(fp)
+    except (OSError, ValueError) as exc:
+        console.print(f"[red]Erro ao ler manifest: {exc}[/red]")
+        raise typer.Exit(1)
+
+    mapped = data.get("mapped_urls", []) or []
+    exported = data.get("exported", {}) or {}
+    failures_data = data.get("failures", {}) or {}
+    queue = data.get("crawl_queue", []) or []
+    crawl_complete = bool(data.get("crawl_complete", False))
+
+    # Conta PDFs reais no disco
+    pdf_count = 0
+    total_bytes = 0
+    if pages_dir.exists():
+        for p in pages_dir.glob("*.pdf"):
+            if not p.name.endswith(".tmp"):
+                pdf_count += 1
+                try:
+                    total_bytes += p.stat().st_size
+                except OSError:
+                    pass
+
+    progress_pct = (len(exported) / len(mapped) * 100) if mapped else 0.0
+
+    payload = {
+        "output_dir": str(output_dir),
+        "start_url": data.get("start_url", ""),
+        "crawl_complete": crawl_complete,
+        "mapped_count": len(mapped),
+        "queue_remaining": len(queue),
+        "exported_count": len(exported),
+        "failures_count": len(failures_data),
+        "pending_count": max(0, len(mapped) - len(exported) - len(failures_data)),
+        "pdfs_on_disk": pdf_count,
+        "total_bytes_on_disk": total_bytes,
+        "progress_pct": round(progress_pct, 1),
+        "last_updated": data.get("last_updated", ""),
+    }
+
+    if json_output:
+        typer.echo(_json.dumps(payload, indent=2, ensure_ascii=False))
+        return
+
+    table = Table(title=f"Status: {output_dir.name}", border_style="cyan")
+    table.add_column("Metrica", style="bold cyan")
+    table.add_column("Valor")
+    table.add_row("URL", payload["start_url"])
+    table.add_row(
+        "Crawl",
+        "[green]completo[/green]" if crawl_complete else "[yellow]incompleto[/yellow]",
+    )
+    table.add_row("URLs mapeadas", str(payload["mapped_count"]))
+    table.add_row("Na fila", str(payload["queue_remaining"]))
+    table.add_row("PDFs exportados", str(payload["exported_count"]))
+    table.add_row("Falhas", str(payload["failures_count"]))
+    table.add_row("Pendentes", str(payload["pending_count"]))
+    table.add_row("PDFs no disco", f"{pdf_count} ({format_bytes(total_bytes)})")
+    table.add_row("Progresso", f"{progress_pct:.1f}%")
+    table.add_row(
+        "Ultimo update",
+        payload["last_updated"].replace("T", " ").replace("+00:00", "Z"),
+    )
+    console.print(table)
 
 
 @app.command()
@@ -931,6 +1043,53 @@ def reset(
             console.print(f"[red]Erro ao remover PDFs: {exc}[/red]")
 
     console.print("[green]Reset concluido.[/green]")
+
+
+@app.command(name="clean-tmp")
+def clean_tmp(
+    output_dir: Path = typer.Option(
+        Path("output"), help="Pasta do job (com pages/).",
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Pula confirmacao."),
+) -> None:
+    """Remove arquivos .pdf.tmp orfaos (de runs interrompidos)."""
+    console = get_console()
+    pages_dir = output_dir / "pages"
+    if not pages_dir.exists():
+        console.print(f"[yellow]pages/ nao existe em {output_dir}[/yellow]")
+        return
+
+    tmp_files = list(pages_dir.glob("*.pdf.tmp"))
+    if not tmp_files:
+        console.print("[green]Nenhum arquivo .pdf.tmp orfao encontrado.[/green]")
+        return
+
+    table = Table(title=f"Arquivos .tmp orfaos em {pages_dir}", border_style="yellow")
+    table.add_column("Arquivo")
+    table.add_column("Tamanho", justify="right")
+    total = 0
+    for p in tmp_files:
+        try:
+            sz = p.stat().st_size
+        except OSError:
+            sz = 0
+        total += sz
+        table.add_row(p.name, format_bytes(sz))
+    console.print(table)
+    console.print(f"\nTotal: {format_bytes(total)} em {len(tmp_files)} arquivo(s)")
+
+    if not yes and sys.stdin.isatty() and not typer.confirm("Remover?", default=False):
+        console.print("Cancelado.")
+        return
+
+    removed = 0
+    for p in tmp_files:
+        try:
+            p.unlink()
+            removed += 1
+        except OSError as exc:
+            console.print(f"[red]Erro ao remover {p.name}: {exc}[/red]")
+    console.print(f"[green]{removed} .tmp removidos.[/green]")
 
 
 @app.command(name="clean-orphans")

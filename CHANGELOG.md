@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.9.0] - 2026-05-25
+
+### Bugs r2 restantes corrigidos
+- `_record_export_result` agora mantém **todas as mutações** dentro de `acc.lock` (eliminou janela onde `acc.exported` tinha entry mas `checkpoint.manifest.exported` ainda não)
+- `save_storage_state` agora protegido por lock global (`_storage_state_lock` em browser.py) — evita 2 workers corromperem `browser_state.json` simultaneamente
+- **Timestamps consistentes**: novo `utc_now_iso()` helper garante sufixo `+00:00` explícito em todos os `last_updated`/`started_at`/`last_attempt` (evita comparações erradas entre TZs)
+- `record_crawl_complete` faz **trim de `crawl_seen`** (era redundante com `mapped_urls`, podia chegar a 100k entries em sites gigantes)
+
+### Features novas
+- **Comando `status`**: snapshot detalhado de um job (mapeadas, exportadas, falhas, pendentes, PDFs no disco, progresso %, last_updated). `--json` para integração.
+- **Comando `clean-tmp`**: remove arquivos `.pdf.tmp` órfãos (de runs interrompidos antes do rename atômico)
+- **Flag `--retry-failed-only`**: pula crawl, processa só URLs em `failures` (resume ultra-rápido após bloqueio)
+- **Flag `--quiet` / `-q`**: silencia output rich (banners/progresso), só erros — útil para CI
+- **SHA-256 dos PDFs no manifest**: campo `sha256` em cada entry de `exported`, calculado via `sha256_file()` (streaming, O(1) RAM). Permite detectar corrupção pós-write (disco ruim, antivirus quarentena).
+
+### Documentação
+- **`ARCHITECTURE.md`** novo: diagrama de fluxo de execução, decisões arquiteturais (resume, anti-bloqueio, concorrência, atomicidade, segurança), lifecycle de uma URL, estados do RateLimiter/Checkpoint
+- **README.md**: documentados todos os comandos novos (`status`, `clean-tmp`) + seção "Flags úteis para CI/scripting" com exemplos
+
+### Testes (144 → 164, +20 novos em `tests/test_v09_fixes.py`)
+- `utc_now_iso` com timezone explícito + diferencia timestamps consecutivos
+- `record_crawl_complete` trim do `crawl_seen` e `crawl_queue`
+- `sha256_file` consistente, bate com hashlib, streaming em arquivos grandes
+- `record_export` com/sem pdf_hash (backward compat)
+- Comando `status` (no_manifest, shows_progress, json output)
+- Comando `clean-tmp` (empty_pages, removes_tmp_files, no_tmp_files)
+- Help mostra novas flags e novos comandos
+- Hash em manifest end-to-end
+
 ## [0.8.0] - 2026-05-25
 
 ### Auditoria r2 (6 agents paralelos, 200 novos achados)

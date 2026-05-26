@@ -59,8 +59,31 @@ py -m venv .venv
 
 ### Outros comandos
 
-- `python -m src.main jobs --output-dir output` — lista trabalhos incompletos em todas as subpastas
+- `python -m src.main jobs --output-dir output` — lista trabalhos incompletos (`--json` para scripts)
+- `python -m src.main status --output-dir output/area` — snapshot detalhado de um job (progresso, falhas, disco)
+- `python -m src.main failures --output-dir output/area` — lista URLs com falha (tentativas, último erro)
+- `python -m src.main reset output/area [--hard]` — reseta job (soft = só manifest; hard = + PDFs)
+- `python -m src.main clean-orphans --output-dir output/area` — remove PDFs sem entrada no manifest
+- `python -m src.main clean-tmp --output-dir output/area` — remove `.pdf.tmp` órfãos
+- `python -m src.main report --format csv|json` — exporta relatório com stats (p50/p95/p99)
 - `python -m src.main version` — mostra a versão
+
+### Flags úteis para CI/scripting
+
+```bash
+# Retry rápido só de URLs com falha (skip crawl)
+python -m src.main run URL --retry-failed-only --yes
+
+# Modo silencioso (suprime banners/progresso, só erros)
+python -m src.main run URL --quiet --yes
+
+# Debug verbose (DEBUG logging com correlation_id)
+python -m src.main run URL --debug
+
+# Saída JSON para integração
+python -m src.main jobs --json
+python -m src.main status --json --output-dir output/area
+```
 
 ## Anti-bloqueio (Cloudflare 522/429)
 
