@@ -37,7 +37,7 @@ from .utils import (
 
 from .utils import LARGE_BATCH_THRESHOLD  # re-export para retrocompat
 
-__version__ = "0.9.0"
+__version__ = "0.10.0"
 
 MIN_DISK_FREE_BYTES = 500 * 1024 * 1024  # 500MB minimo razoavel
 
@@ -68,8 +68,17 @@ async def run_pipeline(
     logger = setup_logger(log_file, debug=debug, correlation_id=correlation_id)
     console = get_console()
     if quiet:
-        # Suprime output rich (so erros + summary)
+        # Suprime output rich + logger (so erros + summary)
         console.quiet = True
+        # Logger ainda escreve no arquivo run.log mas remove handler do console
+        import logging as _lg
+        for handler in list(logger.handlers):
+            # RichHandler tem nome de classe contendo "Rich"
+            if "Rich" in type(handler).__name__:
+                logger.removeHandler(handler)
+        # Sobe nivel para WARNING (so warnings/errors visiveis se algum
+        # RichHandler escapar)
+        logger.setLevel(_lg.WARNING)
     logger.info("Run iniciado: correlation_id=%s", correlation_id)
 
     # Lock file: impede 2 processos rodando no mesmo output_dir
@@ -78,6 +87,7 @@ async def run_pipeline(
         job_lock.acquire()
     except JobLockError as exc:
         console.print(f"[bold red]Lock conflict:[/bold red] {exc}")
+        # NAO chama release — lock nunca foi adquirido por este processo
         return 2
     try:
         return await _run_pipeline_inner(
@@ -87,6 +97,7 @@ async def run_pipeline(
             pages_dir, log_file, logger, console, retry_failed_only,
         )
     finally:
+        # release() eh idempotente (verifica _held interno)
         job_lock.release()
 
 
@@ -140,9 +151,19 @@ async def _run_pipeline_inner(
         logger.info("Proxy configurado: %s", sanitize_proxy_for_log(proxy))
 
     if retry_failed_only:
-        # Modo retry: pula crawl, usa so URLs em failures + mapeadas (force_reexport=False)
         urls = list(checkpoint.manifest.mapped_urls)
         slow_crawl = []
+        if not urls and not checkpoint.manifest.failures:
+            logger.error(
+                "Modo --retry-failed-only requer manifest com URLs mapeadas ou "
+                "failures, mas manifest esta vazio. Rode sem --retry-failed-only "
+                "para iniciar novo crawl."
+            )
+            console.print(
+                "[bold red]Erro:[/bold red] --retry-failed-only sem manifest. "
+                "Rode sem essa flag primeiro para mapear URLs."
+            )
+            return 1
         logger.info(
             "Modo --retry-failed-only: pulando crawl, %d URLs em mapped, %d em failures",
             len(urls), len(checkpoint.manifest.failures),
@@ -297,6 +318,13 @@ def _setup_checkpoint(
         logger.warning(
             "Reconciliacao manifest x disco: %d PDFs faltando/invalidos. "
             "Serao regenerados.", removed,
+        )
+    # Valida invariantes do manifest (alerta sobre inconsistencias)
+    issues = checkpoint.check_invariants(logger=logger)
+    if issues:
+        logger.warning(
+            "%d inconsistencia(s) detectada(s) no manifest. Veja log para detalhes.",
+            len(issues),
         )
     return checkpoint
 
@@ -1045,6 +1073,112 @@ def reset(
     console.print("[green]Reset concluido.[/green]")
 
 
+@app.command()
+def verify(
+    output_dir: Path = typer.Option(
+        Path("output"), help="Pasta do job para verificar.",
+    ),
+    json_output: bool = typer.Option(
+        False, "--json", help="Saida em JSON.",
+    ),
+    limit: int = typer.Option(
+        0, help="Limite de PDFs a verificar (0 = todos). Util para amostragem rapida.",
+    ),
+) -> None:
+    """Verifica integridade dos PDFs comparando SHA-256 com o manifest."""
+    console = get_console()
+    manifest_path = output_dir / MANIFEST_FILENAME
+    pages_dir = output_dir / "pages"
+
+    if not manifest_path.exists():
+        console.print(f"[red]manifest.json nao encontrado em {output_dir}[/red]")
+        raise typer.Exit(1)
+
+    import json as _json
+    from .utils import sha256_file
+    try:
+        with manifest_path.open("r", encoding="utf-8") as fp:
+            data = _json.load(fp)
+    except (OSError, ValueError) as exc:
+        console.print(f"[red]Erro ao ler manifest: {exc}[/red]")
+        raise typer.Exit(1)
+
+    exported = data.get("exported", {}) or {}
+    if not exported:
+        if json_output:
+            typer.echo(_json.dumps({"summary": {"total": 0}, "message": "manifest sem exports"}))
+        else:
+            console.print("[yellow]Manifest sem PDFs exportados. Nada para verificar.[/yellow]")
+        return
+
+    # Limit (amostragem)
+    if limit > 0:
+        exported = dict(list(exported.items())[:limit])
+    results = {"ok": [], "mismatch": [], "missing": [], "skipped": [], "io_error": []}
+
+    for url, entry in exported.items():
+        filename = entry.get("filename", "")
+        expected_hash = entry.get("sha256", "")
+        pdf_path = pages_dir / filename
+
+        if not pdf_path.exists():
+            results["missing"].append({"url": url, "filename": filename})
+            continue
+        if not expected_hash:
+            results["skipped"].append({"url": url, "filename": filename})
+            continue
+        try:
+            actual = sha256_file(pdf_path)
+        except OSError as exc:
+            results["io_error"].append({"url": url, "filename": filename, "error": str(exc)})
+            continue
+        if actual == expected_hash:
+            results["ok"].append(filename)
+        else:
+            results["mismatch"].append({
+                "url": url, "filename": filename,
+                "expected": expected_hash, "actual": actual,
+            })
+
+    summary = {
+        "total": len(exported),
+        "ok": len(results["ok"]),
+        "mismatch": len(results["mismatch"]),
+        "missing": len(results["missing"]),
+        "skipped_no_hash": len(results["skipped"]),
+        "io_error": len(results["io_error"]),
+    }
+
+    if json_output:
+        typer.echo(_json.dumps({"summary": summary, **results}, indent=2, ensure_ascii=False))
+        return
+
+    table = Table(title=f"Integridade: {output_dir.name}", border_style="cyan")
+    table.add_column("Categoria", style="bold cyan")
+    table.add_column("Contagem", justify="right")
+    table.add_row("[green]OK[/green]", str(summary["ok"]))
+    table.add_row("[red]Corrompido (hash mismatch)[/red]", str(summary["mismatch"]))
+    table.add_row("[yellow]Arquivo faltando[/yellow]", str(summary["missing"]))
+    table.add_row("[dim]Sem hash no manifest[/dim]", str(summary["skipped_no_hash"]))
+    table.add_row("[yellow]Erro de IO[/yellow]", str(summary["io_error"]))
+    table.add_row("[bold]Total verificado[/bold]", str(summary["total"]))
+    console.print(table)
+
+    if results["mismatch"]:
+        console.print("\n[bold red]PDFs corrompidos (hash mismatch):[/bold red]")
+        for item in results["mismatch"][:20]:
+            console.print(f"  {item['filename']}")
+        if len(results["mismatch"]) > 20:
+            console.print(f"  ... e mais {len(results['mismatch']) - 20}")
+        console.print("\n[yellow]Acao sugerida:[/yellow] re-exporte com --regenerate")
+        raise typer.Exit(2)
+
+    if results["missing"]:
+        console.print("\n[bold yellow]PDFs faltando (vai re-gerar no proximo run):[/bold yellow]")
+        for item in results["missing"][:20]:
+            console.print(f"  {item['filename']}")
+
+
 @app.command(name="clean-tmp")
 def clean_tmp(
     output_dir: Path = typer.Option(
@@ -1058,8 +1192,14 @@ def clean_tmp(
     if not pages_dir.exists():
         console.print(f"[yellow]pages/ nao existe em {output_dir}[/yellow]")
         return
+    if not pages_dir.is_dir():
+        console.print(f"[red]pages/ existe mas nao eh diretorio: {pages_dir}[/red]")
+        raise typer.Exit(1)
 
-    tmp_files = list(pages_dir.glob("*.pdf.tmp"))
+    # Captura tanto *.pdf.tmp na raiz quanto em subdiretorios (recursivo)
+    tmp_files = list(pages_dir.glob("*.pdf.tmp")) + list(pages_dir.glob("**/*.pdf.tmp"))
+    # Dedup (glob com ** pode pegar mesmo arquivo)
+    tmp_files = list(dict.fromkeys(tmp_files))
     if not tmp_files:
         console.print("[green]Nenhum arquivo .pdf.tmp orfao encontrado.[/green]")
         return

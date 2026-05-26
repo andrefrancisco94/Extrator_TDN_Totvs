@@ -392,9 +392,12 @@ async def _record_export_result(
     Calcula SHA-256 do PDF (data integrity) ANTES de pegar o lock — io de hash
     pode demorar em arquivos grandes, nao quer bloquear outros workers.
     """
-    # Hash fora do lock (operacao pesada em PDFs grandes)
+    # Hash fora do lock E fora do event loop (sha256_file eh blocking IO).
+    # Executar em thread executor evita travar workers paralelos durante
+    # leitura de PDFs gigantes (10MB+ em HDD pode bloquear 100ms+).
     try:
-        pdf_hash = sha256_file(pdf_path)
+        loop = asyncio.get_running_loop()
+        pdf_hash = await loop.run_in_executor(None, sha256_file, pdf_path)
     except OSError as exc:
         logger.warning("Falha ao calcular SHA-256 de %s: %s", pdf_path.name, exc)
         pdf_hash = None

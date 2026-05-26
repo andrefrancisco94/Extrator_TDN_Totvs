@@ -1,5 +1,45 @@
 # Changelog
 
+## [0.10.0] - 2026-05-25
+
+### Auditoria r3 (6 agents, 116 novos achados — 448 acumulado)
+
+**Performance / scaling (Bug agent #3 r3):**
+- **`sha256_file` async** via `loop.run_in_executor` — não bloqueia event loop em PDFs grandes
+- **LRU cache em `slugify`** (`maxsize=4096`) — evita re-normalizar Unicode em PDFs com títulos repetidos
+- **Regex pré-compiladas** (`_SPACE_RE`, `_NON_ASCII_SLUG_RE`, `_MULTI_DASH_RE`) eliminam compilação repetida
+- **`api_cache` bounded** (cap 5000 entries, FIFO drop) — previne memory leak em sites enormes
+
+**Bugs CRÍTICOS de segurança (Bug agent #6 r3):**
+- **SSRF: bypass por IPv4 alt** — `_normalize_ipv4_alt_repr` detecta `0x7f000001` (hex), `2130706433` (decimal), `017700000001` (octal) e bloqueia
+- **SSRF: zona ID IPv6** removida antes da checagem (`fe80::1%eth0` → `fe80::1`)
+- **`sanitize_proxy_for_log` mascara hostname interno** (`.internal`/`.local`/`.lan` + IPs privados) — não vaza infra interna em logs
+
+**Bugs ALTOS:**
+- **Jitter `random.uniform(0.01, 0.25)`** garante mínimo 1% — antes podia retornar 0.0 e perder anti-sincronização
+- **`/CreationDate` em UTC** no consolidated PDF (com `+00'00'` explícito) — antes usava timezone local
+- **`--retry-failed-only` valida manifest** antes de pular crawl — avisa explicitamente se vazio
+- **`--quiet` também silencia logger** (remove RichHandler + sobe level para WARNING)
+- **`clean-tmp` is_dir check + recursivo** (pega `.pdf.tmp` em subdiretórios)
+- **`verify --limit N`** para amostragem rápida; **handle de exported vazio** com mensagem clara
+
+**Bugs MÉDIOS:**
+- **JobLock release safe** — só chama `release()` se acquire teve sucesso (release() idempotente via `_held`)
+- **Manifest invariants check** (`check_invariants()`): detecta URL em ambos exported+failures, mapped_urls duplicado, crawl_max_pages negativo, crawl_complete inconsistente, URLs vazias/não-string
+- **`_setup_checkpoint` reporta inconsistências** no log no início do run
+
+### Testes (164 → 191, +27 novos em `tests/test_v10_fixes.py`)
+- 6 testes de SSRF (IPv4 hex/decimal/octal, normalização)
+- 1 jitter sempre positivo
+- 4 sanitize_proxy (internal hostnames, private IPs, public preservado, credentials)
+- 5 manifest invariants (overlap exported+failures, duplicatas, max_pages negativo, crawl_complete inconsistente)
+- 2 clean-tmp (recursivo + rejeita arquivo como pages_dir)
+- 2 verify (empty + --limit flag)
+- 2 api_cache bounded (cap + FIFO drop)
+- 2 slugify LRU + regex compiladas
+- 1 PDF /CreationDate UTC
+- 1 version 0.10.0
+
 ## [0.9.0] - 2026-05-25
 
 ### Bugs r2 restantes corrigidos

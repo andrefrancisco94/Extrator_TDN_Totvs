@@ -150,9 +150,11 @@ def _sanitize_bookmark_title(raw_title: str, fallback: str) -> str:
 
 
 def _set_metadata(writer: PdfWriter, title: str) -> None:
-    """Define metadata do PDF consolidado (titulo, autor, datas)."""
-    now = datetime.now()
-    pdf_date = "D:" + now.strftime("%Y%m%d%H%M%S")
+    """Define metadata do PDF consolidado (titulo, autor, datas em UTC)."""
+    from datetime import timezone as _tz
+    now = datetime.now(_tz.utc)
+    # PDF date format com timezone: D:YYYYMMDDHHmmSS+00'00'
+    pdf_date = "D:" + now.strftime("%Y%m%d%H%M%S") + "+00'00'"
     try:
         writer.add_metadata({
             "/Title": title,

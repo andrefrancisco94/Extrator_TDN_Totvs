@@ -91,6 +91,9 @@ _CRAWL_TIMEOUT_RATIO_THRESHOLD = 0.20
 # Diferente de MAX_RETRY_ATTEMPTS (que conta entre runs).
 _INTRA_RUN_RETRY_LIMIT = 2
 
+# Cap do cache REST API intra-run (evita memory leak em sites enormes)
+_API_CACHE_MAX_ENTRIES = 5000
+
 
 @dataclass
 class CrawlState:
@@ -105,6 +108,7 @@ class CrawlState:
     attempts: dict[str, int] = field(default_factory=dict)
     # Cache de respostas REST API: key=(page_id, start) -> results
     # Evita re-fetch quando crawl re-visita uma URL apos timeout.
+    # CAP: 5000 entries (suficiente pra sites grandes; depois desaloca em FIFO).
     api_cache: dict[tuple[str, int], list[dict]] = field(default_factory=dict)
     # Lock para api_cache e attempts (sincroniza se crawler for paralelizado).
     state_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -226,10 +230,25 @@ async def _fetch_or_cache_api_page(
     if results is not None and api_cache is not None:
         if cache_lock is not None:
             async with cache_lock:
-                api_cache[cache_key] = results
+                _bounded_cache_set(api_cache, cache_key, results)
         else:
-            api_cache[cache_key] = results
+            _bounded_cache_set(api_cache, cache_key, results)
     return results, blocked
+
+
+def _bounded_cache_set(cache: dict, key, value) -> None:
+    """Insere em cache com cap (_API_CACHE_MAX_ENTRIES). Drop FIFO se cheio.
+
+    Dict do Python 3.7+ preserva ordem de insercao, entao o "primeiro" eh
+    o mais antigo. Drop simples por ordem (nao LRU verdadeiro, mas barato).
+    """
+    if len(cache) >= _API_CACHE_MAX_ENTRIES:
+        try:
+            oldest_key = next(iter(cache))
+            del cache[oldest_key]
+        except (StopIteration, KeyError):
+            pass
+    cache[key] = value
 
 
 async def _get_children_via_api(

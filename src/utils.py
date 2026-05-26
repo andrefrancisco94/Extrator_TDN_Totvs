@@ -160,9 +160,10 @@ class RateLimiter:
                 self.config.backoff_initial_seconds
                 * (self.config.backoff_multiplier ** (self._consecutive_blocks - 1)),
             )
-            # Jitter SOMENTE aumenta (0 a +25%) para nao sincronizar tentativas
-            # mas tambem nao defeats o purpose do cooldown reduzindo-o.
-            cooldown *= 1.0 + random.uniform(0, 0.25)
+            # Jitter SOMENTE aumenta (1% a 25%) para anti-sincronizacao garantida.
+            # `random.uniform(0, 0.25)` pode retornar 0 exato, causando workers
+            # bater no servidor no mesmo instante.
+            cooldown *= 1.0 + random.uniform(0.01, 0.25)
             self._cooldown_until = time.monotonic() + cooldown
             if logger is not None:
                 logger.warning(
@@ -556,6 +557,49 @@ class Checkpoint:
         path = pages_dir / filename
         return is_valid_pdf(path)
 
+    def check_invariants(self, logger=None) -> list[str]:
+        """Verifica invariantes do manifest e retorna lista de inconsistencias.
+
+        Detecta:
+          - URL em exported E failures simultaneamente (qual venceu?)
+          - mapped_urls com duplicatas
+          - crawl_max_pages negativo
+          - crawl_complete=True com mapped_urls vazio
+          - URLs vazias/None em qualquer lista
+        """
+        issues: list[str] = []
+        m = self.manifest
+
+        # URLs em ambos exported e failures
+        both = set(m.exported.keys()) & set(m.failures.keys())
+        if both:
+            issues.append(
+                f"{len(both)} URL(s) em exported E failures simultaneamente "
+                f"(exemplo: {next(iter(both))[:80]})"
+            )
+
+        # mapped_urls duplicadas
+        if len(m.mapped_urls) != len(set(m.mapped_urls)):
+            dup_count = len(m.mapped_urls) - len(set(m.mapped_urls))
+            issues.append(f"mapped_urls tem {dup_count} duplicata(s)")
+
+        # crawl_max_pages negativo
+        if m.crawl_max_pages is not None and m.crawl_max_pages < 0:
+            issues.append(f"crawl_max_pages negativo: {m.crawl_max_pages}")
+
+        # crawl_complete inconsistente
+        if m.crawl_complete and not m.mapped_urls:
+            issues.append("crawl_complete=True mas mapped_urls esta vazio")
+
+        # URLs vazias
+        if any(not u or not isinstance(u, str) for u in m.mapped_urls):
+            issues.append("mapped_urls contem entries vazias ou nao-string")
+
+        if issues and logger is not None:
+            for issue in issues:
+                logger.warning("Manifest invariant: %s", issue)
+        return issues
+
     def reconcile_with_disk(self, pages_dir: Path, logger=None) -> int:
         """Remove do manifest entradas cujo PDF nao existe mais ou eh invalido.
 
@@ -797,10 +841,55 @@ _SSRF_BLOCKED_HOSTS = frozenset({
 })
 
 
-def _is_private_or_loopback_ip(hostname: str) -> bool:
-    """True se hostname eh IP privado, loopback ou link-local."""
+def _normalize_ipv4_alt_repr(hostname: str) -> str:
+    """Normaliza representacoes alternativas de IPv4 (hex/decimal/octal).
+
+    Examples:
+        '0x7f000001' -> '127.0.0.1'
+        '2130706433' -> '127.0.0.1'
+        '017700000001' -> '127.0.0.1'  (octal)
+
+    Retorna hostname original se nao for representacao alternativa.
+    """
+    import ipaddress
     try:
-        import ipaddress
+        # Tenta como int — ORDEM importa:
+        # 1. hex (0x...) primeiro (distintivo)
+        # 2. octal (0... com soh 0-7) ANTES de decimal (octal tambem eh isdigit())
+        # 3. decimal puro
+        if hostname.startswith(("0x", "0X")):
+            value = int(hostname, 16)
+        elif (
+            hostname.startswith("0") and len(hostname) > 1
+            and all(c in "01234567" for c in hostname)
+        ):
+            value = int(hostname, 8)
+        elif hostname.isdigit():
+            value = int(hostname)
+        else:
+            return hostname
+        # Converte int 32-bit para dotted-quad
+        if 0 <= value <= 0xFFFFFFFF:
+            return str(ipaddress.IPv4Address(value))
+    except ValueError:
+        pass
+    return hostname
+
+
+def _is_private_or_loopback_ip(hostname: str) -> bool:
+    """True se hostname eh IP privado, loopback ou link-local.
+
+    Tenta normalizar representacoes alternativas de IPv4 (hex, decimal, octal)
+    para detectar bypasses tipo `0x7f000001`, `2130706433`.
+    Remove zona ID de IPv6 (`fe80::1%eth0` -> `fe80::1`) antes de checar.
+    """
+    import ipaddress
+    # Remove zona ID IPv6 (`%eth0` etc)
+    if "%" in hostname:
+        hostname = hostname.split("%", 1)[0]
+    # Normaliza IPv4 alternativo
+    hostname = _normalize_ipv4_alt_repr(hostname)
+    try:
         ip = ipaddress.ip_address(hostname)
         return (
             ip.is_private or ip.is_loopback or ip.is_link_local
@@ -917,17 +1006,36 @@ def atomic_replace_with_retry(src: str, dst: str, max_retries: int = 5) -> None:
 
 
 def sanitize_proxy_for_log(proxy: str | None) -> str:
-    """Retorna proxy string sem credenciais para logging seguro."""
+    """Retorna proxy string sem credenciais para logging seguro.
+
+    Mascara username/password sempre. Hostname/porta sao preservados
+    APENAS se hostname for publico (nao IP privado/loopback). Caso
+    contrario, mascara hostname tambem (evita vazar infra interna).
+    """
     if not proxy:
         return ""
     try:
         parsed = urlparse(proxy)
-        if parsed.username or parsed.password:
-            host_part = parsed.hostname or ""
-            if parsed.port:
-                host_part = f"{host_part}:{parsed.port}"
-            return f"{parsed.scheme}://***@{host_part}"
-        return proxy
+        hostname = parsed.hostname or ""
+        port = parsed.port
+        scheme = parsed.scheme or "http"
+        has_creds = bool(parsed.username or parsed.password)
+
+        # Detecta infra interna (IPs privados, hostnames .internal, .local etc)
+        is_internal = _is_private_or_loopback_ip(hostname) or any(
+            hostname.endswith(suffix) for suffix in (".internal", ".local", ".lan")
+        )
+
+        if is_internal:
+            host_repr = "[REDACTED]"
+        else:
+            host_repr = hostname
+            if port:
+                host_repr = f"{host_repr}:{port}"
+
+        if has_creds:
+            return f"{scheme}://***:***@{host_repr}"
+        return f"{scheme}://{host_repr}"
     except (ValueError, AttributeError):
         return "[invalid proxy URL]"
 
@@ -1143,7 +1251,13 @@ _SLUGIFY_SUBSTITUTIONS = (
     ("@", "-at-"),
 )
 
+# Regex compiladas (modulo-level) — evita recompilar a cada chamada slugify().
+_SPACE_RE = re.compile(r"\s+")
+_NON_ASCII_SLUG_RE = re.compile(r"[^a-z0-9\- _]")
+_MULTI_DASH_RE = re.compile(r"-+")
 
+
+@__import__("functools").lru_cache(maxsize=4096)
 def slugify(value: str, max_len: int = _MAX_FILENAME_LEN) -> str:
     """Gera slug seguro para arquivo Windows preservando informacao multi-idioma.
 
@@ -1171,12 +1285,12 @@ def slugify(value: str, max_len: int = _MAX_FILENAME_LEN) -> str:
     normalized = unicodedata.normalize("NFKD", value)
     ascii_value = normalized.encode("ascii", "ignore").decode("ascii")
 
-    ascii_value = re.sub(r"\s+", " ", ascii_value).strip().lower()
+    ascii_value = _SPACE_RE.sub(" ", ascii_value).strip().lower()
     ascii_value = ascii_value.replace("/", "-")
     ascii_value = _INVALID_FILE_CHARS.sub("", ascii_value)
-    ascii_value = re.sub(r"[^a-z0-9\- _]", "", ascii_value)
+    ascii_value = _NON_ASCII_SLUG_RE.sub("", ascii_value)
     ascii_value = ascii_value.replace(" ", "-")
-    ascii_value = re.sub(r"-+", "-", ascii_value).strip("-")
+    ascii_value = _MULTI_DASH_RE.sub("-", ascii_value).strip("-")
 
     if not ascii_value:
         # Fallback para idiomas que nao normalizam para ASCII (chines/arabe/etc)
