@@ -24,10 +24,11 @@ def merge_pdfs(
     logger,
     consolidated_title: str = "TDN TOTVS - Consolidado",
 ) -> None:
-    """Mescla PDFs em consolidado com bookmarks e metadata.
+    """Mescla PDFs em consolidado com bookmarks, metadata e compressao.
 
     pdf_entries: lista de (path, titulo). Titulo vira marcador navegavel.
     Escreve em arquivo temporario e faz rename atomico no fim.
+    Aplica compressao de streams para reduzir tamanho do consolidado.
     """
     output_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -57,6 +58,7 @@ def merge_pdfs(
                 progress.advance(task)
 
         _set_metadata(writer, consolidated_title)
+        _compress_streams(writer, logger)
 
         with tmp_file.open("wb") as fp:
             writer.write(fp)
@@ -129,7 +131,6 @@ def _append_with_bookmark(
 def _set_metadata(writer: PdfWriter, title: str) -> None:
     """Define metadata do PDF consolidado (titulo, autor, datas)."""
     now = datetime.now()
-    # PDF date format: D:YYYYMMDDHHmmSS
     pdf_date = "D:" + now.strftime("%Y%m%d%H%M%S")
     try:
         writer.add_metadata({
@@ -142,3 +143,19 @@ def _set_metadata(writer: PdfWriter, title: str) -> None:
         })
     except (ValueError, KeyError):
         pass
+
+
+def _compress_streams(writer: PdfWriter, logger) -> None:
+    """Comprime streams de conteudo do PDF consolidado (reduz tamanho).
+
+    pypdf aplica zlib em streams nao comprimidos. Falha silenciosamente
+    em PDFs problematicos (best-effort).
+    """
+    try:
+        for page in writer.pages:
+            try:
+                page.compress_content_streams()
+            except (ValueError, KeyError, AttributeError, OSError):
+                continue
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Compressao de streams falhou (continuando sem): %s", exc)

@@ -23,10 +23,14 @@ O script faz tudo automaticamente:
 - Instala/atualiza as dependências (usa marker file para pular se já instalado)
 - Instala o Chromium do Playwright (~150MB, só na primeira vez)
 - Mostra um menu interativo:
-  - **[1] Execução rápida** — só pede a URL, resto usa padrões
-  - **[2] Execução avançada** — pergunta URL, pasta de saída, nome do consolidado, timeout, slow threshold, headless/headed e limite de páginas
-  - **[3] Reinstalar dependências** — força refresh
-  - **[4] Sair**
+  - **[1] Continuar trabalho anterior** — detecta jobs incompletos em `output/` e oferece retomar (resume automático)
+  - **[2] Iniciar novo trabalho** — só pede URL e pasta, usa rate limit configurado
+  - **[3] Execução avançada** — configura todos os parâmetros
+  - **[4] Verificar atualizações** (`--update`) — busca páginas novas, reusa PDFs existentes
+  - **[5] Regenerar todos os PDFs** (`--regenerate`)
+  - **[6] Configurar velocidade** — escolhe perfil (lento/médio/rápido/custom) que controla rate limit, workers e timeouts
+  - **[7] Listar trabalhos pendentes** — mostra todos os jobs incompletos no diretório
+  - **[8] Reinstalar dependências** | **[9] Reinstalar Chromium** | **[0] Sair**
 
 ## Uso manual (CLI)
 
@@ -42,9 +46,52 @@ py -m venv .venv
 - `--output-dir output`
 - `--consolidated-name TDN_TOTVS_consolidado.pdf`
 - `--headless` (padrão) | `--headed` (abre navegador para depuração)
-- `--timeout-seconds 120` — **limite total por página** (default 120s = 2min)
+- `--timeout-seconds 180` — **limite total por página** (default 180s = 3min; TDN tem páginas pesadas)
 - `--slow-threshold-seconds 60` — páginas demorando ≥ este valor são registradas em `slow_pages.log`
 - `--max-pages 10` (teste rápido)
+- `--request-delay 2.0` — pausa em segundos entre requests (anti-rate-limit, default 2s)
+- `--backoff-initial 30` — cooldown inicial em segundos após detectar bloqueio (5xx/429/timeout)
+- `--backoff-max 900` — teto do cooldown (default 900s = 15min) após bloqueios sucessivos
+- `--max-workers 1` — workers paralelos para PDFs (cuidado: mais workers = mais risco de bloqueio)
+- `--update` — re-mapeia a árvore procurando páginas novas (reusa PDFs existentes)
+- `--regenerate` — re-mapeia E regenera todos os PDFs
+- `--fresh` — ignora `manifest.json` e começa do zero
+
+### Outros comandos
+
+- `python -m src.main jobs --output-dir output` — lista trabalhos incompletos em todas as subpastas
+- `python -m src.main version` — mostra a versão
+
+## Anti-bloqueio (Cloudflare 522/429)
+
+O servidor TDN usa Cloudflare e bloqueia clientes que fazem requests rápidos demais. O extrator inclui defesas:
+
+- **Rate limit configurável** (`--request-delay`) — pausa entre cada request
+- **Backoff exponencial** — quando detecta 5xx/429/timeout, aumenta o cooldown (30s → 60s → 120s → ... até `--backoff-max`)
+- **User-Agent realista rotativo** — cada navegador aberto usa UA de Chrome/Edge/Firefox real (não "HeadlessChrome")
+- **Viewport variável** — tamanhos de janela realistas para reduzir fingerprinting
+- **Locale pt-BR + headers Accept-Language** — comportamento de usuário brasileiro real
+- **Detecção de challenge do Cloudflare** — se o servidor retornar página de "verifying you are human", aciona cooldown longo
+- **Circuit breaker** — após 5 falhas consecutivas de login/CF, aborta o pipeline (resume retoma depois)
+
+**Se você receber erro 522:** espere 15-60min, depois rode com `--request-delay 5` ou use o modo `[Lento e seguro]` do `iniciar.bat`.
+
+## Resume parcial e checkpoint
+
+Toda execução salva incrementalmente em `output/manifest.json`:
+
+- A cada 10 URLs mapeadas, o crawl persiste fila + URLs vistas + URLs já mapeadas
+- Cada PDF gerado é registrado no manifest com tamanho, título e tempo
+- URLs com falha (timeout, 5xx, login) ficam em `failures` com contagem de tentativas
+
+**Comportamento de retomada:**
+
+- Se você interromper (Ctrl+C, kill, crash) o **crawl** no meio, a próxima execução retoma da fila salva — não re-mapeia o que já foi
+- URLs com timeout no crawl voltam para a fila com até 2 tentativas intra-run; se desistir, vão para `failures` e são re-tentadas no próximo run (até 5 tentativas totais)
+- PDFs já gerados são reaproveitados (validação por header+EOF+tamanho mínimo de 3KB)
+- PDFs em geração são escritos primeiro em `.tmp` e renomeados só após validação — Ctrl+C nunca deixa PDF parcial que parece válido
+
+**Múltiplos jobs:** rode com `--output-dir output/MinhaArea` para isolar projetos diferentes. O `iniciar.bat` opção [1] detecta automaticamente jobs incompletos em qualquer subpasta de `output/`.
 
 ## Saídas
 
@@ -85,9 +132,17 @@ Resultado: o PDF contém todo o conteúdo das abas e seções, com headings clar
 
 ## Robustez
 
-- Cada navegação tem **retry** (até 2 tentativas) em erros de rede transientes via [tenacity]
+- **Rate limit adaptativo** com backoff exponencial em bloqueios (5xx/429/timeout/CF challenge)
+- **RateLimiter compartilhado** entre fase de crawl e export — cooldown propaga, não é resetado
+- **Manifest atômico thread-safe** (lock + write-tmp + rename + fsync) — múltiplos workers não corrompem
+- **PDFs com escrita atômica** (.tmp + rename apenas após validar) — Ctrl+C nunca deixa arquivo parcial passando
+- **Resume parcial do crawl** (queue + seen persistidos a cada 10 URLs)
+- **Retry automático entre runs**: URLs em `failures` voltam para nova tentativa (até 5x)
+- **Circuit breaker**: aborta export após 5 falhas consecutivas de login/CF challenge
+- **Log com rotação automática** (10MB × 5 backups) — não enche disco
+- **Mensagens de erro acionáveis**: ao falhar, sugere ação concreta (aumentar delay, reinstalar Chromium, etc)
+- Cada navegação tem **retry** via [tenacity] em erros de rede transientes
 - Output formatado com [rich] (barras de progresso, tabelas de resumo, tracebacks)
-- Compatibilidade total com terminal Windows via [colorama]
 - PDFs corrompidos são pulados na consolidação (resto continua)
 
 ## Observações de escopo
@@ -109,4 +164,3 @@ Resultado: o PDF contém todo o conteúdo das abas e seções, com headings clar
 
 [tenacity]: https://github.com/jd/tenacity
 [rich]: https://github.com/Textualize/rich
-[colorama]: https://github.com/tartley/colorama

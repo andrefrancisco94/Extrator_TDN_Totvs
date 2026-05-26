@@ -150,54 +150,117 @@ echo   Ambiente pronto.
 echo ============================================================
 echo.
 
+REM ============================================================
+REM  Variaveis para a sessao (configuraveis no menu de velocidade)
+REM ============================================================
+set "SPEED_MODE=safe"
+set "REQUEST_DELAY=2.0"
+set "BACKOFF_INITIAL=30"
+set "BACKOFF_MAX=900"
+set "WORKERS=1"
+set "TIMEOUT=180"
+set "SLOW=60"
+
 :MENU
+echo.
 echo ============================================================
-echo   Menu Principal
+echo   Menu Principal  ^(velocidade: %SPEED_MODE% ^| %REQUEST_DELAY%s/req ^| %WORKERS% worker^(s^)^)
 echo ============================================================
-echo   [1] Execucao rapida    (so URL, resume automatico)
-echo   [2] Execucao avancada  (configura todas as opcoes)
-echo   [3] Verificar atualizacoes da TDN (--update: busca paginas novas)
-echo   [4] Regenerar todos os PDFs (--regenerate: refaz tudo)
-echo   [5] Reinstalar dependencias Python
-echo   [6] Reinstalar Chromium (use se der erro de ICU/launch)
-echo   [7] Sair
+echo   [1] Continuar trabalho anterior  ^(detecta automaticamente^)
+echo   [2] Iniciar novo trabalho  ^(rapido, so URL + pasta^)
+echo   [3] Execucao avancada  ^(configura tudo^)
+echo   [4] Verificar atualizacoes  ^(--update: busca paginas novas^)
+echo   [5] Regenerar todos os PDFs  ^(--regenerate: refaz tudo^)
+echo   [6] Configurar velocidade  ^(rate limit, workers^)
+echo   [7] Listar trabalhos pendentes  ^(jobs incompletos^)
+echo   [8] Reinstalar dependencias Python
+echo   [9] Reinstalar Chromium  ^(use se der erro de ICU/launch^)
+echo   [0] Sair
 echo ============================================================
 set "OPC="
-set /p "OPC=Escolha uma opcao [1-7]: "
+set /p "OPC=Escolha uma opcao [0-9]: "
 
-if "%OPC%"=="1" goto QUICK
-if "%OPC%"=="2" goto ADVANCED
-if "%OPC%"=="3" goto UPDATE_MODE
-if "%OPC%"=="4" goto REGENERATE_MODE
-if "%OPC%"=="5" goto REINSTALL
-if "%OPC%"=="6" goto REINSTALL_CHROME
-if "%OPC%"=="7" goto END
+if "%OPC%"=="1" goto RESUME
+if "%OPC%"=="2" goto QUICK
+if "%OPC%"=="3" goto ADVANCED
+if "%OPC%"=="4" goto UPDATE_MODE
+if "%OPC%"=="5" goto REGENERATE_MODE
+if "%OPC%"=="6" goto SPEED_MENU
+if "%OPC%"=="7" goto LIST_JOBS
+if "%OPC%"=="8" goto REINSTALL
+if "%OPC%"=="9" goto REINSTALL_CHROME
+if "%OPC%"=="0" goto END
 echo Opcao invalida.
 echo.
 goto MENU
 
-REM ---------- Execucao rapida ----------
-:QUICK
+REM ============================================================
+REM  [1] Continuar trabalho anterior - detecta jobs incompletos
+REM ============================================================
+:RESUME
 echo.
-echo --- Execucao Rapida ---
-set "URL="
-set /p "URL=URL inicial da documentacao TDN: "
-if defined URL set "URL=%URL:"=%"
-if "%URL%"=="" (
-    echo [ERRO] URL obrigatoria.
-    echo.
+echo --- Continuar Trabalho Anterior ---
+echo Procurando trabalhos incompletos em output/...
+echo.
+
+REM Lista jobs pendentes em formato linha (pasta^|url)
+set "JOBS_FILE=%TEMP%\extrator_jobs.tmp"
+"%VENV_PY%" -c "from pathlib import Path; from src.utils import find_pending_jobs; jobs = find_pending_jobs(Path('output')); [print(f'{j.output_dir}|{j.start_url}|{j.mapped_count}|{j.queue_count}|{j.exported_count}|{j.failure_count}|{j.last_updated}') for j in jobs]" > "%JOBS_FILE%" 2>nul
+
+if not exist "%JOBS_FILE%" (
+    echo [INFO] Nenhum job pendente encontrado.
+    echo Use opcao [2] para iniciar um trabalho novo.
+    pause
     goto MENU
 )
+
+REM Conta linhas (jobs)
+set "JOB_COUNT=0"
+for /f "usebackq" %%L in ("%JOBS_FILE%") do set /a JOB_COUNT+=1
+if "%JOB_COUNT%"=="0" (
+    echo [INFO] Nenhum job pendente encontrado.
+    echo Use opcao [2] para iniciar um trabalho novo.
+    del "%JOBS_FILE%" >nul 2>nul
+    pause
+    goto MENU
+)
+
+echo Jobs incompletos encontrados:
 echo.
-echo Executando com:
-echo   URL          = %URL%
-echo   Saida        = output
-echo   Consolidado  = TDN_TOTVS_consolidado.pdf
-echo   Timeout      = 120s (2min por pagina)
-echo   Slow log     = paginas que demorarem 60s ou mais
-echo   Headless     = sim
+set "IDX=0"
+for /f "usebackq tokens=1-7 delims=|" %%A in ("%JOBS_FILE%") do (
+    set /a IDX+=1
+    set "JOB_!IDX!_DIR=%%A"
+    set "JOB_!IDX!_URL=%%B"
+    echo   [!IDX!] %%~nxA  ^(mapeadas=%%C^|fila=%%D^|PDFs=%%E^|falhas=%%F^)
+    echo        URL: %%B
+    echo        Atualizado: %%G
+    echo.
+)
+del "%JOBS_FILE%" >nul 2>nul
+
+set "JOB_PICK="
+set /p "JOB_PICK=Qual job continuar? [1-%JOB_COUNT%] (0 = cancelar): "
+if "%JOB_PICK%"=="0" goto MENU
+if "%JOB_PICK%"=="" goto MENU
+
+set "PICKED_DIR=!JOB_%JOB_PICK%_DIR!"
+set "PICKED_URL=!JOB_%JOB_PICK%_URL!"
+if "%PICKED_DIR%"=="" (
+    echo [ERRO] Selecao invalida.
+    pause
+    goto MENU
+)
+
 echo.
-"%VENV_PY%" -m src.main run "%URL%" --output-dir output --timeout-seconds 120 --slow-threshold-seconds 60 --headless
+echo Continuando job:
+echo   Pasta : %PICKED_DIR%
+echo   URL   : %PICKED_URL%
+echo   Rate  : %REQUEST_DELAY%s/req ^| backoff %BACKOFF_INITIAL%s -^> %BACKOFF_MAX%s ^| workers=%WORKERS%
+echo   Timeout: %TIMEOUT%s/pagina ^| slow %SLOW%s
+echo.
+
+"%VENV_PY%" -m src.main run "%PICKED_URL%" --output-dir "%PICKED_DIR%" --timeout-seconds %TIMEOUT% --slow-threshold-seconds %SLOW% --headless --request-delay %REQUEST_DELAY% --backoff-initial %BACKOFF_INITIAL% --backoff-max %BACKOFF_MAX% --max-workers %WORKERS% --yes
 set "EXITCODE=%errorlevel%"
 if not "%EXITCODE%"=="0" (
     echo.
@@ -206,7 +269,50 @@ if not "%EXITCODE%"=="0" (
 )
 goto AFTER_RUN
 
-REM ---------- Execucao avancada ----------
+REM ============================================================
+REM  [2] Execucao rapida - novo trabalho
+REM ============================================================
+:QUICK
+echo.
+echo --- Iniciar Novo Trabalho ---
+set "URL="
+set /p "URL=URL inicial da documentacao TDN: "
+if defined URL set "URL=%URL:"=%"
+if "%URL%"=="" (
+    echo [ERRO] URL obrigatoria.
+    echo.
+    goto MENU
+)
+
+REM Sugere um nome de pasta baseado na URL (ultimo segmento)
+set "DEFAULT_DIR=output"
+set "OUTDIR="
+echo Sugestao: use uma subpasta por projeto, ex: output\MinhaArea
+set /p "OUTDIR=Pasta de saida [%DEFAULT_DIR%]: "
+if defined OUTDIR set "OUTDIR=%OUTDIR:"=%"
+if "%OUTDIR%"=="" set "OUTDIR=%DEFAULT_DIR%"
+
+echo.
+echo Executando com:
+echo   URL          = %URL%
+echo   Saida        = %OUTDIR%
+echo   Consolidado  = TDN_TOTVS_consolidado.pdf
+echo   Timeout      = %TIMEOUT%s/pagina  Slow = %SLOW%s
+echo   Rate limit   = %REQUEST_DELAY%s/req  Workers = %WORKERS%
+echo   Backoff      = %BACKOFF_INITIAL%s -^> %BACKOFF_MAX%s (em bloqueio)
+echo.
+"%VENV_PY%" -m src.main run "%URL%" --output-dir "%OUTDIR%" --timeout-seconds %TIMEOUT% --slow-threshold-seconds %SLOW% --headless --request-delay %REQUEST_DELAY% --backoff-initial %BACKOFF_INITIAL% --backoff-max %BACKOFF_MAX% --max-workers %WORKERS%
+set "EXITCODE=%errorlevel%"
+if not "%EXITCODE%"=="0" (
+    echo.
+    echo [ERRO] A execucao terminou com codigo %EXITCODE%. Veja a mensagem acima.
+    pause
+)
+goto AFTER_RUN
+
+REM ============================================================
+REM  [3] Execucao avancada
+REM ============================================================
 :ADVANCED
 echo.
 echo --- Execucao Avancada (Enter aceita o padrao mostrado entre colchetes) ---
@@ -221,37 +327,47 @@ if "%URL%"=="" (
     goto MENU
 )
 
-set "OUTDIR=output"
+set "OUTDIR="
 set /p "OUTDIR=Pasta de saida [output]: "
 if defined OUTDIR set "OUTDIR=%OUTDIR:"=%"
 if "%OUTDIR%"=="" set "OUTDIR=output"
 
-set "CONSOL=TDN_TOTVS_consolidado.pdf"
+set "CONSOL="
 set /p "CONSOL=Nome do PDF consolidado [TDN_TOTVS_consolidado.pdf]: "
 if defined CONSOL set "CONSOL=%CONSOL:"=%"
 if "%CONSOL%"=="" set "CONSOL=TDN_TOTVS_consolidado.pdf"
 
-set "TIMEOUT=120"
-set /p "TIMEOUT=Timeout por pagina em segundos [120]: "
-if defined TIMEOUT set "TIMEOUT=%TIMEOUT:"=%"
-if "%TIMEOUT%"=="" set "TIMEOUT=120"
-echo %TIMEOUT%| findstr /r "^[1-9][0-9]*$" >nul
+set "ADV_TIMEOUT=%TIMEOUT%"
+set /p "ADV_TIMEOUT=Timeout por pagina em segundos [%TIMEOUT%]: "
+if defined ADV_TIMEOUT set "ADV_TIMEOUT=%ADV_TIMEOUT:"=%"
+if "%ADV_TIMEOUT%"=="" set "ADV_TIMEOUT=%TIMEOUT%"
+echo %ADV_TIMEOUT%| findstr /r "^[1-9][0-9]*$" >nul
 if errorlevel 1 (
-    echo [ERRO] Timeout deve ser inteiro positivo. Recebido: %TIMEOUT%
+    echo [ERRO] Timeout deve ser inteiro positivo. Recebido: %ADV_TIMEOUT%
     echo.
     goto MENU
 )
 
-set "SLOW=60"
-set /p "SLOW=Limite para marcar como 'lenta' em segundos [60]: "
-if defined SLOW set "SLOW=%SLOW:"=%"
-if "%SLOW%"=="" set "SLOW=60"
-echo %SLOW%| findstr /r "^[1-9][0-9]*$" >nul
+set "ADV_SLOW=%SLOW%"
+set /p "ADV_SLOW=Limite para marcar como 'lenta' em segundos [%SLOW%]: "
+if defined ADV_SLOW set "ADV_SLOW=%ADV_SLOW:"=%"
+if "%ADV_SLOW%"=="" set "ADV_SLOW=%SLOW%"
+echo %ADV_SLOW%| findstr /r "^[1-9][0-9]*$" >nul
 if errorlevel 1 (
-    echo [ERRO] Slow threshold deve ser inteiro positivo. Recebido: %SLOW%
+    echo [ERRO] Slow threshold deve ser inteiro positivo. Recebido: %ADV_SLOW%
     echo.
     goto MENU
 )
+
+set "ADV_DELAY=%REQUEST_DELAY%"
+set /p "ADV_DELAY=Delay entre requests em segundos [%REQUEST_DELAY%]: "
+if defined ADV_DELAY set "ADV_DELAY=%ADV_DELAY:"=%"
+if "%ADV_DELAY%"=="" set "ADV_DELAY=%REQUEST_DELAY%"
+
+set "ADV_WORKERS=%WORKERS%"
+set /p "ADV_WORKERS=Workers paralelos (1-8) [%WORKERS%]: "
+if defined ADV_WORKERS set "ADV_WORKERS=%ADV_WORKERS:"=%"
+if "%ADV_WORKERS%"=="" set "ADV_WORKERS=%WORKERS%"
 
 set "HEADLESS_OPT=--headless"
 set "HEADLESS_TXT=sim"
@@ -281,8 +397,8 @@ echo Executando com:
 echo   URL          = %URL%
 echo   Saida        = %OUTDIR%
 echo   Consolidado  = %CONSOL%
-echo   Timeout      = %TIMEOUT%s
-echo   Slow log     = %SLOW%s
+echo   Timeout      = %ADV_TIMEOUT%s    Slow = %ADV_SLOW%s
+echo   Rate         = %ADV_DELAY%s/req  Workers = %ADV_WORKERS%
 echo   Headless     = %HEADLESS_TXT%
 if "%MAX%"=="" (
     echo   Max paginas  = sem limite
@@ -291,7 +407,7 @@ if "%MAX%"=="" (
 )
 echo.
 
-"%VENV_PY%" -m src.main run "%URL%" --output-dir "%OUTDIR%" --consolidated-name "%CONSOL%" --timeout-seconds %TIMEOUT% --slow-threshold-seconds %SLOW% %HEADLESS_OPT% %MAX_OPT%
+"%VENV_PY%" -m src.main run "%URL%" --output-dir "%OUTDIR%" --consolidated-name "%CONSOL%" --timeout-seconds %ADV_TIMEOUT% --slow-threshold-seconds %ADV_SLOW% %HEADLESS_OPT% %MAX_OPT% --request-delay %ADV_DELAY% --backoff-initial %BACKOFF_INITIAL% --backoff-max %BACKOFF_MAX% --max-workers %ADV_WORKERS%
 set "EXITCODE=%errorlevel%"
 if not "%EXITCODE%"=="0" (
     echo.
@@ -300,7 +416,9 @@ if not "%EXITCODE%"=="0" (
 )
 goto AFTER_RUN
 
-REM ---------- Verificar atualizacoes (--update) ----------
+REM ============================================================
+REM  [4] Verificar atualizacoes (--update)
+REM ============================================================
 :UPDATE_MODE
 echo.
 echo --- Verificar Atualizacoes da TDN ---
@@ -315,14 +433,14 @@ if "%URL%"=="" (
     echo.
     goto MENU
 )
-set "OUTDIR=output"
+set "OUTDIR="
 set /p "OUTDIR=Pasta de saida [output]: "
 if defined OUTDIR set "OUTDIR=%OUTDIR:"=%"
 if "%OUTDIR%"=="" set "OUTDIR=output"
 echo.
 echo Executando em modo UPDATE...
 echo.
-"%VENV_PY%" -m src.main run "%URL%" --output-dir "%OUTDIR%" --timeout-seconds 120 --slow-threshold-seconds 60 --headless --update --yes
+"%VENV_PY%" -m src.main run "%URL%" --output-dir "%OUTDIR%" --timeout-seconds %TIMEOUT% --slow-threshold-seconds %SLOW% --headless --update --yes --request-delay %REQUEST_DELAY% --backoff-initial %BACKOFF_INITIAL% --backoff-max %BACKOFF_MAX% --max-workers %WORKERS%
 set "EXITCODE=%errorlevel%"
 if not "%EXITCODE%"=="0" (
     echo.
@@ -331,7 +449,9 @@ if not "%EXITCODE%"=="0" (
 )
 goto AFTER_RUN
 
-REM ---------- Regenerar tudo (--regenerate) ----------
+REM ============================================================
+REM  [5] Regenerar tudo (--regenerate)
+REM ============================================================
 :REGENERATE_MODE
 echo.
 echo --- Regenerar Todos os PDFs ---
@@ -347,14 +467,14 @@ if "%URL%"=="" (
     echo.
     goto MENU
 )
-set "OUTDIR=output"
+set "OUTDIR="
 set /p "OUTDIR=Pasta de saida [output]: "
 if defined OUTDIR set "OUTDIR=%OUTDIR:"=%"
 if "%OUTDIR%"=="" set "OUTDIR=output"
 echo.
 echo Executando em modo REGENERATE (pode demorar - refaz todos os PDFs)...
 echo.
-"%VENV_PY%" -m src.main run "%URL%" --output-dir "%OUTDIR%" --timeout-seconds 120 --slow-threshold-seconds 60 --headless --regenerate --yes
+"%VENV_PY%" -m src.main run "%URL%" --output-dir "%OUTDIR%" --timeout-seconds %TIMEOUT% --slow-threshold-seconds %SLOW% --headless --regenerate --yes --request-delay %REQUEST_DELAY% --backoff-initial %BACKOFF_INITIAL% --backoff-max %BACKOFF_MAX% --max-workers %WORKERS%
 set "EXITCODE=%errorlevel%"
 if not "%EXITCODE%"=="0" (
     echo.
@@ -363,7 +483,93 @@ if not "%EXITCODE%"=="0" (
 )
 goto AFTER_RUN
 
-REM ---------- Reinstalar dependencias ----------
+REM ============================================================
+REM  [6] Menu de velocidade
+REM ============================================================
+:SPEED_MENU
+echo.
+echo --- Configurar Velocidade ---
+echo Modo atual: %SPEED_MODE%  ^(delay=%REQUEST_DELAY%s ^| workers=%WORKERS% ^| timeout=%TIMEOUT%s^)
+echo.
+echo   [1] Lento e seguro      ^(2s/req, 1 worker, timeout 180s^)  - RECOMENDADO
+echo   [2] Medio                ^(1s/req, 2 workers, timeout 150s^)
+echo   [3] Rapido               ^(0.5s/req, 3 workers, timeout 120s^) - CUIDADO 522
+echo   [4] Personalizado
+echo   [0] Voltar
+echo.
+set "SP="
+set /p "SP=Escolha [0-4]: "
+if "%SP%"=="1" (
+    set "SPEED_MODE=safe"
+    set "REQUEST_DELAY=2.0"
+    set "BACKOFF_INITIAL=30"
+    set "BACKOFF_MAX=900"
+    set "WORKERS=1"
+    set "TIMEOUT=180"
+    set "SLOW=60"
+    echo Modo seguro ativado.
+    goto MENU
+)
+if "%SP%"=="2" (
+    set "SPEED_MODE=medio"
+    set "REQUEST_DELAY=1.0"
+    set "BACKOFF_INITIAL=60"
+    set "BACKOFF_MAX=900"
+    set "WORKERS=2"
+    set "TIMEOUT=150"
+    set "SLOW=60"
+    echo Modo medio ativado.
+    goto MENU
+)
+if "%SP%"=="3" (
+    set "SPEED_MODE=rapido"
+    set "REQUEST_DELAY=0.5"
+    set "BACKOFF_INITIAL=120"
+    set "BACKOFF_MAX=1800"
+    set "WORKERS=3"
+    set "TIMEOUT=120"
+    set "SLOW=60"
+    echo Modo rapido ativado. ATENCAO: maior risco de bloqueio (522).
+    goto MENU
+)
+if "%SP%"=="4" goto SPEED_CUSTOM
+if "%SP%"=="0" goto MENU
+echo Opcao invalida.
+goto SPEED_MENU
+
+:SPEED_CUSTOM
+set "SPEED_MODE=custom"
+set "VAL="
+set /p "VAL=Delay entre requests em segundos [%REQUEST_DELAY%]: "
+if defined VAL if not "%VAL%"=="" set "REQUEST_DELAY=%VAL%"
+set "VAL="
+set /p "VAL=Workers paralelos (1-8) [%WORKERS%]: "
+if defined VAL if not "%VAL%"=="" set "WORKERS=%VAL%"
+set "VAL="
+set /p "VAL=Timeout por pagina em segundos [%TIMEOUT%]: "
+if defined VAL if not "%VAL%"=="" set "TIMEOUT=%VAL%"
+set "VAL="
+set /p "VAL=Backoff inicial em segundos (apos bloqueio) [%BACKOFF_INITIAL%]: "
+if defined VAL if not "%VAL%"=="" set "BACKOFF_INITIAL=%VAL%"
+set "VAL="
+set /p "VAL=Backoff maximo em segundos [%BACKOFF_MAX%]: "
+if defined VAL if not "%VAL%"=="" set "BACKOFF_MAX=%VAL%"
+echo Configuracao personalizada salva.
+goto MENU
+
+REM ============================================================
+REM  [7] Listar jobs pendentes
+REM ============================================================
+:LIST_JOBS
+echo.
+"%VENV_PY%" -m src.main jobs --output-dir output
+echo.
+pause
+goto MENU
+
+REM ============================================================
+REM  [8] Reinstalar dependencias
+REM ============================================================
 :REINSTALL
 echo.
 echo --- Forcando reinstalacao das dependencias Python ---
@@ -381,7 +587,9 @@ echo Dependencias reinstaladas.
 echo.
 goto MENU
 
-REM ---------- Reinstalar Chromium (corrige corrupcao) ----------
+REM ============================================================
+REM  [9] Reinstalar Chromium
+REM ============================================================
 :REINSTALL_CHROME
 echo.
 echo --- Forcando download limpo do Chromium ---

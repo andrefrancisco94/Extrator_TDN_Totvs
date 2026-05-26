@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
 import os
+import random
 import re
+import threading
+import time
+import unicodedata
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,6 +24,13 @@ colorama.just_fix_windows_console()
 
 KEEP_QUERY_PARAMS = {"pageId", "spaceKey", "title"}
 
+MANIFEST_FILENAME = "manifest.json"
+STORAGE_STATE_FILENAME = "browser_state.json"
+
+# Maximo de tentativas por URL antes de desistir definitivamente. URLs em
+# failures com attempts < este valor sao re-enqueuadas no proximo run.
+MAX_RETRY_ATTEMPTS = 5
+
 _INVALID_FILE_CHARS = re.compile(r"[<>:\"/\\|?*\x00-\x1f]")
 _MAX_FILENAME_LEN = 80
 
@@ -29,8 +41,9 @@ _WINDOWS_RESERVED_NAMES = frozenset({
     "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
 })
 
-# Tamanho minimo aceitavel para um PDF gerado (header + estrutura basica > 1KB)
-_MIN_VALID_PDF_SIZE = 1024
+# Tamanho minimo aceitavel para um PDF gerado. Aumentado de 1KB para 3KB
+# para reduzir falsos positivos (paginas de erro/login renderizam ~1.5KB).
+_MIN_VALID_PDF_SIZE = 3 * 1024
 
 _console: Console | None = None
 
@@ -45,6 +58,209 @@ def get_console() -> Console:
 # ---------------------------------------------------------------------------
 # Modelos
 # ---------------------------------------------------------------------------
+
+
+@dataclass
+class RateLimitConfig:
+    """Configuracao de rate limit + backoff anti-bloqueio.
+
+    base_delay_seconds: pausa minima entre requests (anti-rate-limit basico).
+    backoff_initial_seconds: cooldown apos detectar bloqueio (5xx, 429).
+    backoff_max_seconds: teto do cooldown apos bloqueios sucessivos.
+    backoff_multiplier: cada bloqueio sucessivo multiplica o cooldown por isto.
+    jitter_ratio: variacao aleatoria do delay base (0.0 a 1.0 = +/-10% a +/-100%).
+    """
+    base_delay_seconds: float = 2.0
+    backoff_initial_seconds: float = 30.0
+    backoff_max_seconds: float = 900.0  # 15min teto
+    backoff_multiplier: float = 2.0
+    jitter_ratio: float = 0.2
+
+
+class RateLimiter:
+    """Throttle adaptativo: delay base entre requests + cooldown crescente em bloqueios.
+
+    Uso:
+        await limiter.wait()           # antes de cada request
+        limiter.report_success()       # apos request bem-sucedido
+        await limiter.report_block(logger)  # apos 5xx/429/timeout consecutivo
+
+    Thread-safe entre coroutines via asyncio.Lock. Nao protege contra threads,
+    so contra concorrencia cooperativa de asyncio.
+    """
+
+    def __init__(self, config: RateLimitConfig):
+        self.config = config
+        self._lock = asyncio.Lock()
+        self._last_request_at: float = 0.0
+        self._consecutive_blocks: int = 0
+        self._cooldown_until: float = 0.0
+
+    async def wait(self) -> None:
+        """Bloqueia ate ser seguro fazer o proximo request.
+
+        IMPORTANTE: o lock so eh segurado para reservar o slot temporal
+        (atualizar _last_request_at e calcular sleep). O asyncio.sleep
+        em si acontece FORA do lock para permitir que outros workers
+        avancem em paralelo respeitando suas proprias reservas.
+        """
+        async with self._lock:
+            now = time.monotonic()
+            cooldown_sleep = max(0.0, self._cooldown_until - now)
+            # Calcula tempo desde o ultimo request reservado
+            elapsed_since_reserved = now - self._last_request_at
+            jitter = 1.0 + random.uniform(
+                -self.config.jitter_ratio, self.config.jitter_ratio,
+            )
+            target_delay = max(0.0, self.config.base_delay_seconds * jitter)
+            base_sleep = max(0.0, target_delay - elapsed_since_reserved)
+            # Reserva o slot: marca o tempo em que este request VAI ocorrer
+            total_sleep = cooldown_sleep + base_sleep
+            self._last_request_at = now + total_sleep
+
+        if total_sleep > 0:
+            await asyncio.sleep(total_sleep)
+
+    def report_success(self) -> None:
+        """Reseta o contador de bloqueios consecutivos."""
+        self._consecutive_blocks = 0
+
+    async def report_block(self, logger=None, reason: str = "") -> float:
+        """Registra bloqueio e agenda cooldown exponencial. Retorna duracao do cooldown."""
+        async with self._lock:
+            self._consecutive_blocks += 1
+            cooldown = min(
+                self.config.backoff_max_seconds,
+                self.config.backoff_initial_seconds
+                * (self.config.backoff_multiplier ** (self._consecutive_blocks - 1)),
+            )
+            # Jitter de +/- 25% no cooldown pra nao sincronizar tentativas
+            cooldown *= 1.0 + random.uniform(-0.25, 0.25)
+            self._cooldown_until = time.monotonic() + cooldown
+            if logger is not None:
+                logger.warning(
+                    "Bloqueio detectado%s. Cooldown #%d: %.0fs",
+                    f" ({reason})" if reason else "",
+                    self._consecutive_blocks, cooldown,
+                )
+            return cooldown
+
+    @property
+    def consecutive_blocks(self) -> int:
+        return self._consecutive_blocks
+
+
+_REALISTIC_USER_AGENTS = (
+    # Chrome 120 Win10
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    # Chrome 121 Win11
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+    # Edge 121
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 Edg/121.0.0.0",
+    # Firefox 122
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
+)
+
+_REALISTIC_VIEWPORTS = (
+    {"width": 1920, "height": 1080},
+    {"width": 1536, "height": 864},
+    {"width": 1440, "height": 900},
+    {"width": 1366, "height": 768},
+    {"width": 1600, "height": 900},
+)
+
+
+def pick_user_agent() -> str:
+    """Retorna um User-Agent realista aleatorio (anti-fingerprinting)."""
+    return random.choice(_REALISTIC_USER_AGENTS)
+
+
+def pick_viewport() -> dict:
+    """Retorna viewport realistico aleatorio."""
+    return random.choice(_REALISTIC_VIEWPORTS)
+
+
+def build_browser_context_args(
+    state_path: Path | None = None,
+    proxy_url: str | None = None,
+) -> dict:
+    """Argumentos comuns para new_context (UA, viewport, locale, storage_state, proxy)."""
+    args: dict = {
+        "user_agent": pick_user_agent(),
+        "viewport": pick_viewport(),
+        "locale": "pt-BR",
+        "timezone_id": "America/Sao_Paulo",
+        "extra_http_headers": {
+            "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+        },
+    }
+    if state_path and state_path.exists():
+        try:
+            with state_path.open("r", encoding="utf-8") as fp:
+                json.load(fp)
+            args["storage_state"] = str(state_path)
+        except (OSError, ValueError):
+            pass  # ignora storage_state corrompido
+    proxy_dict = parse_proxy_arg(proxy_url)
+    if proxy_dict:
+        args["proxy"] = proxy_dict
+    return args
+
+
+def parse_proxy_arg(proxy: str | None) -> dict | None:
+    """Converte string de proxy em dict do Playwright. Suporta env var fallback."""
+    if not proxy:
+        proxy = os.environ.get("HTTP_PROXY") or os.environ.get("HTTPS_PROXY")
+    if not proxy:
+        return None
+    parsed = urlparse(proxy)
+    if parsed.scheme not in {"http", "https", "socks5"}:
+        return None
+    result = {"server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port or 80}"}
+    if parsed.username:
+        result["username"] = parsed.username
+    if parsed.password:
+        result["password"] = parsed.password
+    return result
+
+
+_CF_CHALLENGE_INDICATORS = (
+    "cf-browser-verification",
+    "challenge-platform",
+    "checking your browser",
+    "verifying you are human",
+    "ddos protection by cloudflare",
+    "ray id:",
+    "cf-error",
+    "cf-chl-bypass",
+)
+
+
+def is_cloudflare_challenge(content_lower: str) -> bool:
+    """Detecta paginas de challenge do Cloudflare via marcadores no HTML."""
+    return any(k in content_lower for k in _CF_CHALLENGE_INDICATORS)
+
+
+def is_blocking_error(exc: BaseException) -> bool:
+    """Detecta excecoes que sugerem bloqueio do servidor (Cloudflare 5xx, 429).
+
+    Heuristica conservadora: tem que ter palavras-chave especificas na mensagem.
+    """
+    msg = str(exc).lower()
+    keywords = (
+        "522", "523", "524", "525",  # Cloudflare origin errors
+        "502", "503", "504",  # Bad gateway / unavailable / timeout
+        "429",  # Too many requests
+        "net::err_aborted",
+        "net::err_connection_reset",
+        "net::err_connection_closed",
+        "net::err_timed_out",
+        "err_http_response_code_failure",
+    )
+    return any(k in msg for k in keywords)
 
 
 @dataclass(frozen=True)
@@ -64,7 +280,7 @@ class SlowPageRecord:
 @dataclass
 class Manifest:
     """Estado persistido entre execucoes para resume/checkpoint."""
-    version: int = 1
+    version: int = 2
     start_url: str = ""
     started_at: str = ""
     last_updated: str = ""
@@ -73,10 +289,17 @@ class Manifest:
     # Permite detectar quando o usuario muda max_pages e force re-crawl.
     crawl_max_pages: int | None = None
     mapped_urls: list[str] = field(default_factory=list)
+    # Fila de URLs ainda nao mapeadas (para resume parcial de crawl interrompido).
+    # Quando crawl_complete=True isto eh sempre vazio.
+    crawl_queue: list[str] = field(default_factory=list)
+    # URLs ja vistas no crawl (independente de terem virado mapped_urls).
+    # Evita reprocessar paginas que falharam por timeout no resume.
+    crawl_seen: list[str] = field(default_factory=list)
     # url -> {filename, title, size_bytes, elapsed_seconds}
     exported: dict[str, dict] = field(default_factory=dict)
-    # url -> error
-    failures: dict[str, str] = field(default_factory=dict)
+    # url -> {error, attempts, last_attempt}. URLs com failures voltam pra fila
+    # no resume para nova tentativa (ate _MAX_RETRY_ATTEMPTS).
+    failures: dict[str, dict] = field(default_factory=dict)
 
 
 class Checkpoint:
@@ -84,12 +307,21 @@ class Checkpoint:
 
     Quando o arquivo existe mas esta corrompido ou e de versao incompativel,
     armazena o motivo em `load_warning` para o caller poder alertar o usuario.
+
+    Thread-safe entre coroutines via threading.Lock no save() (acessado tambem
+    de codigo sincrono, por isso threading e nao asyncio.Lock).
     """
 
     def __init__(self, output_dir: Path, start_url: str, logger=None):
-        self.path = output_dir / "manifest.json"
+        self.path = output_dir / MANIFEST_FILENAME
         self.load_warning: str | None = None
+        # Se manifest anterior tinha outro start_url, fica registrado aqui
+        # para que o caller possa alertar/confirmar com o usuario.
+        self.previous_start_url: str | None = None
         self.manifest = self._load_or_create(start_url)
+        # Serializa escritas no manifest. Sem isto, 2 workers podem chamar
+        # save() simultaneamente e corromper o JSON (race em tmp + replace).
+        self._save_lock = threading.Lock()
         if self.load_warning and logger is not None:
             logger.warning("Manifest descartado: %s (recomecando do zero)", self.load_warning)
 
@@ -104,13 +336,16 @@ class Checkpoint:
             self.load_warning = f"manifest.json invalido/corrompido ({exc})"
             return self._fresh(start_url)
 
-        if data.get("version") != 1:
+        version = data.get("version")
+        if version not in (1, 2):
             self.load_warning = (
-                f"manifest.json com versao desconhecida ({data.get('version')!r})"
+                f"manifest.json com versao desconhecida ({version!r})"
             )
             return self._fresh(start_url)
-        if data.get("start_url") != start_url:
-            # Mudou a URL inicial — silencioso, e esperado quando muda projeto.
+        prev_url = str(data.get("start_url", ""))
+        if prev_url and prev_url != start_url:
+            # Mudou a URL inicial — preserva info para alertar o caller.
+            self.previous_start_url = prev_url
             return self._fresh(start_url)
 
         crawl_complete = bool(data.get("crawl_complete", False))
@@ -120,16 +355,31 @@ class Checkpoint:
             self.load_warning = "manifest.json marcado como crawl_complete mas sem URLs"
             return self._fresh(start_url)
 
+        # Migracao v1 -> v2: failures era dict[str, str], agora eh dict[str, dict].
+        raw_failures = data.get("failures", {}) or {}
+        failures: dict[str, dict] = {}
+        for url, value in raw_failures.items():
+            if isinstance(value, str):
+                failures[url] = {"error": value, "attempts": 1, "last_attempt": ""}
+            elif isinstance(value, dict):
+                failures[url] = {
+                    "error": str(value.get("error", "")),
+                    "attempts": int(value.get("attempts", 1)),
+                    "last_attempt": str(value.get("last_attempt", "")),
+                }
+
         return Manifest(
-            version=int(data.get("version", 1)),
+            version=2,
             start_url=str(data.get("start_url", start_url)),
             started_at=str(data.get("started_at", "")),
             last_updated=str(data.get("last_updated", "")),
             crawl_complete=crawl_complete,
             crawl_max_pages=data.get("crawl_max_pages"),
             mapped_urls=mapped_urls,
+            crawl_queue=list(data.get("crawl_queue", [])),
+            crawl_seen=list(data.get("crawl_seen", [])),
             exported=dict(data.get("exported", {})),
-            failures=dict(data.get("failures", {})),
+            failures=failures,
         )
 
     @staticmethod
@@ -140,25 +390,87 @@ class Checkpoint:
         )
 
     def save(self) -> None:
-        """Salva manifest atomicamente (tmp + replace). Tolerante a falhas de IO."""
-        self.manifest.last_updated = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".json.tmp")
-        try:
-            with tmp.open("w", encoding="utf-8") as fp:
-                json.dump(asdict(self.manifest), fp, indent=2, ensure_ascii=False)
-            os.replace(str(tmp), str(self.path))
-        except OSError:
+        """Salva manifest atomicamente (tmp + replace). Tolerante a falhas de IO.
+
+        Usa lock para evitar corrupcao quando multiplos workers chamam
+        save() em paralelo. Se a escrita falhar, preserva o timestamp
+        anterior para evitar estado inconsistente onde last_updated
+        avanca mas o conteudo ficou parcial.
+        """
+        with self._save_lock:
+            prev_timestamp = self.manifest.last_updated
+            self.manifest.last_updated = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(".json.tmp")
             try:
-                if tmp.exists():
-                    tmp.unlink()
+                with tmp.open("w", encoding="utf-8") as fp:
+                    json.dump(asdict(self.manifest), fp, indent=2, ensure_ascii=False)
+                    fp.flush()
+                    try:
+                        os.fsync(fp.fileno())
+                    except OSError:
+                        pass  # nao critico, alguns FS nao suportam
+                os.replace(str(tmp), str(self.path))
             except OSError:
-                pass
-            raise
+                # Restaura timestamp anterior em caso de falha (consistencia)
+                self.manifest.last_updated = prev_timestamp
+                try:
+                    if tmp.exists():
+                        tmp.unlink()
+                except OSError:
+                    pass
+                raise
+
+    def backup(self, max_backups: int = 5) -> Path | None:
+        """Cria backup do manifest atual em manifest.json.bak.N (rotativo).
+
+        Mantem os ultimos `max_backups`. Retorna o path do backup criado,
+        ou None se nao havia manifest para fazer backup. Chamado antes de
+        operacoes destrutivas (--fresh, reset).
+        """
+        if not self.path.exists():
+            return None
+        with self._save_lock:
+            # Rotaciona backups: .bak.1 -> .bak.2, ..., descarta o mais antigo
+            for i in range(max_backups - 1, 0, -1):
+                src = self.path.with_suffix(f".json.bak.{i}")
+                dst = self.path.with_suffix(f".json.bak.{i + 1}")
+                if src.exists():
+                    try:
+                        if dst.exists():
+                            dst.unlink()
+                        os.replace(str(src), str(dst))
+                    except OSError:
+                        pass
+            target = self.path.with_suffix(".json.bak.1")
+            try:
+                import shutil
+                shutil.copy2(str(self.path), str(target))
+                return target
+            except OSError:
+                return None
 
     def record_crawl_complete(self, urls: list[str], max_pages: int | None = None) -> None:
         self.manifest.crawl_complete = True
         self.manifest.mapped_urls = list(urls)
+        self.manifest.crawl_queue = []  # fila esvaziada — crawl terminou
+        self.manifest.crawl_max_pages = max_pages
+        self.save()
+
+    def save_crawl_progress(
+        self,
+        ordered_urls: list[str],
+        queue: list[str],
+        seen: list[str],
+        max_pages: int | None = None,
+    ) -> None:
+        """Salva snapshot incremental do crawl (para resume parcial).
+
+        Chamado periodicamente durante o crawl, NAO marca crawl_complete.
+        """
+        self.manifest.mapped_urls = list(ordered_urls)
+        self.manifest.crawl_queue = list(queue)
+        self.manifest.crawl_seen = list(seen)
         self.manifest.crawl_max_pages = max_pages
         self.save()
 
@@ -172,6 +484,47 @@ class Checkpoint:
             return False
         path = pages_dir / filename
         return is_valid_pdf(path)
+
+    def reconcile_with_disk(self, pages_dir: Path, logger=None) -> int:
+        """Remove do manifest entradas cujo PDF nao existe mais ou eh invalido.
+
+        Retorna numero de entradas removidas. Chamada no inicio do resume
+        para sincronizar manifest com estado real do disco (PDFs deletados
+        manualmente, antivirus quarantine, etc).
+        """
+        removed = 0
+        # list() necessario: deletamos do dict dentro do loop (mutacao concorrente)
+        for url in list(self.manifest.exported.keys()):  # noqa: PLR0904
+            entry = self.manifest.exported[url]
+            filename = entry.get("filename", "")
+            if not filename:
+                del self.manifest.exported[url]
+                removed += 1
+                continue
+            path = pages_dir / filename
+            if not is_valid_pdf(path):
+                del self.manifest.exported[url]
+                removed += 1
+                if logger is not None:
+                    logger.warning(
+                        "Manifest dessincronizado: %s sem PDF valido. "
+                        "Sera regenerado.", filename,
+                    )
+        if removed > 0:
+            self.save()
+        return removed
+
+    def find_orphan_pdfs(self, pages_dir: Path) -> list[Path]:
+        """PDFs no disco sem entrada no manifest (orfaos)."""
+        if not pages_dir.exists():
+            return []
+        manifested = {entry.get("filename", "") for entry in self.manifest.exported.values()}
+        manifested.discard("")
+        orphans: list[Path] = []
+        for path in pages_dir.glob("*.pdf"):
+            if path.name not in manifested:
+                orphans.append(path)
+        return orphans
 
     def get_exported_entry(self, url: str) -> dict | None:
         return self.manifest.exported.get(url)
@@ -195,8 +548,119 @@ class Checkpoint:
         self.save()
 
     def record_failure(self, url: str, error: str) -> None:
-        self.manifest.failures[url] = error
+        existing = self.manifest.failures.get(url) or {}
+        attempts = int(existing.get("attempts", 0)) + 1
+        self.manifest.failures[url] = {
+            "error": error,
+            "attempts": attempts,
+            "last_attempt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
         self.save()
+
+    def failure_attempts(self, url: str) -> int:
+        entry = self.manifest.failures.get(url)
+        if not entry:
+            return 0
+        return int(entry.get("attempts", 0))
+
+    def urls_pending_retry(self, max_attempts: int) -> list[str]:
+        """URLs com failures mas que ainda merecem nova tentativa."""
+        return [
+            url for url, entry in self.manifest.failures.items()
+            if int(entry.get("attempts", 0)) < max_attempts
+        ]
+
+
+@dataclass(frozen=True)
+class PendingJob:
+    """Job incompleto detectado em output/<subdir>/manifest.json."""
+    output_dir: Path
+    manifest_path: Path
+    start_url: str
+    mapped_count: int
+    queue_count: int
+    exported_count: int
+    failure_count: int
+    last_updated: str
+    crawl_complete: bool
+
+    @property
+    def display_name(self) -> str:
+        return self.output_dir.name
+
+    @property
+    def is_crawl_pending(self) -> bool:
+        return not self.crawl_complete
+
+    @property
+    def is_export_pending(self) -> bool:
+        return self.exported_count < self.mapped_count or self.failure_count > 0
+
+
+def _collect_manifest_candidates(root_dir: Path) -> list[Path]:
+    """Lista paths candidatos a manifest (root + subpastas de 1 nivel)."""
+    candidates: list[Path] = [root_dir / MANIFEST_FILENAME]
+    try:
+        if root_dir.exists():
+            candidates.extend(
+                child / MANIFEST_FILENAME
+                for child in root_dir.iterdir() if child.is_dir()
+            )
+    except OSError:
+        pass
+    return candidates
+
+
+def _read_manifest_for_job(manifest_path: Path) -> PendingJob | None:
+    """Le um manifest e retorna PendingJob se houver trabalho pendente."""
+    if not manifest_path.exists():
+        return None
+    try:
+        with manifest_path.open("r", encoding="utf-8") as fp:
+            data = json.load(fp)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+
+    crawl_complete = bool(data.get("crawl_complete", False))
+    mapped = list(data.get("mapped_urls", []))
+    exported = dict(data.get("exported", {}))
+    failures = dict(data.get("failures", {}))
+    is_pending = (
+        not crawl_complete
+        or len(exported) < len(mapped)
+        or len(failures) > 0
+    )
+    if not is_pending:
+        return None
+
+    return PendingJob(
+        output_dir=manifest_path.parent,
+        manifest_path=manifest_path,
+        start_url=str(data.get("start_url", "")),
+        mapped_count=len(mapped),
+        queue_count=len(list(data.get("crawl_queue", []))),
+        exported_count=len(exported),
+        failure_count=len(failures),
+        last_updated=str(data.get("last_updated", "")),
+        crawl_complete=crawl_complete,
+    )
+
+
+def find_pending_jobs(root_dir: Path) -> list[PendingJob]:
+    """Encontra subpastas com manifest.json indicando trabalho incompleto.
+
+    Procura ate 2 niveis de profundidade em root_dir e na pasta atual.
+    Retorna ordenado pela data de last_updated (mais recente primeiro).
+    """
+    jobs: list[PendingJob] = []
+    for manifest_path in _collect_manifest_candidates(root_dir):
+        job = _read_manifest_for_job(manifest_path)
+        if job is not None:
+            jobs.append(job)
+    jobs.sort(key=lambda j: j.last_updated, reverse=True)
+    return jobs
 
 
 class InvalidStartUrlError(ValueError):
@@ -229,13 +693,26 @@ def ensure_output_dirs(output_dir: Path) -> tuple[Path, Path]:
     return pages_dir, log_file
 
 
+def storage_state_path(output_dir: Path) -> Path:
+    """Caminho do storage_state (cookies + localStorage) reutilizavel entre runs."""
+    return output_dir / STORAGE_STATE_FILENAME
+
+
 def setup_logger(log_file: Path) -> logging.Logger:
+    """Configura logger com rotacao automatica do arquivo (10MB x 5 backups)."""
+    from logging.handlers import RotatingFileHandler
+
     logger = logging.getLogger("tdn_extractor")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
     logger.propagate = False
 
-    file_handler = logging.FileHandler(log_file, encoding="utf-8")
+    # Rotacao: max 10MB por arquivo, mantem 5 ultimas rotacoes (50MB total).
+    # Evita que run.log cresca indefinidamente apos muitos resumes.
+    file_handler = RotatingFileHandler(
+        log_file, encoding="utf-8",
+        maxBytes=10 * 1024 * 1024, backupCount=5,
+    )
     file_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
     logger.addHandler(file_handler)
 
@@ -302,26 +779,43 @@ def canonicalize_url(url: str) -> str:
 
 
 def slugify(value: str, max_len: int = _MAX_FILENAME_LEN) -> str:
-    """Gera slug seguro para arquivo Windows.
+    """Gera slug seguro para arquivo Windows preservando informacao multi-idioma.
 
-    Limita comprimento e rejeita nomes reservados do Windows (CON, PRN, AUX,
-    NUL, COMn, LPTn) que falham silenciosamente ao serem criados.
+    Usa NFKD para normalizar acentos (Conceitos -> Conceitos preserva 'c'),
+    converte simbolos comuns (C++ -> c-plus-plus, C# -> c-sharp), mantem
+    transliteracao ASCII. Rejeita nomes reservados do Windows.
     """
-    value = re.sub(r"\s+", " ", value).strip().lower()
-    value = value.replace("/", "-")
-    value = _INVALID_FILE_CHARS.sub("", value)
-    value = re.sub(r"[^a-z0-9\- _]", "", value)
-    value = value.replace(" ", "-")
-    value = re.sub(r"-+", "-", value).strip("-")
-    if not value:
-        return "pagina"
-    # Nomes reservados Windows (qualquer extensao subsequente sera ignorada pelo SO)
-    if value in _WINDOWS_RESERVED_NAMES:
-        value = value + "-page"
-    if len(value) > max_len:
+    # Normalize: NFKD separa acentos do char base, encode ASCII descarta acentos
+    # mas preserva a letra (cafe -> cafe, nao 'c' soh)
+    normalized = unicodedata.normalize("NFKD", value)
+    ascii_value = normalized.encode("ascii", "ignore").decode("ascii")
+
+    # Substituicoes semanticas para nao perder info
+    ascii_value = ascii_value.replace("c++", "c-plus-plus")
+    ascii_value = ascii_value.replace("C++", "c-plus-plus")
+    ascii_value = ascii_value.replace("c#", "c-sharp")
+    ascii_value = ascii_value.replace("C#", "c-sharp")
+    ascii_value = ascii_value.replace("&", "-and-")
+
+    ascii_value = re.sub(r"\s+", " ", ascii_value).strip().lower()
+    ascii_value = ascii_value.replace("/", "-")
+    ascii_value = _INVALID_FILE_CHARS.sub("", ascii_value)
+    ascii_value = re.sub(r"[^a-z0-9\- _]", "", ascii_value)
+    ascii_value = ascii_value.replace(" ", "-")
+    ascii_value = re.sub(r"-+", "-", ascii_value).strip("-")
+
+    if not ascii_value:
+        # Fallback para idiomas que nao normalizam para ASCII (chines/arabe/etc)
+        # — usa hash determinístico do valor original
         digest = hashlib.md5(value.encode("utf-8")).hexdigest()[:8]
-        value = value[: max_len - 9] + "-" + digest
-    return value
+        return f"pagina-{digest}"
+
+    if ascii_value in _WINDOWS_RESERVED_NAMES:
+        ascii_value = ascii_value + "-page"
+    if len(ascii_value) > max_len:
+        digest = hashlib.md5(ascii_value.encode("utf-8")).hexdigest()[:8]
+        ascii_value = ascii_value[: max_len - 9] + "-" + digest
+    return ascii_value
 
 
 def is_valid_pdf(path: Path) -> bool:
@@ -346,6 +840,21 @@ def is_valid_pdf(path: Path) -> bool:
         return b"%%EOF" in tail
     except OSError:
         return False
+
+
+def count_pdf_pages(path: Path) -> int:
+    """Conta paginas de um PDF. Retorna 0 se invalido/corrompido."""
+    try:
+        from pypdf import PdfReader
+        from pypdf.errors import PdfReadError
+    except ImportError:
+        return 0
+    try:
+        with path.open("rb") as fp:
+            reader = PdfReader(fp)
+            return len(reader.pages)
+    except (PdfReadError, OSError, ValueError, KeyError):
+        return 0
 
 
 def parse_scope(start_url: str) -> CrawlScope:
