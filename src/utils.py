@@ -121,9 +121,10 @@ class RateLimiter:
         if total_sleep > 0:
             await asyncio.sleep(total_sleep)
 
-    def report_success(self) -> None:
-        """Reseta o contador de bloqueios consecutivos."""
-        self._consecutive_blocks = 0
+    async def report_success(self) -> None:
+        """Reseta o contador de bloqueios consecutivos (thread-safe)."""
+        async with self._lock:
+            self._consecutive_blocks = 0
 
     async def report_block(self, logger=None, reason: str = "") -> float:
         """Registra bloqueio e agenda cooldown exponencial. Retorna duracao do cooldown."""
@@ -315,15 +316,30 @@ class Checkpoint:
     def __init__(self, output_dir: Path, start_url: str, logger=None):
         self.path = output_dir / MANIFEST_FILENAME
         self.load_warning: str | None = None
-        # Se manifest anterior tinha outro start_url, fica registrado aqui
-        # para que o caller possa alertar/confirmar com o usuario.
         self.previous_start_url: str | None = None
         self.manifest = self._load_or_create(start_url)
-        # Serializa escritas no manifest. Sem isto, 2 workers podem chamar
-        # save() simultaneamente e corromper o JSON (race em tmp + replace).
         self._save_lock = threading.Lock()
+        # Batch de saves: evita O(N²) write em runs grandes. Flush a cada N
+        # records ou em fim de fase (save() explicito).
+        self._pending_save_count = 0
+        self._save_every_n = 20  # saves a cada 20 record_export/failure
         if self.load_warning and logger is not None:
             logger.warning("Manifest descartado: %s (recomecando do zero)", self.load_warning)
+
+    def _maybe_batched_save(self) -> None:
+        """Salva apenas a cada N chamadas. Usado por record_export/failure
+        para evitar write O(N²) em runs grandes (1000 PDFs = 1 save por PDF
+        com manifesto crescente = 500k entries escritas no total).
+        """
+        self._pending_save_count += 1
+        if self._pending_save_count >= self._save_every_n:
+            self._pending_save_count = 0
+            self.save()
+
+    def flush(self) -> None:
+        """Forca save pendente (chamar em fim de fase)."""
+        self._pending_save_count = 0
+        self.save()
 
     def _load_or_create(self, start_url: str) -> Manifest:
         if not self.path.exists():
@@ -356,11 +372,16 @@ class Checkpoint:
             return self._fresh(start_url)
 
         # Migracao v1 -> v2: failures era dict[str, str], agora eh dict[str, dict].
+        # Quando string, tenta extrair numero de tentativas da mensagem (ex:
+        # "timeout apos 3 tentativas") para preservar historico. Sem isso,
+        # URLs ja exauridas em v1 voltariam pra retry no v2.
         raw_failures = data.get("failures", {}) or {}
         failures: dict[str, dict] = {}
         for url, value in raw_failures.items():
             if isinstance(value, str):
-                failures[url] = {"error": value, "attempts": 1, "last_attempt": ""}
+                match = re.search(r"(\d+)\s*(?:tentativa|attempt)", value, re.I)
+                attempts = int(match.group(1)) if match else 1
+                failures[url] = {"error": value, "attempts": attempts, "last_attempt": ""}
             elif isinstance(value, dict):
                 failures[url] = {
                     "error": str(value.get("error", "")),
@@ -410,7 +431,8 @@ class Checkpoint:
                         os.fsync(fp.fileno())
                     except OSError:
                         pass  # nao critico, alguns FS nao suportam
-                os.replace(str(tmp), str(self.path))
+                # Retry em Windows: antivirus pode segurar manifest temporariamente
+                atomic_replace_with_retry(str(tmp), str(self.path))
             except OSError:
                 # Restaura timestamp anterior em caso de falha (consistencia)
                 self.manifest.last_updated = prev_timestamp
@@ -490,8 +512,20 @@ class Checkpoint:
 
         Retorna numero de entradas removidas. Chamada no inicio do resume
         para sincronizar manifest com estado real do disco (PDFs deletados
-        manualmente, antivirus quarantine, etc).
+        manualmente, antivirus quarantine, etc). Se pages_dir nao for
+        diretorio, retorna 0 (nao corrompe o manifest).
         """
+        if not pages_dir.exists():
+            if logger is not None:
+                logger.debug("pages_dir nao existe ainda, pulando reconcile")
+            return 0
+        if not pages_dir.is_dir():
+            if logger is not None:
+                logger.warning(
+                    "reconcile_with_disk: %s nao eh diretorio, pulando",
+                    pages_dir,
+                )
+            return 0
         removed = 0
         # list() necessario: deletamos do dict dentro do loop (mutacao concorrente)
         for url in list(self.manifest.exported.keys()):  # noqa: PLR0904
@@ -514,14 +548,32 @@ class Checkpoint:
             self.save()
         return removed
 
+    # Nomes protegidos: nunca devem ser deletados por find_orphan_pdfs.
+    # Cobertura: manifest.json e backups, mesmo que algum tenha extensao .pdf.
+    _PROTECTED_NAMES = frozenset({
+        MANIFEST_FILENAME,
+        "browser_state.json",
+        "run.log",
+        "slow_pages.log",
+    })
+
     def find_orphan_pdfs(self, pages_dir: Path) -> list[Path]:
-        """PDFs no disco sem entrada no manifest (orfaos)."""
-        if not pages_dir.exists():
+        """PDFs no disco sem entrada no manifest (orfaos).
+
+        Protege contra falsa deteccao de nomes especiais (manifest.json.pdf,
+        backup files) e ignora arquivos .tmp em geracao.
+        """
+        if not pages_dir.exists() or not pages_dir.is_dir():
             return []
         manifested = {entry.get("filename", "") for entry in self.manifest.exported.values()}
         manifested.discard("")
         orphans: list[Path] = []
         for path in pages_dir.glob("*.pdf"):
+            # Skip arquivos protegidos por nome ou em geracao (.tmp)
+            if path.name in self._PROTECTED_NAMES:
+                continue
+            if path.name.endswith(".tmp") or ".pdf.tmp" in path.name:
+                continue
             if path.name not in manifested:
                 orphans.append(path)
         return orphans
@@ -545,7 +597,8 @@ class Checkpoint:
         }
         # Remove de failures se estava la (re-tentativa bem-sucedida)
         self.manifest.failures.pop(url, None)
-        self.save()
+        # Batched save: evita O(N²) em runs com muitos PDFs
+        self._maybe_batched_save()
 
     def record_failure(self, url: str, error: str) -> None:
         existing = self.manifest.failures.get(url) or {}
@@ -555,7 +608,7 @@ class Checkpoint:
             "attempts": attempts,
             "last_attempt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         }
-        self.save()
+        self._maybe_batched_save()
 
     def failure_attempts(self, url: str) -> int:
         entry = self.manifest.failures.get(url)
@@ -597,18 +650,27 @@ class PendingJob:
         return self.exported_count < self.mapped_count or self.failure_count > 0
 
 
-def _collect_manifest_candidates(root_dir: Path) -> list[Path]:
-    """Lista paths candidatos a manifest (root + subpastas de 1 nivel)."""
+def _collect_manifest_candidates(root_dir: Path, max_depth: int = 3) -> list[Path]:
+    """Lista paths candidatos a manifest (root + subpastas ate `max_depth` niveis).
+
+    Default profundidade 3 cobre `output/Area/Projeto/manifest.json`.
+    """
     candidates: list[Path] = [root_dir / MANIFEST_FILENAME]
     try:
         if root_dir.exists():
-            candidates.extend(
-                child / MANIFEST_FILENAME
-                for child in root_dir.iterdir() if child.is_dir()
-            )
+            for depth in range(1, max_depth + 1):
+                pattern = "/".join(["*"] * depth) + "/" + MANIFEST_FILENAME
+                candidates.extend(root_dir.glob(pattern))
     except OSError:
         pass
-    return candidates
+    # Dedup preservando ordem
+    seen: set[Path] = set()
+    unique: list[Path] = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            unique.append(c)
+    return unique
 
 
 def _read_manifest_for_job(manifest_path: Path) -> PendingJob | None:
@@ -667,7 +729,38 @@ class InvalidStartUrlError(ValueError):
     """URL inicial invalida (scheme nao-http, sem dominio, etc)."""
 
 
-def validate_start_url(url: str) -> str:
+# Hosts privados/reservados bloqueados (defesa contra SSRF e auto-conexao).
+_SSRF_BLOCKED_HOSTS = frozenset({
+    "localhost", "127.0.0.1", "0.0.0.0", "::1", "[::1]",
+    # AWS metadata endpoint
+    "169.254.169.254",
+    # Outros metadata endpoints comuns
+    "metadata.google.internal", "metadata.azure.com",
+})
+
+
+def _is_private_or_loopback_ip(hostname: str) -> bool:
+    """True se hostname eh IP privado, loopback ou link-local."""
+    try:
+        import ipaddress
+        ip = ipaddress.ip_address(hostname)
+        return (
+            ip.is_private or ip.is_loopback or ip.is_link_local
+            or ip.is_multicast or ip.is_reserved
+        )
+    except (ValueError, ImportError):
+        return False
+
+
+def validate_start_url(url: str, allow_local: bool = False) -> str:
+    """Valida e canonicaliza URL inicial. Bloqueia SSRF se allow_local=False.
+
+    Rejeita:
+      - Scheme nao-http(s) (file://, javascript:, data:, etc)
+      - URL sem dominio
+      - Hosts locais/privados (localhost, 127.x, 10.x, etc) se allow_local=False
+      - IPs de metadata cloud (169.254.169.254)
+    """
     if not url or not isinstance(url, str):
         raise InvalidStartUrlError("URL vazia ou nao e string.")
 
@@ -683,7 +776,102 @@ def validate_start_url(url: str) -> str:
     if not parsed.netloc:
         raise InvalidStartUrlError(f"URL sem dominio: {stripped!r}")
 
+    if not allow_local:
+        hostname = (parsed.hostname or "").lower()
+        if hostname in _SSRF_BLOCKED_HOSTS:
+            raise InvalidStartUrlError(
+                f"URL bloqueada (host privado/metadata): {hostname}. "
+                "Use allow_local=True se intencional."
+            )
+        if _is_private_or_loopback_ip(hostname):
+            raise InvalidStartUrlError(
+                f"URL bloqueada (IP privado/loopback): {hostname}. "
+                "Use allow_local=True se intencional."
+            )
+
     return canonicalize_url(stripped)
+
+
+# Caminho Windows MAX_PATH legacy (260 chars). Margem de seguranca: 240.
+_MAX_PATH_SAFE = 240
+
+
+def validate_safe_path(path: Path, must_be_relative_to: Path | None = None) -> Path:
+    """Valida path contra traversal e MAX_PATH. Retorna path resolvido.
+
+    Levanta ValueError se:
+      - Resolved path excede MAX_PATH legacy do Windows (260 chars)
+      - must_be_relative_to fornecido e resolved path nao esta dentro dele
+    """
+    try:
+        resolved = path.resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"Path invalido: {path} ({exc})") from exc
+
+    resolved_str = str(resolved)
+    if os.name == "nt" and len(resolved_str) > _MAX_PATH_SAFE:
+        raise ValueError(
+            f"Path muito longo para Windows ({len(resolved_str)} chars > "
+            f"{_MAX_PATH_SAFE}): {resolved_str[:80]}..."
+        )
+
+    if must_be_relative_to is not None:
+        try:
+            base = must_be_relative_to.resolve(strict=False)
+            resolved.relative_to(base)
+        except (ValueError, OSError) as exc:
+            raise ValueError(
+                f"Path traversal detectado: {resolved} fora de {base}"
+            ) from exc
+
+    return resolved
+
+
+def get_free_disk_bytes(path: Path) -> int:
+    """Retorna bytes livres no filesystem que contem `path`. -1 se erro."""
+    try:
+        import shutil as _shutil
+        target = path if path.exists() else path.parent
+        usage = _shutil.disk_usage(str(target))
+        return usage.free
+    except OSError:
+        return -1
+
+
+def atomic_replace_with_retry(src: str, dst: str, max_retries: int = 5) -> None:
+    """os.replace com retry para contornar antivirus lock em Windows.
+
+    Antivirus pode segurar handle do arquivo recem-escrito por alguns segundos.
+    Tenta ate `max_retries` com backoff curto (0.2s, 0.4s, ...).
+    """
+    import time as _time
+    last_error: OSError | None = None
+    for attempt in range(max_retries):
+        try:
+            os.replace(src, dst)
+            return
+        except OSError as exc:
+            last_error = exc
+            if attempt < max_retries - 1:
+                _time.sleep(0.2 * (attempt + 1))
+    if last_error is not None:
+        raise last_error
+
+
+def sanitize_proxy_for_log(proxy: str | None) -> str:
+    """Retorna proxy string sem credenciais para logging seguro."""
+    if not proxy:
+        return ""
+    try:
+        parsed = urlparse(proxy)
+        if parsed.username or parsed.password:
+            host_part = parsed.hostname or ""
+            if parsed.port:
+                host_part = f"{host_part}:{parsed.port}"
+            return f"{parsed.scheme}://***@{host_part}"
+        return proxy
+    except (ValueError, AttributeError):
+        return "[invalid proxy URL]"
 
 
 def ensure_output_dirs(output_dir: Path) -> tuple[Path, Path]:
@@ -778,24 +966,48 @@ def canonicalize_url(url: str) -> str:
     return urlunparse(normalized)
 
 
+_ZERO_WIDTH_CHARS = re.compile(r"[​-‍﻿]")
+_RTL_MARKERS = re.compile(r"[‪-‮؜]")
+
+_SLUGIFY_SUBSTITUTIONS = (
+    ("c++", "c-plus-plus"),
+    ("C++", "c-plus-plus"),
+    ("c#", "c-sharp"),
+    ("C#", "c-sharp"),
+    ("&", "-and-"),
+    ("™", "-tm"),
+    ("®", "-r"),
+    ("©", "-c"),
+    ("@", "-at-"),
+)
+
+
 def slugify(value: str, max_len: int = _MAX_FILENAME_LEN) -> str:
     """Gera slug seguro para arquivo Windows preservando informacao multi-idioma.
 
     Usa NFKD para normalizar acentos (Conceitos -> Conceitos preserva 'c'),
     converte simbolos comuns (C++ -> c-plus-plus, C# -> c-sharp), mantem
     transliteracao ASCII. Rejeita nomes reservados do Windows.
+
+    Filtra:
+      - Zero-width chars (U+200B..U+200D, U+FEFF) que sao invisiveis e corrompem filenames
+      - RTL markers (U+202A..U+202E, U+061C) que reordenam graficamente
+      - Simbolos comuns (™, ®, ©, @, &) com substituicao semantica
+
+    Para idiomas que nao normalizam para ASCII (chines/arabe), usa hash MD5.
     """
-    # Normalize: NFKD separa acentos do char base, encode ASCII descarta acentos
-    # mas preserva a letra (cafe -> cafe, nao 'c' soh)
+    # 1. Remove chars invisiveis que quebram filenames
+    value = _ZERO_WIDTH_CHARS.sub("", value)
+    value = _RTL_MARKERS.sub("", value)
+
+    # 2. Substituicoes semanticas ANTES de NFKD (preserva info)
+    for src, dst in _SLUGIFY_SUBSTITUTIONS:
+        value = value.replace(src, dst)
+
+    # 3. Normalize: NFKD separa acentos do char base, ASCII descarta acentos
+    # mas preserva a letra base (cafe -> cafe, nao 'c' soh)
     normalized = unicodedata.normalize("NFKD", value)
     ascii_value = normalized.encode("ascii", "ignore").decode("ascii")
-
-    # Substituicoes semanticas para nao perder info
-    ascii_value = ascii_value.replace("c++", "c-plus-plus")
-    ascii_value = ascii_value.replace("C++", "c-plus-plus")
-    ascii_value = ascii_value.replace("c#", "c-sharp")
-    ascii_value = ascii_value.replace("C#", "c-sharp")
-    ascii_value = ascii_value.replace("&", "-and-")
 
     ascii_value = re.sub(r"\s+", " ", ascii_value).strip().lower()
     ascii_value = ascii_value.replace("/", "-")
@@ -806,7 +1018,6 @@ def slugify(value: str, max_len: int = _MAX_FILENAME_LEN) -> str:
 
     if not ascii_value:
         # Fallback para idiomas que nao normalizam para ASCII (chines/arabe/etc)
-        # — usa hash determinístico do valor original
         digest = hashlib.md5(value.encode("utf-8")).hexdigest()[:8]
         return f"pagina-{digest}"
 
@@ -843,18 +1054,26 @@ def is_valid_pdf(path: Path) -> bool:
 
 
 def count_pdf_pages(path: Path) -> int:
-    """Conta paginas de um PDF. Retorna 0 se invalido/corrompido."""
+    """Conta paginas de um PDF. Retorna -1 se invalido/corrompido, N>=0 se valido.
+
+    Distingue erro (-1, ex: PdfReader nao parsea) de PDF valido sem paginas
+    (0, raro mas possivel). Callers devem checar `>= 0` para validade.
+    """
     try:
         from pypdf import PdfReader
         from pypdf.errors import PdfReadError
     except ImportError:
-        return 0
+        return -1
     try:
         with path.open("rb") as fp:
             reader = PdfReader(fp)
-            return len(reader.pages)
+            try:
+                count = len(reader.pages)
+            except (PdfReadError, ValueError, KeyError, AttributeError):
+                return -1
+            return count
     except (PdfReadError, OSError, ValueError, KeyError):
-        return 0
+        return -1
 
 
 def parse_scope(start_url: str) -> CrawlScope:

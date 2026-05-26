@@ -211,7 +211,7 @@ def test_rate_limiter_report_success_resets_blocks():
     async def run():
         await lim.report_block(reason="x")
         assert lim.consecutive_blocks == 1
-        lim.report_success()
+        await lim.report_success()  # agora async com lock
         assert lim.consecutive_blocks == 0
 
     asyncio.run(run())
@@ -346,11 +346,13 @@ def test_is_valid_pdf_rejects_no_header():
         assert not is_valid_pdf(p)
 
 
-def test_count_pdf_pages_invalid_returns_zero():
+def test_count_pdf_pages_invalid_returns_negative():
+    """count_pdf_pages retorna -1 em erro, 0+ se valido (distingue casos)."""
     with tempfile.TemporaryDirectory() as td:
         p = Path(td) / "fake.pdf"
         p.write_bytes(b"not a pdf")
-        assert count_pdf_pages(p) == 0
+        # Valor < 0 indica erro (-1); >= 0 seria PDF valido
+        assert count_pdf_pages(p) < 0
 
 
 def test_reconcile_with_disk_removes_missing():

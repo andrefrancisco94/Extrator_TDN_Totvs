@@ -24,13 +24,15 @@ from .utils import (
     format_bytes,
     format_duration,
     get_console,
+    sanitize_proxy_for_log,
     setup_logger,
     storage_state_path,
+    validate_safe_path,
     validate_start_url,
     write_slow_pages_log,
 )
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 LARGE_BATCH_THRESHOLD = 500
 MIN_DISK_FREE_BYTES = 500 * 1024 * 1024  # 500MB minimo razoavel
@@ -97,7 +99,8 @@ async def run_pipeline(
     # Storage state: cookies/localStorage persistidos entre runs.
     state_path = storage_state_path(output_dir)
     if proxy:
-        logger.info("Proxy configurado: %s", proxy)
+        # Mascara credenciais no log para nao vazar password/token
+        logger.info("Proxy configurado: %s", sanitize_proxy_for_log(proxy))
 
     try:
         urls, slow_crawl = await crawl_confluence_tree(
@@ -163,6 +166,12 @@ async def run_pipeline(
         logger.warning("Exportacao de PDFs interrompida pelo usuario (Ctrl+C).")
         raise
 
+    # Garante que ultimo batch de record_export foi salvo
+    try:
+        checkpoint.flush()
+    except OSError as exc:
+        logger.warning("Falha ao flush manifest: %s", exc)
+
     if not pdf_entries:
         logger.error("Nenhum PDF individual foi gerado.")
         return 1
@@ -200,18 +209,29 @@ async def run_pipeline(
 def _maybe_force_recrawl_for_max_pages(
     force_recrawl: bool, checkpoint: Checkpoint, max_pages: int | None, logger,
 ) -> bool:
-    """Se max_pages mudou, forca re-crawl para nao reusar lista cropped."""
-    if (
-        not force_recrawl
-        and checkpoint.manifest.crawl_complete
-        and checkpoint.manifest.crawl_max_pages != max_pages
-    ):
-        logger.warning(
-            "max_pages mudou (era %s, agora %s) — forcando re-crawl.",
-            checkpoint.manifest.crawl_max_pages, max_pages,
-        )
-        return True
-    return force_recrawl
+    """Se max_pages mudou SIGNIFICATIVAMENTE, forca re-crawl.
+
+    Casos que NAO forcam recrawl:
+      - Run anterior sem limite (None) + atual com limite: run anterior ja tem
+        tudo, basta truncar — mas truncar implica perda, entao forca recrawl
+      - Run anterior com limite + atual sem limite: pode ter mais URLs, forca
+      - Mesmo limite: nao forca
+      - Run anterior sem limite + atual sem limite: nao forca
+
+    Resumo: forca apenas quando ambos definidos e diferentes, OU quando muda
+    de definido para indefinido (e vice-versa).
+    """
+    if force_recrawl or not checkpoint.manifest.crawl_complete:
+        return force_recrawl
+    prev = checkpoint.manifest.crawl_max_pages
+    if prev == max_pages:
+        return False
+    # Diferentes (incluindo None vs valor): forca recrawl
+    logger.warning(
+        "max_pages mudou (era %s, agora %s) — forcando re-crawl.",
+        prev, max_pages,
+    )
+    return True
 
 
 def _setup_checkpoint(
@@ -553,6 +573,13 @@ def run(
         console.print(f"[bold red]URL invalida:[/bold red] {exc}")
         raise typer.Exit(2)
 
+    # Valida path contra traversal e MAX_PATH (Windows legacy 260 chars)
+    try:
+        validate_safe_path(output_dir)
+    except ValueError as exc:
+        console.print(f"[bold red]Path invalido:[/bold red] {exc}")
+        raise typer.Exit(2)
+
     try:
         output_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
@@ -663,10 +690,29 @@ def jobs(
     output_dir: Path = typer.Option(
         Path("output"), help="Pasta raiz onde procurar jobs incompletos.",
     ),
+    json_output: bool = typer.Option(
+        False, "--json", help="Saida em JSON (para scripts/integracao).",
+    ),
 ) -> None:
     """Lista jobs incompletos detectados em pastas com manifest.json."""
     console = get_console()
     pending = find_pending_jobs(output_dir)
+
+    if json_output:
+        import json as _json
+        payload = [{
+            "output_dir": str(j.output_dir),
+            "start_url": j.start_url,
+            "mapped_count": j.mapped_count,
+            "queue_count": j.queue_count,
+            "exported_count": j.exported_count,
+            "failure_count": j.failure_count,
+            "last_updated": j.last_updated,
+            "crawl_complete": j.crawl_complete,
+        } for j in pending]
+        typer.echo(_json.dumps(payload, indent=2, ensure_ascii=False))
+        return
+
     if not pending:
         console.print("[green]Nenhum job incompleto encontrado.[/green]")
         return
@@ -706,6 +752,9 @@ def failures(
     output_dir: Path = typer.Option(
         Path("output"), help="Pasta do job (com manifest.json) a inspecionar.",
     ),
+    json_output: bool = typer.Option(
+        False, "--json", help="Saida em JSON (para scripts/integracao).",
+    ),
 ) -> None:
     """Lista URLs em failures (com tentativas e ultimo erro)."""
     console = get_console()
@@ -723,6 +772,22 @@ def failures(
         raise typer.Exit(1)
 
     raw = data.get("failures", {}) or {}
+
+    if json_output:
+        payload = []
+        for url, entry in raw.items():
+            if isinstance(entry, str):
+                payload.append({"url": url, "error": entry, "attempts": 1, "last_attempt": ""})
+            else:
+                payload.append({
+                    "url": url,
+                    "error": str(entry.get("error", "")),
+                    "attempts": int(entry.get("attempts", 1)),
+                    "last_attempt": str(entry.get("last_attempt", "")),
+                })
+        typer.echo(_json.dumps(payload, indent=2, ensure_ascii=False))
+        return
+
     if not raw:
         console.print("[green]Nenhuma URL em failures.[/green]")
         return
@@ -787,6 +852,12 @@ def reset(
 ) -> None:
     """Reseta um job. Soft: mantem PDFs e remove manifest. Hard: remove tudo."""
     console = get_console()
+
+    # Valida que output_dir existe e eh pasta
+    if output_dir.exists() and not output_dir.is_dir():
+        console.print(f"[red]{output_dir} nao eh pasta[/red]")
+        raise typer.Exit(2)
+
     manifest_path = output_dir / MANIFEST_FILENAME
     pages_dir = output_dir / "pages"
 
@@ -952,14 +1023,23 @@ def _build_report_rows(data: dict) -> list[dict]:
 
 
 def _write_report_csv(target: Path, rows: list[dict]) -> None:
+    """Escreve CSV com escape forte (QUOTE_ALL) para URLs/titles com virgulas/aspas/newlines."""
     import csv
     target.parent.mkdir(parents=True, exist_ok=True)
     fields = ["url", "status", "filename", "title", "size_bytes",
               "elapsed_seconds", "error", "attempts"]
+
+    def _clean(value):
+        """Remove newlines e CR de strings (CSV nao deveria ter)."""
+        if isinstance(value, str):
+            return value.replace("\r", " ").replace("\n", " ").strip()
+        return value
+
+    sanitized = [{k: _clean(v) for k, v in row.items()} for row in rows]
     with target.open("w", encoding="utf-8", newline="") as fp:
-        writer = csv.DictWriter(fp, fieldnames=fields)
+        writer = csv.DictWriter(fp, fieldnames=fields, quoting=csv.QUOTE_ALL)
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows(sanitized)
 
 
 def _write_report_json(target: Path, rows: list[dict], data: dict) -> None:
@@ -982,7 +1062,27 @@ def _write_report_json(target: Path, rows: list[dict], data: dict) -> None:
         _json.dump(payload, fp, indent=2, ensure_ascii=False)
 
 
+def _install_signal_handlers() -> None:
+    """Instala handlers para SIGTERM/SIGINT que levantam KeyboardInterrupt.
+
+    Sem isto, task managers (systemd, docker stop) enviam SIGTERM e o processo
+    morre sem chance de salvar o manifest. Convertendo para KeyboardInterrupt,
+    o pipeline normal de cleanup (try/finally) eh acionado.
+    """
+    import signal
+
+    def _handler(signum, _frame):
+        raise KeyboardInterrupt(f"Sinal {signum} recebido")
+
+    try:
+        signal.signal(signal.SIGTERM, _handler)
+    except (AttributeError, ValueError):
+        pass  # Windows pode nao ter SIGTERM em alguns contextos
+    # SIGINT (Ctrl+C) ja levanta KeyboardInterrupt por default — nao reinstala
+
+
 if __name__ == "__main__":
+    _install_signal_handlers()
     try:
         app()
     except KeyboardInterrupt:

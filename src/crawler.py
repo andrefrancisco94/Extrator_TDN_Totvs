@@ -24,6 +24,14 @@ from tenacity import (
     wait_exponential,
 )
 
+from .browser import (
+    BrowserSession,
+    is_browser_alive as _is_browser_alive_helper,
+    launch_browser_session as _launch_browser_session_helper,
+    new_page as _new_page,
+    safe_close_page as _safe_close_page,
+    teardown_session as _teardown_session,
+)
 from .utils import (
     Checkpoint,
     CrawlScope,
@@ -31,7 +39,6 @@ from .utils import (
     RateLimitConfig,
     RateLimiter,
     SlowPageRecord,
-    build_browser_context_args,
     canonicalize_url,
     get_console,
     is_blocking_error,
@@ -76,9 +83,6 @@ _PAGE_ROTATION_INTERVAL = 50
 # se o processo for interrompido no meio do mapeamento.
 _CRAWL_CHECKPOINT_EVERY = 10
 
-# Maximo de tentativas de relancar o browser antes de abortar o pipeline
-_MAX_BROWSER_LAUNCH_ATTEMPTS = 3
-
 # Se mais de X% das paginas crawladas deram timeout, nao marca crawl_complete
 # (evita resume futuro com lista parcial confundida com completa).
 _CRAWL_TIMEOUT_RATIO_THRESHOLD = 0.20
@@ -102,6 +106,8 @@ class CrawlState:
     # Cache de respostas REST API: key=(page_id, start) -> results
     # Evita re-fetch quando crawl re-visita uma URL apos timeout.
     api_cache: dict[tuple[str, int], list[dict]] = field(default_factory=dict)
+    # Lock para api_cache e attempts (sincroniza se crawler for paralelizado).
+    state_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 @dataclass
@@ -117,34 +123,10 @@ class CrawlConfig:
     proxy: str | None = None
 
 
-@dataclass
-class BrowserSession:
-    browser: object = None
-    context: object = None
-    page: Page | None = None
-    state_path: Path | None = None
-
-
 def _is_retryable(exc: BaseException) -> bool:
     if isinstance(exc, PlaywrightTimeoutError):
         return False
     return isinstance(exc, PlaywrightError)
-
-
-async def _new_page(context, timeout_ms: int) -> Page:
-    page = await context.new_page()
-    page.set_default_timeout(timeout_ms)
-    return page
-
-
-async def _safe_close_page(page: Page | None) -> None:
-    if page is None:
-        return
-    try:
-        if not page.is_closed():
-            await page.close()
-    except PlaywrightError:
-        pass
 
 
 def _match_start_url_format(url: str, scope: CrawlScope) -> str:
@@ -220,19 +202,33 @@ async def _fetch_or_cache_api_page(
     page: Page, page_id: str, base: str, start: int, logger,
     limiter: RateLimiter | None,
     api_cache: dict[tuple[str, int], list[dict]] | None,
+    cache_lock: asyncio.Lock | None = None,
 ) -> tuple[list[dict] | None, bool]:
-    """Wrap _fetch_api_page com cache opcional por (page_id, start)."""
+    """Wrap _fetch_api_page com cache opcional por (page_id, start).
+
+    Se cache_lock fornecido, protege leitura/escrita do api_cache.
+    """
     cache_key = (page_id, start)
-    if api_cache is not None and cache_key in api_cache:
-        logger.debug("REST API cache hit: %s start=%d", page_id, start)
-        return api_cache[cache_key], False
+    if api_cache is not None:
+        if cache_lock is not None:
+            async with cache_lock:
+                cached = api_cache.get(cache_key)
+        else:
+            cached = api_cache.get(cache_key)
+        if cached is not None:
+            logger.debug("REST API cache hit: %s start=%d", page_id, start)
+            return cached, False
     api_url = (
         f"{base}/rest/api/content/{page_id}/child/page"
         f"?limit={_API_PAGE_SIZE}&start={start}"
     )
     results, blocked = await _fetch_api_page(page, api_url, logger, limiter)
     if results is not None and api_cache is not None:
-        api_cache[cache_key] = results
+        if cache_lock is not None:
+            async with cache_lock:
+                api_cache[cache_key] = results
+        else:
+            api_cache[cache_key] = results
     return results, blocked
 
 
@@ -243,6 +239,7 @@ async def _get_children_via_api(
     logger,
     limiter: RateLimiter | None = None,
     api_cache: dict[tuple[str, int], list[dict]] | None = None,
+    cache_lock: asyncio.Lock | None = None,
 ) -> tuple[list[str] | None, bool]:
     """Tenta buscar paginas filhas via Confluence REST API.
 
@@ -261,7 +258,7 @@ async def _get_children_via_api(
 
     for _ in range(_API_MAX_PAGES):
         results, blocked = await _fetch_or_cache_api_page(
-            page, page_id, base, start, logger, limiter, api_cache,
+            page, page_id, base, start, logger, limiter, api_cache, cache_lock,
         )
         if blocked:
             return None, True
@@ -410,73 +407,14 @@ async def _goto_dom_ready(page: Page, url: str, timeout_ms: int) -> None:
     await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
 
 
-async def _launch_browser_session(
-    playwright, headless: bool, timeout_ms: int, logger=None,
-    state_path: Path | None = None, proxy: str | None = None,
-) -> BrowserSession:
-    """Lança browser com retry. Usa UA realista, viewport variavel, storage_state."""
-    last_error: Exception | None = None
-    context_args = build_browser_context_args(state_path=state_path, proxy_url=proxy)
-    for attempt in range(1, _MAX_BROWSER_LAUNCH_ATTEMPTS + 1):
-        try:
-            browser = await playwright.chromium.launch(
-                headless=headless, channel="chromium",
-            )
-            context = await browser.new_context(**context_args)
-            page = await _new_page(context, timeout_ms)
-            return BrowserSession(
-                browser=browser, context=context, page=page, state_path=state_path,
-            )
-        except PlaywrightError as exc:
-            last_error = exc
-            if logger is not None:
-                logger.warning(
-                    "Falha ao lancar browser (tentativa %d/%d): %s",
-                    attempt, _MAX_BROWSER_LAUNCH_ATTEMPTS, exc,
-                )
-    raise RuntimeError(
-        "Nao foi possivel iniciar o navegador apos "
-        f"{_MAX_BROWSER_LAUNCH_ATTEMPTS} tentativas. "
-        "Verifique se o Chromium esta instalado (rode 'playwright install chromium' "
-        f"ou use a opcao [6] do menu). Ultimo erro: {last_error}"
-    )
+# Aliases para retrocompat com codigo interno do crawler
+_launch_browser_session = _launch_browser_session_helper
+_is_browser_alive = _is_browser_alive_helper
 
 
-def _is_browser_alive(session: BrowserSession) -> bool:
-    """Wrapper safe para is_connected (pode lancar se processo ja morreu)."""
-    if session.browser is None:
-        return False
-    try:
-        return bool(session.browser.is_connected())
-    except (PlaywrightError, Exception):  # noqa: BLE001 - defensive
-        return False
-
-
-async def _save_storage_state(session: BrowserSession, logger) -> None:
-    """Salva cookies/storage no caminho configurado (se houver)."""
-    if session.state_path is None or session.context is None:
-        return
-    try:
-        session.state_path.parent.mkdir(parents=True, exist_ok=True)
-        await session.context.storage_state(path=str(session.state_path))
-        logger.debug("Storage state salvo em %s", session.state_path)
-    except (PlaywrightError, OSError) as exc:
-        logger.warning("Falha ao salvar storage_state: %s", exc)
-
-
-async def _teardown_session(session: BrowserSession, logger) -> None:
-    # Salva cookies antes de fechar o context
-    await _save_storage_state(session, logger)
-    if session.context is not None:
-        try:
-            await session.context.close()
-        except PlaywrightError as exc:
-            logger.warning("Falha ao fechar context: %s", exc)
-    if session.browser is not None:
-        try:
-            await session.browser.close()
-        except PlaywrightError as exc:
-            logger.warning("Falha ao fechar browser: %s", exc)
+# Lock global do crawler para recovery (crawler atual eh single-worker, mas
+# previne race se for paralelizado no futuro).
+_crawl_browser_recovery_lock = asyncio.Lock()
 
 
 async def _ensure_browser_alive(
@@ -484,19 +422,23 @@ async def _ensure_browser_alive(
 ) -> None:
     if _is_browser_alive(session):
         return
-    logger.warning("Browser desconectou. Relancando...")
-    try:
-        if session.browser is not None:
-            await session.browser.close()
-    except PlaywrightError:
-        pass
-    new_session = await _launch_browser_session(
-        playwright, cfg.headless, cfg.timeout_ms, logger,
-        state_path=session.state_path, proxy=cfg.proxy,
-    )
-    session.browser = new_session.browser
-    session.context = new_session.context
-    session.page = new_session.page
+    async with _crawl_browser_recovery_lock:
+        # Re-check apos pegar o lock
+        if _is_browser_alive(session):
+            return
+        logger.warning("Browser desconectou. Relancando...")
+        try:
+            if session.browser is not None:
+                await session.browser.close()
+        except PlaywrightError:
+            pass
+        new_session = await _launch_browser_session(
+            playwright, cfg.headless, cfg.timeout_ms, logger,
+            state_path=session.state_path, proxy=cfg.proxy,
+        )
+        session.browser = new_session.browser
+        session.context = new_session.context
+        session.page = new_session.page
 
 
 def _restore_state_from_checkpoint(
@@ -510,12 +452,19 @@ def _restore_state_from_checkpoint(
     if not (saved_queue or saved_seen or saved_mapped):
         return False
 
-    # Restaura mapped_urls como historico (mas serao re-validados)
-    state.ordered_urls = list(saved_mapped)
-    state.seen = set(saved_seen) | set(saved_mapped)
+    # Restaura mapped_urls como historico, DEDUPLICANDO (manifest pode estar
+    # editado manualmente com duplicatas).
+    seen_so_far: set[str] = set()
+    state.ordered_urls = []
+    for url in saved_mapped:
+        if url not in seen_so_far:
+            state.ordered_urls.append(url)
+            seen_so_far.add(url)
+
+    state.seen = set(saved_seen) | seen_so_far
     # Re-enqueua o que estava na fila
     for url in saved_queue:
-        if url not in state.queue and url not in state.seen:
+        if url not in state.queued and url not in state.seen:
             state.queue.append(url)
             state.queued.add(url)
 
@@ -765,14 +714,14 @@ async def _run_crawl_loop(
 
             # Re-enfileira URL com timeout para nova tentativa (intra-run).
             if timed_out:
-                _maybe_requeue_timed_out(current, state, logger, checkpoint)
+                await _maybe_requeue_timed_out(current, state, logger, checkpoint)
 
             # Snapshot periodico para resume parcial
             if pages_processed % _CRAWL_CHECKPOINT_EVERY == 0:
                 _save_partial_progress(checkpoint, state, cfg, logger)
 
 
-def _maybe_requeue_timed_out(
+async def _maybe_requeue_timed_out(
     current: str, state: CrawlState, logger, checkpoint: Checkpoint,
 ) -> None:
     """Re-enfileira URL com timeout (ate _INTRA_RUN_RETRY_LIMIT vezes).
@@ -780,19 +729,19 @@ def _maybe_requeue_timed_out(
     NAO remove de ordered_urls para nao criar inconsistencia com checkpoints
     ja salvos. Apenas remove de `seen` para permitir reprocessamento.
     Quando desiste apos retries intra-run, registra em failures para que o
-    proximo run a re-tente.
+    proximo run a re-tente. Usa state_lock para sincronizar com workers.
     """
-    attempts = state.attempts.get(current, 0) + 1
-    state.attempts[current] = attempts
-    if attempts >= _INTRA_RUN_RETRY_LIMIT:
+    async with state.state_lock:
+        attempts = state.attempts.get(current, 0) + 1
+        state.attempts[current] = attempts
+        should_give_up = attempts >= _INTRA_RUN_RETRY_LIMIT
+
+    if should_give_up:
         logger.error(
             "URL desistida apos %d timeouts intra-run: %s "
             "(registrada em failures para re-tentar no proximo run)",
             attempts, current,
         )
-        # CRITICAL: registra em failures para que o resume futuro pegue.
-        # Sem isto, URLs com timeout no crawl ficam apenas em `seen` e
-        # nunca sao re-tentadas (porque seen exclui da fila no resume).
         try:
             checkpoint.record_failure(
                 current, f"crawl timeout apos {attempts} tentativas intra-run",
@@ -800,6 +749,7 @@ def _maybe_requeue_timed_out(
         except OSError as exc:
             logger.warning("Falha ao registrar failure de %s: %s", current, exc)
         return
+
     # Remove de seen para permitir reprocessamento; NAO mexer em ordered_urls
     state.seen.discard(current)
     # Coloca no FIM da fila pra dar tempo de outras URLs cooperarem
@@ -844,18 +794,20 @@ async def _collect_child_urls(
     logger,
     limiter: RateLimiter,
     api_cache: dict[tuple[str, int], list[dict]] | None = None,
+    cache_lock: asyncio.Lock | None = None,
 ) -> tuple[list[str], bool]:
     """Coleta filhos via REST API (primario) ou DOM (fallback).
 
     Retorna (urls, blocked). blocked=True sinaliza que o servidor recusou.
     """
     raw_hrefs, blocked = await _get_children_via_api(
-        page, current, scope, logger, limiter, api_cache=api_cache,
+        page, current, scope, logger, limiter,
+        api_cache=api_cache, cache_lock=cache_lock,
     )
     if blocked:
         return [], True
     if raw_hrefs is not None:
-        limiter.report_success()
+        await limiter.report_success()
         logger.info("REST API: %d filhos em %s", len(raw_hrefs), current)
         return raw_hrefs, False
 
@@ -864,7 +816,7 @@ async def _collect_child_urls(
     await _wait_for_sidebar(page, page_start, cfg)
     try:
         hrefs = await _extract_child_links(page, current)
-        limiter.report_success()
+        await limiter.report_success()
         return hrefs or [], False
     except PlaywrightError as exc:
         logger.warning("Falha ao extrair links em %s: %s", current, exc)
@@ -932,7 +884,7 @@ async def _crawl_one(
 
         raw_hrefs, blocked = await _collect_child_urls(
             page, current, scope, cfg, page_start, logger, limiter,
-            api_cache=state.api_cache,
+            api_cache=state.api_cache, cache_lock=state.state_lock,
         )
         if blocked:
             logger.warning("Bloqueio detectado em %s (REST API)", current)

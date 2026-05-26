@@ -26,21 +26,39 @@ from tenacity import (
     wait_exponential,
 )
 
+from .browser import (
+    BrowserSession,
+    is_browser_alive as _is_browser_alive_helper,
+    launch_browser_session as _launch_browser_session_helper,
+    new_page as _new_page,
+    safe_close_page as _safe_close_page,
+    teardown_session as _teardown_session,
+)
 from .utils import (
     Checkpoint,
     MAX_RETRY_ATTEMPTS,
     RateLimitConfig,
     RateLimiter,
     SlowPageRecord,
-    build_browser_context_args,
+    atomic_replace_with_retry,
     build_pdf_file_name,
     count_pdf_pages,
     ensure_output_dirs,
     get_console,
+    get_free_disk_bytes,
     is_blocking_error,
     is_cloudflare_challenge,
     is_valid_pdf,
 )
+
+# Aliases para retrocompat com codigo interno do exporter
+_launch_browser_session = _launch_browser_session_helper
+_is_browser_alive = _is_browser_alive_helper
+
+# Limite minimo de espaco em disco durante export (50MB). Abaixo disso,
+# aciona abort_requested via circuit breaker.
+_MIN_DISK_FREE_DURING_EXPORT = 50 * 1024 * 1024
+_DISK_CHECK_EVERY_N = 25
 
 _CONTENT_SELECTORS = (
     "#main-content",
@@ -51,9 +69,6 @@ _CONTENT_SELECTORS = (
 )
 
 _PAGE_ROTATION_INTERVAL = 50
-
-# Maximo de tentativas de relancar o browser antes de abortar.
-_MAX_BROWSER_LAUNCH_ATTEMPTS = 3
 
 # Score minimo para considerar pagina como tela de login (multi-indicador).
 _LOGIN_SCORE_THRESHOLD = 2
@@ -196,8 +211,12 @@ class ExportAccumulators:
     exported: list[tuple[Path, str]] = field(default_factory=list)
     failures: list[tuple[str, str]] = field(default_factory=list)
     slow_records: list[SlowPageRecord] = field(default_factory=list)
-    # Lock para mutacoes em paralelo (used_names, exported, failures, slow_records).
+    # Lock para mutacoes em paralelo (used_names, exported, failures, slow_records,
+    # consecutive_session_failures, abort_requested).
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # Lock dedicado para recovery de browser (impede que multiplos workers
+    # relancem browser simultaneamente em caso de crash).
+    browser_recovery_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     # Circuit breaker: conta failures consecutivos (login/CF) para abortar
     # quando a sessao/proteção fica em estado ruim e nao adianta seguir.
     consecutive_session_failures: int = 0
@@ -208,37 +227,12 @@ class ExportAccumulators:
 _SESSION_FAILURE_CIRCUIT_BREAKER = 5
 
 
-@dataclass
-class BrowserSession:
-    """Container mutavel para browser/context/page (permite recovery in-place)."""
-    browser: object = None
-    context: object = None
-    page: Page | None = None
-    state_path: Path | None = None
-
-
 def _is_retryable(exc: BaseException) -> bool:
     if isinstance(exc, (PlaywrightTimeoutError, LoginPageError)):
         return False
     if isinstance(exc, TransientHTTPError):
         return True
     return isinstance(exc, PlaywrightError)
-
-
-async def _new_page(context, timeout_ms: int) -> Page:
-    page = await context.new_page()
-    page.set_default_timeout(timeout_ms)
-    return page
-
-
-async def _safe_close_page(page: Page | None) -> None:
-    if page is None:
-        return
-    try:
-        if not page.is_closed():
-            await page.close()
-    except PlaywrightError:
-        pass
 
 
 async def _is_cf_challenge_page(page: Page) -> bool:
@@ -362,8 +356,12 @@ async def _validate_generated_pdf(pdf_path: Path, max_retries: int = 8) -> int:
             if not is_valid_pdf(pdf_path):
                 last_error = f"estrutura PDF invalida (size={size} bytes)"
                 continue
-            # Valida que tem pelo menos 1 pagina (evita PDF corrompido)
+            # Valida que tem pelo menos 1 pagina (evita PDF corrompido).
+            # count_pdf_pages retorna -1 em erro, 0+ se valido.
             page_count = count_pdf_pages(pdf_path)
+            if page_count < 0:
+                last_error = f"PDF nao parseavel (size={size} bytes)"
+                continue
             if page_count == 0:
                 last_error = f"PDF sem paginas legiveis (size={size} bytes)"
                 continue
@@ -417,18 +415,39 @@ async def _record_export_failure(
     acc.checkpoint.record_failure(url, error)
 
 
-def _bump_session_failures(acc: ExportAccumulators, logger) -> None:
-    """Incrementa contador de falhas de sessao (login/CF) e aciona circuit breaker."""
-    acc.consecutive_session_failures += 1
-    if acc.consecutive_session_failures >= _SESSION_FAILURE_CIRCUIT_BREAKER:
+def _check_disk_or_abort(acc: ExportAccumulators, logger) -> None:
+    """Verifica espaco em disco; aborta export se abaixo do minimo."""
+    free = get_free_disk_bytes(acc.pages_dir)
+    if 0 < free < _MIN_DISK_FREE_DURING_EXPORT:
         if not acc.abort_requested:
+            logger.error(
+                "Disco quase cheio (%d MB livres < %d MB). Abortando export "
+                "para nao corromper PDFs. Libere espaco e rode novamente.",
+                free // (1024 * 1024),
+                _MIN_DISK_FREE_DURING_EXPORT // (1024 * 1024),
+            )
+        acc.abort_requested = True
+
+
+async def _bump_session_failures(acc: ExportAccumulators, logger) -> None:
+    """Incrementa contador de falhas de sessao (login/CF) e aciona circuit breaker.
+
+    Thread-safe via acc.lock — evita race em modo paralelo onde workers
+    incrementam o mesmo contador simultaneamente.
+    """
+    async with acc.lock:
+        acc.consecutive_session_failures += 1
+        should_abort = (
+            acc.consecutive_session_failures >= _SESSION_FAILURE_CIRCUIT_BREAKER
+        )
+        if should_abort and not acc.abort_requested:
             logger.error(
                 "Circuit breaker: %d falhas consecutivas de sessao (login/CF). "
                 "Abortando export. Resolva o problema e rode novamente — o "
                 "resume retomara as URLs restantes.",
                 acc.consecutive_session_failures,
             )
-        acc.abort_requested = True
+            acc.abort_requested = True
 
 
 async def _generate_pdf(
@@ -456,8 +475,8 @@ async def _generate_pdf(
             margin={"top": "12mm", "right": "10mm", "bottom": "12mm", "left": "10mm"},
         )
         size_bytes = await _validate_generated_pdf(tmp_path)
-        # Rename atomico apenas se valido
-        os.replace(str(tmp_path), str(pdf_path))
+        # Rename atomico apenas se valido — retry em Windows antivirus
+        atomic_replace_with_retry(str(tmp_path), str(pdf_path))
         return size_bytes
     except BaseException:
         # Inclui KeyboardInterrupt — limpa tmp em qualquer interrupcao
@@ -513,8 +532,9 @@ async def _export_one(
         await _record_export_result(
             url, pdf_path, title, file_name, size_bytes, elapsed_total, acc, cfg, logger,
         )
-        limiter.report_success()
-        acc.consecutive_session_failures = 0  # sucesso reseta circuit breaker
+        await limiter.report_success()
+        async with acc.lock:
+            acc.consecutive_session_failures = 0  # sucesso reseta circuit breaker
         logger.info(
             "PDF gerado (%s/%s) em %.1fs (%.1f KB): %s",
             index, total, elapsed_total, size_bytes / 1024, file_name,
@@ -524,7 +544,7 @@ async def _export_one(
     except LoginPageError as exc:
         logger.error("Login detectado em %s: %s", url, exc)
         await _record_export_failure(url, "Pagina de login (Confluence privado)", acc)
-        _bump_session_failures(acc, logger)
+        await _bump_session_failures(acc, logger)
         return page
 
     except CloudflareChallengeError as exc:
@@ -536,7 +556,7 @@ async def _export_one(
         )
         # CF challenge = sinal forte de bloqueio. Aciona cooldown longo.
         await limiter.report_block(logger, "Cloudflare challenge")
-        _bump_session_failures(acc, logger)
+        await _bump_session_failures(acc, logger)
         await _safe_close_page(page)
         return await _new_page(context, cfg.timeout_ms)
 
@@ -583,12 +603,17 @@ def _expand_urls_with_retries(
     ainda tem tentativas disponiveis (< MAX_RETRY_ATTEMPTS) sao incluidas
     no fim para serem re-tentadas — independentemente de force_reexport,
     porque essas URLs nunca tiveram PDF gerado (so falhas).
+
+    Dedup contra exported tambem: se uma URL falhou no passado mas depois
+    foi exportada com sucesso, nao re-tenta (record_export ja limpa failures
+    mas pode haver dessincronia em manifests editados).
     """
     pending = checkpoint.urls_pending_retry(MAX_RETRY_ATTEMPTS)
     if not pending:
         return urls
-    seen = set(urls)
-    extra = [u for u in pending if u not in seen]
+    seen_urls = set(urls)
+    exported_urls = set(checkpoint.manifest.exported.keys())
+    extra = [u for u in pending if u not in seen_urls and u not in exported_urls]
     if extra:
         logger.info(
             "Re-tentando %d URL(s) que falharam em runs anteriores "
@@ -687,73 +712,6 @@ async def export_pages_to_pdf(
     return acc.exported, acc.failures, acc.slow_records
 
 
-async def _launch_browser_session(
-    playwright, headless: bool, timeout_ms: int, logger=None,
-    state_path: Path | None = None, proxy: str | None = None,
-) -> BrowserSession:
-    """Lança browser com retry. Usa UA realista, viewport variavel, storage_state."""
-    last_error: Exception | None = None
-    context_args = build_browser_context_args(state_path=state_path, proxy_url=proxy)
-    for attempt in range(1, _MAX_BROWSER_LAUNCH_ATTEMPTS + 1):
-        try:
-            browser = await playwright.chromium.launch(
-                headless=headless, channel="chromium",
-            )
-            context = await browser.new_context(**context_args)
-            page = await _new_page(context, timeout_ms)
-            return BrowserSession(
-                browser=browser, context=context, page=page, state_path=state_path,
-            )
-        except PlaywrightError as exc:
-            last_error = exc
-            if logger is not None:
-                logger.warning(
-                    "Falha ao lancar browser (tentativa %d/%d): %s",
-                    attempt, _MAX_BROWSER_LAUNCH_ATTEMPTS, exc,
-                )
-    raise RuntimeError(
-        "Nao foi possivel iniciar o navegador apos "
-        f"{_MAX_BROWSER_LAUNCH_ATTEMPTS} tentativas. "
-        "Verifique se o Chromium esta instalado (rode 'playwright install chromium' "
-        f"ou use a opcao [6] do menu). Ultimo erro: {last_error}"
-    )
-
-
-def _is_browser_alive(session: BrowserSession) -> bool:
-    if session.browser is None:
-        return False
-    try:
-        return bool(session.browser.is_connected())
-    except (PlaywrightError, Exception):  # noqa: BLE001 - defensive
-        return False
-
-
-async def _save_storage_state(session: BrowserSession, logger) -> None:
-    """Salva cookies/storage no caminho configurado (se houver)."""
-    if session.state_path is None or session.context is None:
-        return
-    try:
-        session.state_path.parent.mkdir(parents=True, exist_ok=True)
-        await session.context.storage_state(path=str(session.state_path))
-        logger.debug("Storage state salvo em %s", session.state_path)
-    except (PlaywrightError, OSError) as exc:
-        logger.warning("Falha ao salvar storage_state: %s", exc)
-
-
-async def _teardown_session(session: BrowserSession, logger) -> None:
-    await _save_storage_state(session, logger)
-    if session.context is not None:
-        try:
-            await session.context.close()
-        except PlaywrightError as exc:
-            logger.warning("Falha ao fechar context: %s", exc)
-    if session.browser is not None:
-        try:
-            await session.browser.close()
-        except PlaywrightError as exc:
-            logger.warning("Falha ao fechar browser: %s", exc)
-
-
 async def _run_export_loop(
     session: BrowserSession,
     urls: list[str],
@@ -784,6 +742,9 @@ async def _run_export_loop(
             if acc.abort_requested:
                 logger.warning("Export interrompido por circuit breaker.")
                 break
+            # Check de disco periodico: aborta antes de gerar PDF que vai falhar
+            if index % _DISK_CHECK_EVERY_N == 0:
+                _check_disk_or_abort(acc, logger)
             await _process_export_iteration(
                 session, url, index, total, playwright, acc, cfg, logger,
                 progress, task, limiter,
@@ -867,27 +828,35 @@ async def _worker_loop(
         while True:
             if acc.abort_requested:
                 break
-            item = await queue.get()
-            if item is None:
-                break
-            index, url = item
-            # _process_worker_item retorna a page atual (possivelmente nova
-            # se houve erro/timeout em _export_one). Propagar para a proxima
-            # iteracao senao a page recriada nunca eh usada.
-            page = await _process_worker_item(
-                page, context, url, index, total, acc, cfg, logger,
-                progress, task, limiter, worker_id,
-            )
-            progress.advance(task)
-            processed += 1
-            # Rotacao periodica para liberar memoria
-            if processed % _PAGE_ROTATION_INTERVAL == 0:
-                logger.info(
-                    "Worker %d: rotacionando page apos %d URLs",
-                    worker_id, processed,
-                )
-                await _safe_close_page(page)
-                page = await _new_page(context, cfg.timeout_ms)
+            item = await queue.get()  # propaga CancelledError naturalmente
+            try:
+                if item is None:
+                    break
+                index, url = item
+                try:
+                    page = await _process_worker_item(
+                        page, context, url, index, total, acc, cfg, logger,
+                        progress, task, limiter, worker_id,
+                    )
+                except Exception:  # noqa: BLE001
+                    # Erro inesperado em um item nao deve matar o worker
+                    logger.exception(
+                        "Worker %d: erro inesperado ao processar URL %s",
+                        worker_id, url,
+                    )
+                progress.advance(task)
+                processed += 1
+                # Rotacao periodica para liberar memoria
+                if processed % _PAGE_ROTATION_INTERVAL == 0:
+                    logger.info(
+                        "Worker %d: rotacionando page apos %d URLs",
+                        worker_id, processed,
+                    )
+                    await _safe_close_page(page)
+                    page = await _new_page(context, cfg.timeout_ms)
+            finally:
+                # Sempre marca task_done — sem isto, queue.join() trava forever
+                queue.task_done()
     finally:
         await _safe_close_page(page)
 
@@ -977,9 +946,31 @@ async def _resume_existing(
 
 async def _ensure_browser_alive(
     session: BrowserSession, playwright, cfg: ExportConfig, logger,
+    acc: ExportAccumulators | None = None,
 ) -> None:
+    """Verifica e relanca browser se morreu. Usa lock se acc fornecido (paralelo).
+
+    Em modo single-worker, acc=None e funciona normal. Em paralelo, dois workers
+    podem detectar crash simultaneamente; o lock garante que so um relanca.
+    """
     if _is_browser_alive(session):
         return
+
+    # Lock so quando ha acc (modo paralelo). Single-worker: sem contencao.
+    if acc is not None:
+        async with acc.browser_recovery_lock:
+            # Re-check apos pegar o lock (outro worker pode ter relancado)
+            if _is_browser_alive(session):
+                return
+            await _do_browser_recovery(session, playwright, cfg, logger)
+    else:
+        await _do_browser_recovery(session, playwright, cfg, logger)
+
+
+async def _do_browser_recovery(
+    session: BrowserSession, playwright, cfg: ExportConfig, logger,
+) -> None:
+    """Executa o relancamento do browser (sem lock — caller decide)."""
     logger.warning("Browser desconectou. Relancando...")
     try:
         if session.browser is not None:
