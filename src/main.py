@@ -16,6 +16,8 @@ from .pdf_merge import merge_pdfs
 from .utils import (
     Checkpoint,
     InvalidStartUrlError,
+    JobLock,
+    JobLockError,
     MANIFEST_FILENAME,
     RateLimitConfig,
     RateLimiter,
@@ -23,6 +25,7 @@ from .utils import (
     find_pending_jobs,
     format_bytes,
     format_duration,
+    generate_correlation_id,
     get_console,
     sanitize_proxy_for_log,
     setup_logger,
@@ -32,9 +35,10 @@ from .utils import (
     write_slow_pages_log,
 )
 
-__version__ = "0.7.0"
+from .utils import LARGE_BATCH_THRESHOLD  # re-export para retrocompat
 
-LARGE_BATCH_THRESHOLD = 500
+__version__ = "0.8.0"
+
 MIN_DISK_FREE_BYTES = 500 * 1024 * 1024  # 500MB minimo razoavel
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
@@ -55,11 +59,39 @@ async def run_pipeline(
     max_workers: int,
     proxy: str | None = None,
     dry_run: bool = False,
+    debug: bool = False,
 ) -> int:
     pages_dir, log_file = ensure_output_dirs(output_dir)
-    logger = setup_logger(log_file)
+    correlation_id = generate_correlation_id()
+    logger = setup_logger(log_file, debug=debug, correlation_id=correlation_id)
     console = get_console()
+    logger.info("Run iniciado: correlation_id=%s", correlation_id)
 
+    # Lock file: impede 2 processos rodando no mesmo output_dir
+    job_lock = JobLock(output_dir)
+    try:
+        job_lock.acquire()
+    except JobLockError as exc:
+        console.print(f"[bold red]Lock conflict:[/bold red] {exc}")
+        return 2
+    try:
+        return await _run_pipeline_inner(
+            start_url, output_dir, consolidated_name, headless, timeout_seconds,
+            max_pages, slow_threshold_seconds, auto_confirm, force_recrawl,
+            force_reexport, rate_limit, max_workers, proxy, dry_run,
+            pages_dir, log_file, logger, console,
+        )
+    finally:
+        job_lock.release()
+
+
+async def _run_pipeline_inner(
+    start_url, output_dir, consolidated_name, headless, timeout_seconds,
+    max_pages, slow_threshold_seconds, auto_confirm, force_recrawl,
+    force_reexport, rate_limit, max_workers, proxy, dry_run,
+    pages_dir, log_file, logger, console,
+) -> int:
+    """Pipeline interno (encapsulado no lock). Mantem assinatura original."""
     timeout_ms = timeout_seconds * 1000
     pipeline_start = time.monotonic()
 
@@ -470,22 +502,35 @@ def _build_main_summary_table(
 
 
 def _handle_fresh_flag(output_dir: Path, start_url: str, console) -> None:
-    """Backup + remocao do manifest quando --fresh."""
+    """Backup + remocao do manifest E storage_state quando --fresh.
+
+    --fresh deve resetar TUDO: manifest, cookies persistidos (browser_state.json),
+    pois usuario pode estar tentando escapar de sessao bloqueada.
+    """
     manifest = output_dir / MANIFEST_FILENAME
-    if not manifest.exists():
-        return
-    try:
-        temp_ck = Checkpoint(output_dir, start_url)
-        backup = temp_ck.backup()
-        if backup:
-            console.print(f"[dim]Backup criado: {backup}[/dim]")
-    except (OSError, ValueError):
-        pass
-    try:
-        manifest.unlink()
-        console.print("[yellow]Manifest anterior removido[/yellow] (--fresh).")
-    except OSError as exc:
-        console.print(f"[yellow]Aviso: nao foi possivel remover manifest:[/yellow] {exc}")
+    state_file = storage_state_path(output_dir)
+
+    if manifest.exists():
+        try:
+            temp_ck = Checkpoint(output_dir, start_url)
+            backup = temp_ck.backup()
+            if backup:
+                console.print(f"[dim]Backup criado: {backup}[/dim]")
+        except (OSError, ValueError):
+            pass
+        try:
+            manifest.unlink()
+            console.print("[yellow]Manifest anterior removido[/yellow] (--fresh).")
+        except OSError as exc:
+            console.print(f"[yellow]Aviso: nao foi possivel remover manifest:[/yellow] {exc}")
+
+    # Remove storage_state para forcar nova sessao (importante apos bloqueio)
+    if state_file.exists():
+        try:
+            state_file.unlink()
+            console.print("[yellow]Cookies/storage anteriores removidos[/yellow] (--fresh).")
+        except OSError as exc:
+            console.print(f"[yellow]Aviso: nao foi possivel remover storage_state:[/yellow] {exc}")
 
 
 def _check_disk_space(output_dir: Path, console) -> bool:
@@ -555,6 +600,10 @@ def run(
     dry_run: bool = typer.Option(
         False, "--dry-run",
         help="Mapeia a arvore mas nao exporta PDFs (estimativa rapida).",
+    ),
+    debug: bool = typer.Option(
+        False, "--debug",
+        help="Verbose: ativa DEBUG logging (mais detalhes em run.log).",
     ),
 ) -> None:
     """Mapeia a arvore lateral do Confluence, exporta PDFs e gera consolidado.
@@ -631,6 +680,7 @@ def run(
                 max_workers=max_workers,
                 proxy=proxy,
                 dry_run=dry_run,
+                debug=debug,
             )
         )
     except KeyboardInterrupt:
@@ -1042,19 +1092,55 @@ def _write_report_csv(target: Path, rows: list[dict]) -> None:
         writer.writerows(sanitized)
 
 
+def _percentiles(values: list[float]) -> dict[str, float]:
+    """Calcula p50/p95/p99 sem dependencia externa (numpy etc).
+
+    Filtra valores negativos (sentinelas de erro) e zero (sem dado).
+    Retorna 0.0 para todos se lista vazia/invalida.
+    """
+    # Filtra apenas valores positivos validos
+    clean = [v for v in values if v > 0]
+    if not clean:
+        return {"p50": 0.0, "p95": 0.0, "p99": 0.0, "min": 0.0, "max": 0.0}
+    sorted_v = sorted(clean)
+    n = len(sorted_v)
+
+    def _p(percent: float) -> float:
+        # Implementacao nearest-rank (simples, sem interpolacao)
+        idx = int(percent * (n - 1) + 0.5)
+        return float(sorted_v[min(idx, n - 1)])
+
+    return {
+        "p50": _p(0.50),
+        "p95": _p(0.95),
+        "p99": _p(0.99),
+        "min": float(sorted_v[0]),
+        "max": float(sorted_v[-1]),
+    }
+
+
 def _write_report_json(target: Path, rows: list[dict], data: dict) -> None:
     import json as _json
     target.parent.mkdir(parents=True, exist_ok=True)
+    # Calcula estatisticas de tempo (apenas PDFs exportados)
+    elapsed_times = [
+        float(r.get("elapsed_seconds", 0)) for r in rows
+        if r["status"] == "exported" and r.get("elapsed_seconds", 0) > 0
+    ]
+    total = len(rows)
+    exported_count = sum(1 for r in rows if r["status"] == "exported")
     payload = {
         "start_url": data.get("start_url", ""),
         "last_updated": data.get("last_updated", ""),
         "crawl_complete": data.get("crawl_complete", False),
         "summary": {
-            "total": len(rows),
-            "exported": sum(1 for r in rows if r["status"] == "exported"),
+            "total": total,
+            "exported": exported_count,
             "failed": sum(1 for r in rows if r["status"] == "failed"),
             "pending": sum(1 for r in rows if r["status"] == "pending"),
             "total_bytes": sum(int(r.get("size_bytes", 0)) for r in rows),
+            "conversion_rate": (exported_count / total) if total else 0.0,
+            "timing_seconds": _percentiles(elapsed_times),
         },
         "rows": rows,
     }
@@ -1063,21 +1149,28 @@ def _write_report_json(target: Path, rows: list[dict], data: dict) -> None:
 
 
 def _install_signal_handlers() -> None:
-    """Instala handlers para SIGTERM/SIGINT que levantam KeyboardInterrupt.
+    """Instala handlers para SIGTERM que levantam KeyboardInterrupt.
 
     Sem isto, task managers (systemd, docker stop) enviam SIGTERM e o processo
     morre sem chance de salvar o manifest. Convertendo para KeyboardInterrupt,
     o pipeline normal de cleanup (try/finally) eh acionado.
+
+    Note: signal.signal() so funciona na main thread; em Windows pode nao
+    receber SIGTERM mas SIGBREAK eh usado.
     """
     import signal
 
     def _handler(signum, _frame):
         raise KeyboardInterrupt(f"Sinal {signum} recebido")
 
-    try:
-        signal.signal(signal.SIGTERM, _handler)
-    except (AttributeError, ValueError):
-        pass  # Windows pode nao ter SIGTERM em alguns contextos
+    # SIGTERM (Unix) e SIGBREAK (Windows Ctrl+Break) — tenta ambos
+    for sig_name in ("SIGTERM", "SIGBREAK"):
+        sig = getattr(signal, sig_name, None)
+        if sig is not None:
+            try:
+                signal.signal(sig, _handler)
+            except (AttributeError, ValueError, OSError):
+                pass
     # SIGINT (Ctrl+C) ja levanta KeyboardInterrupt por default — nao reinstala
 
 

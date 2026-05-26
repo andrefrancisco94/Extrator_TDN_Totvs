@@ -68,7 +68,7 @@ _CONTENT_SELECTORS = (
     "main",
 )
 
-_PAGE_ROTATION_INTERVAL = 50
+from .utils import PAGE_ROTATION_INTERVAL as _PAGE_ROTATION_INTERVAL  # noqa: PLC0415
 
 # Score minimo para considerar pagina como tela de login (multi-indicador).
 _LOGIN_SCORE_THRESHOLD = 2
@@ -415,18 +415,20 @@ async def _record_export_failure(
     acc.checkpoint.record_failure(url, error)
 
 
-def _check_disk_or_abort(acc: ExportAccumulators, logger) -> None:
-    """Verifica espaco em disco; aborta export se abaixo do minimo."""
+async def _check_disk_or_abort(acc: ExportAccumulators, logger) -> None:
+    """Verifica espaco em disco; aborta export se abaixo do minimo (thread-safe)."""
     free = get_free_disk_bytes(acc.pages_dir)
     if 0 < free < _MIN_DISK_FREE_DURING_EXPORT:
-        if not acc.abort_requested:
+        async with acc.lock:
+            should_log = not acc.abort_requested
+            acc.abort_requested = True
+        if should_log:
             logger.error(
                 "Disco quase cheio (%d MB livres < %d MB). Abortando export "
                 "para nao corromper PDFs. Libere espaco e rode novamente.",
                 free // (1024 * 1024),
                 _MIN_DISK_FREE_DURING_EXPORT // (1024 * 1024),
             )
-        acc.abort_requested = True
 
 
 async def _bump_session_failures(acc: ExportAccumulators, logger) -> None:
@@ -744,7 +746,7 @@ async def _run_export_loop(
                 break
             # Check de disco periodico: aborta antes de gerar PDF que vai falhar
             if index % _DISK_CHECK_EVERY_N == 0:
-                _check_disk_or_abort(acc, logger)
+                await _check_disk_or_abort(acc, logger)
             await _process_export_iteration(
                 session, url, index, total, playwright, acc, cfg, logger,
                 progress, task, limiter,

@@ -31,6 +31,13 @@ STORAGE_STATE_FILENAME = "browser_state.json"
 # failures com attempts < este valor sao re-enqueuadas no proximo run.
 MAX_RETRY_ATTEMPTS = 5
 
+# Intervalo de rotacao de pagina Playwright (compartilhado entre crawler/exporter
+# para evitar memory leak em runs longos)
+PAGE_ROTATION_INTERVAL = 50
+
+# Threshold para confirmar batch grande antes de exportar
+LARGE_BATCH_THRESHOLD = 500
+
 _INVALID_FILE_CHARS = re.compile(r"[<>:\"/\\|?*\x00-\x1f]")
 _MAX_FILENAME_LEN = 80
 
@@ -127,7 +134,11 @@ class RateLimiter:
             self._consecutive_blocks = 0
 
     async def report_block(self, logger=None, reason: str = "") -> float:
-        """Registra bloqueio e agenda cooldown exponencial. Retorna duracao do cooldown."""
+        """Registra bloqueio e agenda cooldown exponencial. Retorna duracao do cooldown.
+
+        Jitter aplica APENAS aumento (0 a +25%) — nunca reduz cooldown abaixo
+        do calculado, evitando bater no servidor antes da hora.
+        """
         async with self._lock:
             self._consecutive_blocks += 1
             cooldown = min(
@@ -135,8 +146,9 @@ class RateLimiter:
                 self.config.backoff_initial_seconds
                 * (self.config.backoff_multiplier ** (self._consecutive_blocks - 1)),
             )
-            # Jitter de +/- 25% no cooldown pra nao sincronizar tentativas
-            cooldown *= 1.0 + random.uniform(-0.25, 0.25)
+            # Jitter SOMENTE aumenta (0 a +25%) para nao sincronizar tentativas
+            # mas tambem nao defeats o purpose do cooldown reduzindo-o.
+            cooldown *= 1.0 + random.uniform(0, 0.25)
             self._cooldown_until = time.monotonic() + cooldown
             if logger is not None:
                 logger.warning(
@@ -148,6 +160,7 @@ class RateLimiter:
 
     @property
     def consecutive_blocks(self) -> int:
+        """Leitura snapshot (int atomico em CPython com GIL)."""
         return self._consecutive_blocks
 
 
@@ -319,27 +332,43 @@ class Checkpoint:
         self.previous_start_url: str | None = None
         self.manifest = self._load_or_create(start_url)
         self._save_lock = threading.Lock()
-        # Batch de saves: evita O(N²) write em runs grandes. Flush a cada N
-        # records ou em fim de fase (save() explicito).
+        # Batch de saves: evita O(N²) write em runs grandes.
+        # `_pending_save_count` e `_save_every_n` protegidos pelo mesmo
+        # _save_lock para evitar race em modo paralelo.
         self._pending_save_count = 0
-        self._save_every_n = 20  # saves a cada 20 record_export/failure
+        self._save_every_n = 20
         if self.load_warning and logger is not None:
             logger.warning("Manifest descartado: %s (recomecando do zero)", self.load_warning)
 
     def _maybe_batched_save(self) -> None:
-        """Salva apenas a cada N chamadas. Usado por record_export/failure
-        para evitar write O(N²) em runs grandes (1000 PDFs = 1 save por PDF
-        com manifesto crescente = 500k entries escritas no total).
+        """Salva apenas a cada N chamadas (thread-safe).
+
+        Decide DENTRO do lock se precisa salvar — evita race onde 2 workers
+        leem count=19, ambos incrementam pra 20 e ambos chamam save().
+        Se save() falhar, contador NAO eh zerado (proxima chamada tenta de novo).
         """
-        self._pending_save_count += 1
-        if self._pending_save_count >= self._save_every_n:
-            self._pending_save_count = 0
-            self.save()
+        with self._save_lock:
+            self._pending_save_count += 1
+            should_save = self._pending_save_count >= self._save_every_n
+            if should_save:
+                self._pending_save_count = 0
+        if should_save:
+            try:
+                self.save()
+            except OSError:
+                # Save falhou — restaura contador pra tentar de novo proxima
+                with self._save_lock:
+                    self._pending_save_count = self._save_every_n
+                raise
 
     def flush(self) -> None:
-        """Forca save pendente (chamar em fim de fase)."""
-        self._pending_save_count = 0
-        self.save()
+        """Forca save pendente (chamar em fim de fase).
+
+        Se save() falhar, mantem contador para retry (nao zera estado).
+        """
+        self.save()  # save() ja faz lock interno; se falhar, propaga
+        with self._save_lock:
+            self._pending_save_count = 0
 
     def _load_or_create(self, start_url: str) -> Manifest:
         if not self.path.exists():
@@ -886,22 +915,120 @@ def storage_state_path(output_dir: Path) -> Path:
     return output_dir / STORAGE_STATE_FILENAME
 
 
-def setup_logger(log_file: Path) -> logging.Logger:
-    """Configura logger com rotacao automatica do arquivo (10MB x 5 backups)."""
+_LOCK_FILENAME = ".extrator.lock"
+
+
+class JobLockError(RuntimeError):
+    """Outro processo ja esta usando este output_dir."""
+
+
+class JobLock:
+    """Lock file para impedir 2 processos simultaneos no mesmo output_dir.
+
+    Uso:
+        with JobLock(output_dir):
+            ...  # operacoes seguras
+
+    Armazena PID. Se outro processo existe e tem o lock, mas PID nao esta
+    ativo (crash), assume lock orfao e toma posse.
+    """
+
+    def __init__(self, output_dir: Path):
+        self.lock_file = output_dir / _LOCK_FILENAME
+        self._held = False
+
+    def acquire(self) -> None:
+        """Adquire o lock. Levanta JobLockError se ja em uso por processo vivo."""
+        if self.lock_file.exists():
+            try:
+                pid_str = self.lock_file.read_text(encoding="utf-8").strip()
+                pid = int(pid_str) if pid_str.isdigit() else 0
+            except (OSError, ValueError):
+                pid = 0
+            if pid and _is_pid_alive(pid):
+                raise JobLockError(
+                    f"Outro processo (PID {pid}) ja esta usando {self.lock_file.parent}. "
+                    "Aguarde ou finalize-o antes de rodar novamente."
+                )
+            # Lock orfao (processo morto) — toma posse
+        try:
+            self.lock_file.parent.mkdir(parents=True, exist_ok=True)
+            self.lock_file.write_text(str(os.getpid()), encoding="utf-8")
+            self._held = True
+        except OSError as exc:
+            raise JobLockError(f"Falha ao adquirir lock: {exc}") from exc
+
+    def release(self) -> None:
+        """Libera o lock se este processo o detem."""
+        if not self._held:
+            return
+        try:
+            self.lock_file.unlink()
+        except OSError:
+            pass
+        self._held = False
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *_):
+        self.release()
+
+
+def _is_pid_alive(pid: int) -> bool:
+    """Verifica se um PID esta ativo (Windows + Unix)."""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        # Windows: usar tasklist (mais portavel que ctypes)
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}"],
+                capture_output=True, text=True, timeout=5,
+            )
+            return str(pid) in result.stdout
+        except (OSError, subprocess.TimeoutExpired, ImportError):
+            return False
+    try:
+        os.kill(pid, 0)  # signal 0 = check sem matar (ProcessLookupError eh subclasse de OSError)
+        return True
+    except OSError:
+        return False
+
+
+def setup_logger(
+    log_file: Path, debug: bool = False, correlation_id: str | None = None,
+) -> logging.Logger:
+    """Configura logger com rotacao automatica (10MB x 5 backups).
+
+    Args:
+        log_file: arquivo de log (rotativo).
+        debug: se True, ativa nivel DEBUG (mais verboso).
+        correlation_id: ID unico do run (UUID curto) — incluido em cada linha
+            para facilitar rastreamento de logs em multiplos runs.
+    """
     from logging.handlers import RotatingFileHandler
 
     logger = logging.getLogger("tdn_extractor")
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.DEBUG if debug else logging.INFO)
     logger.handlers.clear()
     logger.propagate = False
 
-    # Rotacao: max 10MB por arquivo, mantem 5 ultimas rotacoes (50MB total).
-    # Evita que run.log cresca indefinidamente apos muitos resumes.
+    # Formato com correlation_id se fornecido
+    if correlation_id:
+        fmt_file = f"%(asctime)s | [{correlation_id}] | %(levelname)s | %(message)s"
+        fmt_console = f"[{correlation_id}] %(message)s"
+    else:
+        fmt_file = "%(asctime)s | %(levelname)s | %(message)s"
+        fmt_console = "%(message)s"
+
     file_handler = RotatingFileHandler(
         log_file, encoding="utf-8",
         maxBytes=10 * 1024 * 1024, backupCount=5,
     )
-    file_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+    file_handler.setFormatter(logging.Formatter(fmt_file))
     logger.addHandler(file_handler)
 
     rich_handler = RichHandler(
@@ -911,10 +1038,16 @@ def setup_logger(log_file: Path) -> logging.Logger:
         rich_tracebacks=True,
         markup=False,
     )
-    rich_handler.setFormatter(logging.Formatter("%(message)s"))
+    rich_handler.setFormatter(logging.Formatter(fmt_console))
     logger.addHandler(rich_handler)
 
     return logger
+
+
+def generate_correlation_id() -> str:
+    """Gera ID unico curto para um run (8 chars hex)."""
+    import uuid
+    return uuid.uuid4().hex[:8]
 
 
 def write_slow_pages_log(output_dir: Path, records: Iterable[SlowPageRecord]) -> Path:
@@ -1033,7 +1166,9 @@ def is_valid_pdf(path: Path) -> bool:
     """Valida estrutura basica de um PDF: header, EOF marker, tamanho minimo.
 
     Mais barato que abrir com PdfReader. Detecta arquivos vazios/parciais
-    que Playwright pode deixar quando crasha durante page.pdf().
+    que Playwright pode deixar quando crasha durante page.pdf(). Tambem
+    rejeita HTML disfarcado de PDF (servidor retorna HTML de erro mas
+    Content-Type mente).
     """
     try:
         if not path.exists():
@@ -1042,8 +1177,13 @@ def is_valid_pdf(path: Path) -> bool:
         if size < _MIN_VALID_PDF_SIZE:
             return False
         with path.open("rb") as fp:
-            header = fp.read(5)
-            if header != b"%PDF-":
+            header = fp.read(16)
+            if not header.startswith(b"%PDF-"):
+                return False
+            # Rejeita HTML de erro (alguns servidores entregam HTML com
+            # Content-Type: application/pdf, ou Playwright captura err page)
+            head_lower = header.lower()
+            if b"<html" in head_lower or b"<!doctype" in head_lower:
                 return False
             # Le os ultimos 1024 bytes para procurar pelo marcador %%EOF
             fp.seek(max(0, size - 1024))

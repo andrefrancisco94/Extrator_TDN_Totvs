@@ -77,7 +77,7 @@ _LOAD_SELECTORS = (
     "#main-content",
 )
 
-_PAGE_ROTATION_INTERVAL = 50
+from .utils import PAGE_ROTATION_INTERVAL as _PAGE_ROTATION_INTERVAL  # noqa: PLC0415
 
 # Salva snapshot do crawl a cada N URLs processadas. Permite resume parcial
 # se o processo for interrompido no meio do mapeamento.
@@ -441,13 +441,22 @@ async def _ensure_browser_alive(
         session.page = new_session.page
 
 
+def _is_valid_url_str(url) -> bool:
+    """Filtra URLs malformadas (None, vazia, nao-string)."""
+    return isinstance(url, str) and url.strip().startswith(("http://", "https://"))
+
+
 def _restore_state_from_checkpoint(
     state: CrawlState, checkpoint: Checkpoint, start_canonical: str, logger,
 ) -> bool:
-    """Restaura state da fila/seen salvos no manifest. Retorna True se resumiu."""
-    saved_queue = list(checkpoint.manifest.crawl_queue)
-    saved_seen = list(checkpoint.manifest.crawl_seen)
-    saved_mapped = list(checkpoint.manifest.mapped_urls)
+    """Restaura state da fila/seen salvos no manifest. Retorna True se resumiu.
+
+    Filtra URLs malformadas que podem ter sido inseridas via edicao manual
+    do manifest (None, strings vazias, nao-http URLs).
+    """
+    saved_queue = [u for u in checkpoint.manifest.crawl_queue if _is_valid_url_str(u)]
+    saved_seen = [u for u in checkpoint.manifest.crawl_seen if _is_valid_url_str(u)]
+    saved_mapped = [u for u in checkpoint.manifest.mapped_urls if _is_valid_url_str(u)]
 
     if not (saved_queue or saved_seen or saved_mapped):
         return False

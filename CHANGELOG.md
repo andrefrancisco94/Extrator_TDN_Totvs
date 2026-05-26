@@ -1,5 +1,42 @@
 # Changelog
 
+## [0.8.0] - 2026-05-25
+
+### Auditoria r2 (6 agents paralelos, 200 novos achados)
+
+**Bugs CRÍTICOS corrigidos (concorrência):**
+- `_pending_save_count` protegido por lock (race em workers paralelos chamando `record_export`)
+- `_check_disk_or_abort` agora async com lock (race em `abort_requested`)
+- `RateLimiter.consecutive_blocks` documentado como leitura atômica
+- Jitter no cooldown agora **só aumenta** (0 a +25%) — não defeats purpose
+- Signal handler também trata `SIGBREAK` (Windows Ctrl+Break)
+
+**Bugs ALTOS corrigidos:**
+- `_handle_fresh_flag` agora remove **também** `browser_state.json` (cookies anteriores)
+- `_restore_state_from_checkpoint` filtra URLs malformadas (None, vazia, não-http) do manifest
+- `_percentiles` filtra valores negativos e zero (sentinelas de erro)
+- `flush()` preserva `_pending_save_count` se save falhar (próximo retry funciona)
+- `is_valid_pdf` rejeita HTML disfarçado de PDF (`<html>` / `<!doctype>` no header)
+
+**Features novas:**
+- **`JobLock`**: lock file (`.extrator.lock`) impede 2 processos no mesmo `output_dir`. Detecta lock órfão (PID morto) e toma posse automática.
+- Constantes compartilhadas: `PAGE_ROTATION_INTERVAL` e `LARGE_BATCH_THRESHOLD` em `utils.py` (eliminou duplicação crawler/exporter)
+
+**Refactor:**
+- `run_pipeline` dividido em `run_pipeline` (lock) + `_run_pipeline_inner` (lógica), garantindo `release()` via try/finally
+- Constantes movidas de módulos específicos para `utils.py`
+
+**Infraestrutura:**
+- `.gitignore` completo (cobre `.venv`, `output/`, `.bak`, `.pdf.tmp`, `.extrator.lock`)
+- `LICENSE` (MIT) arquivo padrão
+- `pyproject.toml` com `[tool.coverage.*]` config
+- Bump version 0.7.0 → 0.8.0
+
+**Testes (99 → 144, +45 novos em `tests/test_v08_fixes.py` + `tests/test_browser.py` + `tests/conftest.py`):**
+- 14 testes do módulo `browser.py` (BrowserSession, launch, teardown, save_storage_state com mocks)
+- 31 testes de fixes da v0.8: jitter only-increases, lock thread-safety, JobLock acquire/release/orphan, filter URLs malformadas, percentiles negative filter, fresh removes state, HTML-as-PDF rejection, slugify edge cases, constantes compartilhadas, _is_pid_alive
+- `conftest.py` com fixtures compartilhadas (`temp_output_dir`, `mock_logger`, `valid_pdf_bytes`)
+
 ## [0.7.0] - 2026-05-25
 
 ### Auditoria abrangente (5 agents paralelos, 132 achados)

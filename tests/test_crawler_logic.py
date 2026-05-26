@@ -58,37 +58,37 @@ def test_restore_with_mapped_only(logger):
     """Restaura mapped_urls mesmo sem queue/seen explicitos."""
     with tempfile.TemporaryDirectory() as td:
         ck = Checkpoint(Path(td), "https://x.com/a")
-        ck.manifest.mapped_urls = ["url1", "url2"]
+        ck.manifest.mapped_urls = ["https://x.com/url1", "https://x.com/url2"]
         state = CrawlState(queue=deque(), queued=set())
-        result = _restore_state_from_checkpoint(state, ck, "url1", logger)
+        result = _restore_state_from_checkpoint(state, ck, "https://x.com/url1", logger)
         assert result is True
-        assert state.ordered_urls == ["url1", "url2"]
+        assert state.ordered_urls == ["https://x.com/url1", "https://x.com/url2"]
 
 
 def test_restore_re_enqueues_failures(logger):
     """URLs em failures (com attempts < MAX) voltam pra fila."""
     with tempfile.TemporaryDirectory() as td:
         ck = Checkpoint(Path(td), "https://x.com/a")
-        ck.manifest.mapped_urls = ["url1"]
-        ck.manifest.failures["url2"] = {
+        ck.manifest.mapped_urls = ["https://x.com/url1"]
+        ck.manifest.failures["https://x.com/url2"] = {
             "error": "timeout", "attempts": 1, "last_attempt": "",
         }
         state = CrawlState(queue=deque(), queued=set())
-        _restore_state_from_checkpoint(state, ck, "url1", logger)
-        assert "url2" in state.queued
+        _restore_state_from_checkpoint(state, ck, "https://x.com/url1", logger)
+        assert "https://x.com/url2" in state.queued
 
 
 def test_restore_ignores_exhausted_failures(logger):
     """URLs com failures.attempts >= MAX nao sao re-enfileiradas."""
     with tempfile.TemporaryDirectory() as td:
         ck = Checkpoint(Path(td), "https://x.com/a")
-        ck.manifest.mapped_urls = ["url1"]
-        ck.manifest.failures["dead"] = {
+        ck.manifest.mapped_urls = ["https://x.com/url1"]
+        ck.manifest.failures["https://x.com/dead"] = {
             "error": "X", "attempts": MAX_RETRY_ATTEMPTS, "last_attempt": "",
         }
         state = CrawlState(queue=deque(), queued=set())
-        _restore_state_from_checkpoint(state, ck, "url1", logger)
-        assert "dead" not in state.queued
+        _restore_state_from_checkpoint(state, ck, "https://x.com/url1", logger)
+        assert "https://x.com/dead" not in state.queued
 
 
 # =============================================================================

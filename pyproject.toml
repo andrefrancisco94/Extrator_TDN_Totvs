@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "extrator-tdn-totvs"
-version = "0.7.0"
+version = "0.8.0"
 description = "Extrator de documentação Confluence/TDN TOTVS para PDF consolidado"
 authors = [{name = "Andre", email = "andre.fco94@gmail.com"}]
 license = {text = "MIT"}
@@ -59,3 +59,18 @@ addopts = [
 filterwarnings = [
     "ignore::DeprecationWarning",
 ]
+
+[tool.coverage.run]
+source = ["src"]
+omit = ["tests/*", "*/__init__.py"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]
+show_missing = true
+skip_covered = false

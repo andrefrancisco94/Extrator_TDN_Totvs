@@ -118,14 +118,35 @@ def _append_with_bookmark(
         return
 
     # Bookmark com o titulo da pagina, apontando para primeira pagina do PDF
-    safe_title = (entry_title or entry_path.stem).strip()
-    if not safe_title:
-        safe_title = entry_path.stem
-    safe_title = safe_title[:120]  # PDF outline tem limites praticos
+    safe_title = _sanitize_bookmark_title(
+        entry_title or entry_path.stem, entry_path.stem,
+    )
     try:
         writer.add_outline_item(safe_title, page_index_before)
     except (ValueError, KeyError, OSError) as exc:
-        logger.debug("Nao foi possivel adicionar bookmark para %s: %s", safe_title, exc)
+        logger.warning("Bookmark falhou para %s: %s", safe_title, exc)
+        # Fallback: bookmark minimalista com filename stem
+        try:
+            writer.add_outline_item(entry_path.stem[:50], page_index_before)
+        except (ValueError, KeyError, OSError):
+            logger.debug("Bookmark fallback tambem falhou para %s", entry_path.name)
+
+
+_PDF_OUTLINE_MAX_TITLE_LEN = 120  # Limite pratico do PDF outline
+
+
+def _sanitize_bookmark_title(raw_title: str, fallback: str) -> str:
+    """Sanitiza titulo para bookmark do PDF (remove chars problematicos)."""
+    import re as _re
+    safe = (raw_title or fallback).strip()
+    if not safe:
+        safe = fallback
+    # Remove chars que algumas implementacoes de PDF outline nao suportam
+    safe = safe.replace("™", "TM").replace("®", "(R)").replace("©", "(C)")
+    # Zero-width chars
+    safe = _re.sub(r"[​-‍﻿]", "", safe)
+    # Trunca
+    return safe[:_PDF_OUTLINE_MAX_TITLE_LEN]
 
 
 def _set_metadata(writer: PdfWriter, title: str) -> None:
@@ -145,17 +166,32 @@ def _set_metadata(writer: PdfWriter, title: str) -> None:
         pass
 
 
+_COMPRESS_PAGE_LIMIT = 5000  # acima disso, pula compressao (OOM risk)
+
+
 def _compress_streams(writer: PdfWriter, logger) -> None:
     """Comprime streams de conteudo do PDF consolidado (reduz tamanho).
 
     pypdf aplica zlib em streams nao comprimidos. Falha silenciosamente
-    em PDFs problematicos (best-effort).
+    em PDFs problematicos (best-effort). Em PDFs muito grandes (>5000 paginas),
+    pula a compressao para evitar OOM (cada page.compress carrega stream
+    inteiro na memoria).
     """
     try:
+        page_count = len(writer.pages)
+        if page_count > _COMPRESS_PAGE_LIMIT:
+            logger.info(
+                "PDF muito grande (%d paginas > %d), pulando compressao para "
+                "evitar OOM. Use pdftk/qpdf externamente se quiser comprimir.",
+                page_count, _COMPRESS_PAGE_LIMIT,
+            )
+            return
         for page in writer.pages:
             try:
                 page.compress_content_streams()
-            except (ValueError, KeyError, AttributeError, OSError):
+            except (ValueError, KeyError, AttributeError, OSError, MemoryError):
                 continue
+    except MemoryError:
+        logger.warning("Sem memoria para compressao de streams, continuando")
     except Exception as exc:  # noqa: BLE001
         logger.debug("Compressao de streams falhou (continuando sem): %s", exc)
