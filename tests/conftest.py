@@ -2,10 +2,18 @@
 from __future__ import annotations
 
 import logging
+import os
 import tempfile
 from pathlib import Path
 
 import pytest
+
+# Sem isto, Rich/Typer renderiza --help com ANSI escape codes que fragmentam
+# nomes de flags (ex: "--request-delay" vira "\x1b[36m-\x1b[0m\x1b[36m-request\x1b[0m..."),
+# quebrando asserts do tipo `"--flag" in result.stdout` no CI. _TYPER_FORCE_DISABLE_TERMINAL
+# eh o switch oficial do Typer; NO_COLOR sozinho nao basta quando FORCE_COLOR esta setado.
+os.environ["_TYPER_FORCE_DISABLE_TERMINAL"] = "1"
+os.environ.setdefault("NO_COLOR", "1")
 
 
 @pytest.fixture
