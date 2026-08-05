@@ -294,7 +294,11 @@ async def _is_login_page(page: Page) -> bool:
 )
 async def _goto_dom_ready(page: Page, url: str, timeout_ms: int) -> None:
     response = await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-    if response and response.status >= 500:
+    # 429 (rate limit) precisa do mesmo tratamento que 5xx: aciona o cooldown
+    # do RateLimiter via TransientHTTPError. Sem isso, o exporter cai no
+    # catch-all generico (que nao chama report_block) e continua martelando
+    # o servidor no intervalo base, ignorando o bloqueio sinalizado.
+    if response and (response.status >= 500 or response.status == 429):
         raise TransientHTTPError(f"HTTP {response.status}")
     if response and response.status >= 400:
         raise RuntimeError(f"HTTP {response.status}")

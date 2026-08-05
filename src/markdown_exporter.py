@@ -39,6 +39,7 @@ from .browser import (
 from .pdf_exporter import (
     CloudflareChallengeError,
     LoginPageError,
+    TransientHTTPError,
     _CONTENT_SELECTORS,
     _ensure_browser_alive,
     _goto_dom_ready,
@@ -503,6 +504,14 @@ async def _export_one_markdown(
             SlowPageRecord(url=url, elapsed_seconds=elapsed, phase="md-timeout")
         )
         await limiter.report_block(logger, "timeout no Markdown")
+        await _safe_close_page(page)
+        return await _new_page(context, cfg.timeout_ms)
+
+    except TransientHTTPError as exc:
+        elapsed = time.monotonic() - page_start
+        logger.error("HTTP transitorio em %s apos %.1fs: %s", url, elapsed, exc)
+        acc.failures.append((url, str(exc)))
+        await limiter.report_block(logger, str(exc))
         await _safe_close_page(page)
         return await _new_page(context, cfg.timeout_ms)
 
