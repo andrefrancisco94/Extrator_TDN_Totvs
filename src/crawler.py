@@ -99,6 +99,11 @@ _API_CACHE_MAX_ENTRIES = 5000
 class CrawlState:
     """Estado mutavel do crawl (BFS + slow records)."""
     ordered_urls: list[str] = field(default_factory=list)
+    # Espelha o conteudo de ordered_urls como set, mas NUNCA eh removido
+    # (diferente de `seen`, que e descartado em timeout-retry para permitir
+    # reprocessamento). Garante que uma URL entra em ordered_urls no maximo
+    # uma vez, mesmo que passe por varios timeouts/retries intra-run.
+    mapped_set: set[str] = field(default_factory=set)
     slow_records: list[SlowPageRecord] = field(default_factory=list)
     seen: set[str] = field(default_factory=set)
     queued: set[str] = field(default_factory=set)
@@ -489,6 +494,9 @@ def _restore_state_from_checkpoint(
             state.ordered_urls.append(url)
             seen_so_far.add(url)
 
+    # mapped_set espelha ordered_urls e NUNCA e descartado (diferente de
+    # `seen` abaixo) — impede re-adicionar a mesma URL apos timeout-retry.
+    state.mapped_set = set(seen_so_far)
     state.seen = set(saved_seen) | seen_so_far
     # Re-enqueua o que estava na fila
     for url in saved_queue:
@@ -712,7 +720,9 @@ async def _run_crawl_loop(
                 continue
 
             state.seen.add(current)
-            state.ordered_urls.append(current)
+            if current not in state.mapped_set:
+                state.mapped_set.add(current)
+                state.ordered_urls.append(current)
             short = current if len(current) <= 60 else current[:57] + "..."
             progress.update(
                 task, advance=1, queue=len(state.queue),
