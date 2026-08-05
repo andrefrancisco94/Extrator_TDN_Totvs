@@ -423,3 +423,97 @@ Call log:
 2026-08-05 10:37:43,817 | [b6c07267] | WARNING | Bloqueio detectado (Cloudflare challenge no crawl). Cooldown #5: 587s
 2026-08-05 10:37:43,902 | [b6c07267] | INFO | URL re-enfileirada apos timeout (tentativa 1/2): https://tdn.totvs.com/pages/viewpage.action?pageId=942068847
 2026-08-05 10:37:43,905 | [b6c07267] | INFO | Mapeando (20/infinito, fila=27): https://tdn.totvs.com/pages/viewpage.action?pageId=1018572961
+2026-08-05 11:32:00,209 | [51ff3663] | INFO | Run iniciado: correlation_id=51ff3663
+2026-08-05 11:32:00,460 | [51ff3663] | INFO | URL inicial: https://tdn.totvs.com/display/public/PROT/CFGTRIB+-+Configurador+de+Tributos+-+P12
+2026-08-05 11:32:00,463 | [51ff3663] | INFO | Diretorio de saida: C:\Users\andre.francisco\Desktop\GitHub\Extrator_TDN_Totvs\output\CFGTRIB
+2026-08-05 11:32:00,465 | [51ff3663] | INFO | Re-crawl forcado: ignorando 10 URLs cacheadas do run anterior.
+2026-08-05 11:32:00,472 | [51ff3663] | INFO | Iniciando crawl em https://tdn.totvs.com/display/public/PROT/CFGTRIB+-+Configurador+de+Tributos+-+P12
+2026-08-05 11:32:00,474 | [51ff3663] | INFO | Escopo: dominio=tdn.totvs.com | path_prefix=/display/public/PROT/ | space=PROT
+2026-08-05 11:32:00,475 | [51ff3663] | INFO | Orcamento por pagina: 180s total | 90s DOM | slow >= 60s
+2026-08-05 11:32:00,476 | [51ff3663] | INFO | Rate limit: 2.0s entre requests | cooldown inicial 30s | workers=1
+2026-08-05 11:32:01,433 | [51ff3663] | INFO | Mapeando (1/infinito, fila=0): https://tdn.totvs.com/display/public/PROT/CFGTRIB+-+Configurador+de+Tributos+-+P12
+2026-08-05 11:32:04,730 | [51ff3663] | INFO | Mapeando (2/infinito, fila=24): https://tdn.totvs.com/pages/viewpage.action?pageId=1027814147
+2026-08-05 11:32:07,026 | [51ff3663] | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/pages/viewpage.action?pageId=1027814147
+2026-08-05 11:32:07,027 | [51ff3663] | INFO | Mapeando (3/infinito, fila=23): https://tdn.totvs.com/pages/viewpage.action?pageId=962623217
+2026-08-05 11:32:09,505 | [51ff3663] | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/pages/viewpage.action?pageId=962623217
+2026-08-05 11:32:09,506 | [51ff3663] | INFO | Mapeando (4/infinito, fila=22): https://tdn.totvs.com/pages/viewpage.action?pageId=822223872
+2026-08-05 11:32:11,654 | [51ff3663] | INFO | Mapeando (5/infinito, fila=25): https://tdn.totvs.com/pages/viewpage.action?pageId=825324804
+2026-08-05 11:32:13,857 | [51ff3663] | INFO | Mapeando (6/infinito, fila=26): https://tdn.totvs.com/display/PROT/CFGTRIB+-+Cadastro+de+Mensagens+no+Documento+Fiscal
+2026-08-05 11:32:16,431 | [51ff3663] | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/display/PROT/CFGTRIB+-+Cadastro+de+Mensagens+no+Documento+Fiscal
+2026-08-05 11:32:16,433 | [51ff3663] | INFO | Mapeando (7/infinito, fila=25): https://tdn.totvs.com/pages/viewpage.action?pageId=979039175
+2026-08-05 11:32:18,971 | [51ff3663] | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/pages/viewpage.action?pageId=979039175
+2026-08-05 11:32:18,973 | [51ff3663] | INFO | Mapeando (8/infinito, fila=24): https://tdn.totvs.com/pages/viewpage.action?pageId=676039354
+2026-08-05 11:32:21,754 | [51ff3663] | INFO | Mapeando (9/infinito, fila=33): https://tdn.totvs.com/pages/viewpage.action?pageId=906853167
+2026-08-05 11:32:23,767 | [51ff3663] | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/pages/viewpage.action?pageId=906853167
+2026-08-05 11:32:23,770 | [51ff3663] | INFO | Mapeando (10/infinito, fila=32): https://tdn.totvs.com/pages/viewpage.action?pageId=928965724
+2026-08-05 11:32:25,917 | [51ff3663] | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/pages/viewpage.action?pageId=928965724
+2026-08-05 11:32:25,923 | [51ff3663] | INFO | Mapeando (11/infinito, fila=31): https://tdn.totvs.com/display/PROT/CFGTRIB+-+Compartilhamento+de+Tabelas
+2026-08-05 11:32:28,192 | [51ff3663] | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/display/PROT/CFGTRIB+-+Compartilhamento+de+Tabelas
+2026-08-05 11:32:28,194 | [51ff3663] | INFO | Mapeando (12/infinito, fila=30): https://tdn.totvs.com/display/PROT/CFGTRIB+-+Compra+Governamental
+2026-08-05 11:32:30,272 | [51ff3663] | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/display/PROT/CFGTRIB+-+Compra+Governamental
+2026-08-05 11:32:30,275 | [51ff3663] | INFO | Mapeando (13/infinito, fila=29): https://tdn.totvs.com/display/PROT/CFGTRIB+-+Configurador+de+Tributos
+2026-08-05 11:32:34,354 | [51ff3663] | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/display/PROT/CFGTRIB+-+Configurador+de+Tributos
+2026-08-05 11:32:34,356 | [51ff3663] | INFO | Mapeando (14/infinito, fila=28): https://tdn.totvs.com/pages/viewpage.action?pageId=1016682375
+2026-08-05 11:32:34,593 | [51ff3663] | WARNING | Cloudflare challenge detectado em https://tdn.totvs.com/pages/viewpage.action?pageId=1016682375
+2026-08-05 11:32:34,596 | [51ff3663] | WARNING | Bloqueio detectado (Cloudflare challenge no crawl). Cooldown #1: 34s
+2026-08-05 11:32:34,700 | [51ff3663] | INFO | URL re-enfileirada apos timeout (tentativa 1/2): https://tdn.totvs.com/pages/viewpage.action?pageId=1016682375
+2026-08-05 11:32:34,704 | [51ff3663] | INFO | Mapeando (15/infinito, fila=28): https://tdn.totvs.com/display/PROT/CFGTRIB+-+Dados+Adicionais
+2026-08-05 11:33:10,506 | [51ff3663] | WARNING | Cloudflare challenge detectado em https://tdn.totvs.com/display/PROT/CFGTRIB+-+Dados+Adicionais
+2026-08-05 11:33:10,509 | [51ff3663] | WARNING | Bloqueio detectado (Cloudflare challenge no crawl). Cooldown #2: 70s
+2026-08-05 11:33:10,597 | [51ff3663] | INFO | URL re-enfileirada apos timeout (tentativa 1/2): https://tdn.totvs.com/display/PROT/CFGTRIB+-+Dados+Adicionais
+2026-08-05 11:33:10,602 | [51ff3663] | INFO | Mapeando (16/infinito, fila=28): https://tdn.totvs.com/pages/viewpage.action?pageId=966220651
+2026-08-05 11:34:22,284 | [51ff3663] | WARNING | Cloudflare challenge detectado em https://tdn.totvs.com/pages/viewpage.action?pageId=966220651
+2026-08-05 11:34:22,286 | [51ff3663] | WARNING | Bloqueio detectado (Cloudflare challenge no crawl). Cooldown #3: 129s
+2026-08-05 11:34:22,367 | [51ff3663] | INFO | URL re-enfileirada apos timeout (tentativa 1/2): https://tdn.totvs.com/pages/viewpage.action?pageId=966220651
+2026-08-05 11:34:22,370 | [51ff3663] | INFO | Mapeando (17/infinito, fila=28): https://tdn.totvs.com/pages/viewpage.action?pageId=1016684365
+2026-08-05 11:36:33,807 | [51ff3663] | WARNING | Cloudflare challenge detectado em https://tdn.totvs.com/pages/viewpage.action?pageId=1016684365
+2026-08-05 11:36:33,810 | [51ff3663] | WARNING | Bloqueio detectado (Cloudflare challenge no crawl). Cooldown #4: 259s
+2026-08-05 11:36:33,898 | [51ff3663] | INFO | URL re-enfileirada apos timeout (tentativa 1/2): https://tdn.totvs.com/pages/viewpage.action?pageId=1016684365
+2026-08-05 11:36:33,901 | [51ff3663] | INFO | Mapeando (18/infinito, fila=28): https://tdn.totvs.com/pages/viewpage.action?pageId=960010301
+2026-08-05 11:40:55,206 | [51ff3663] | WARNING | Cloudflare challenge detectado em https://tdn.totvs.com/pages/viewpage.action?pageId=960010301
+2026-08-05 11:40:55,208 | [51ff3663] | WARNING | Bloqueio detectado (Cloudflare challenge no crawl). Cooldown #5: 520s
+2026-08-05 11:40:55,295 | [51ff3663] | INFO | URL re-enfileirada apos timeout (tentativa 1/2): https://tdn.totvs.com/pages/viewpage.action?pageId=960010301
+2026-08-05 11:40:55,299 | [51ff3663] | INFO | Mapeando (19/infinito, fila=28): https://tdn.totvs.com/pages/viewpage.action?pageId=942068847
+2026-08-05 11:49:41,233 | [51ff3663] | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/pages/viewpage.action?pageId=942068847
+2026-08-05 11:49:41,238 | [51ff3663] | INFO | Mapeando (20/infinito, fila=27): https://tdn.totvs.com/pages/viewpage.action?pageId=1018572961
+2026-08-05 11:49:43,624 | [51ff3663] | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/pages/viewpage.action?pageId=1018572961
+2026-08-05 11:49:43,632 | [51ff3663] | INFO | Mapeando (21/infinito, fila=26): https://tdn.totvs.com/pages/viewpage.action?pageId=1027813812
+2026-08-05 11:49:46,091 | [51ff3663] | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/pages/viewpage.action?pageId=1027813812
+2026-08-05 11:49:46,094 | [51ff3663] | INFO | Mapeando (22/infinito, fila=25): https://tdn.totvs.com/pages/viewpage.action?pageId=1070065237
+2026-08-05 11:49:48,662 | [51ff3663] | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/pages/viewpage.action?pageId=1070065237
+2026-08-05 11:49:48,664 | [51ff3663] | INFO | Mapeando (23/infinito, fila=24): https://tdn.totvs.com/display/PROT/CFGTRIB+-+Perguntas+e+Respostas+-+Configurador+de+Tributos
+2026-08-05 11:49:50,878 | [51ff3663] | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/display/PROT/CFGTRIB+-+Perguntas+e+Respostas+-+Configurador+de+Tributos
+2026-08-05 11:49:50,880 | [51ff3663] | INFO | Mapeando (24/infinito, fila=23): https://tdn.totvs.com/display/PROT/CFGTRIB+-+Simulador+Comparativo
+2026-08-05 11:49:53,162 | [51ff3663] | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/display/PROT/CFGTRIB+-+Simulador+Comparativo
+2026-08-05 11:49:53,164 | [51ff3663] | INFO | Mapeando (25/infinito, fila=22): https://tdn.totvs.com/pages/viewpage.action?pageId=877863294
+2026-08-05 11:49:55,474 | [51ff3663] | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/pages/viewpage.action?pageId=877863294
+2026-08-05 11:49:55,477 | [51ff3663] | INFO | Mapeando (26/infinito, fila=21): https://tdn.totvs.com/pages/viewpage.action?pageId=1103673321
+2026-08-05 11:49:57,895 | [51ff3663] | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/pages/viewpage.action?pageId=1103673321
+2026-08-05 11:49:57,899 | [51ff3663] | INFO | Mapeando (27/infinito, fila=20): https://tdn.totvs.com/display/PROT/CFGTRIB+-+Frete+Pauta+considerado+nos+registros+C195+e+C197
+2026-08-05 11:50:00,291 | [51ff3663] | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/display/PROT/CFGTRIB+-+Frete+Pauta+considerado+nos+registros+C195+e+C197
+2026-08-05 11:50:00,293 | [51ff3663] | INFO | Mapeando (28/infinito, fila=19): https://tdn.totvs.com/pages/viewpage.action?pageId=889126322
+2026-08-05 11:50:02,529 | [51ff3663] | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/pages/viewpage.action?pageId=889126322
+2026-08-05 11:50:02,532 | [51ff3663] | INFO | Mapeando (29/infinito, fila=18): https://tdn.totvs.com/pages/viewpage.action?pageId=847892777
+2026-08-05 11:50:05,051 | [51ff3663] | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/pages/viewpage.action?pageId=847892777
+2026-08-05 11:50:05,054 | [51ff3663] | INFO | Mapeando (30/infinito, fila=17): https://tdn.totvs.com/pages/viewpage.action?pageId=822223908
+2026-08-05 11:50:08,095 | [51ff3663] | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/pages/viewpage.action?pageId=822223908
+2026-08-05 11:50:08,106 | [51ff3663] | INFO | Mapeando (31/infinito, fila=16): https://tdn.totvs.com/pages/viewpage.action?pageId=825324831
+2026-08-05 11:50:10,365 | [51ff3663] | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/pages/viewpage.action?pageId=825324831
+2026-08-05 11:50:10,369 | [51ff3663] | INFO | Mapeando (32/infinito, fila=15): https://tdn.totvs.com/pages/viewpage.action?pageId=887731155
+2026-08-05 11:50:12,808 | [51ff3663] | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/pages/viewpage.action?pageId=887731155
+2026-08-05 11:50:12,810 | [51ff3663] | INFO | Mapeando (33/infinito, fila=14): https://tdn.totvs.com/display/PROT/CFGTRIB+-+Campos+da+TES
+2026-08-05 11:50:14,854 | [51ff3663] | INFO | Mapeando (34/infinito, fila=14): https://tdn.totvs.com/pages/viewpage.action?pageId=899211861
+2026-08-05 11:50:17,338 | [51ff3663] | INFO | Mapeando (35/infinito, fila=18): https://tdn.totvs.com/pages/viewpage.action?pageId=899211548
+2026-08-05 11:50:19,490 | [51ff3663] | INFO | Mapeando (36/infinito, fila=23): https://tdn.totvs.com/pages/viewpage.action?pageId=899211922
+2026-08-05 11:50:19,696 | [51ff3663] | WARNING | Cloudflare challenge detectado em https://tdn.totvs.com/pages/viewpage.action?pageId=899211922
+2026-08-05 11:50:19,699 | [51ff3663] | WARNING | Bloqueio detectado (Cloudflare challenge no crawl). Cooldown #1: 35s
+2026-08-05 11:50:19,793 | [51ff3663] | INFO | URL re-enfileirada apos timeout (tentativa 1/2): https://tdn.totvs.com/pages/viewpage.action?pageId=899211922
+2026-08-05 11:50:19,797 | [51ff3663] | INFO | Mapeando (37/infinito, fila=23): https://tdn.totvs.com/pages/viewpage.action?pageId=899211646
+2026-08-05 11:50:55,818 | [51ff3663] | WARNING | Cloudflare challenge detectado em https://tdn.totvs.com/pages/viewpage.action?pageId=899211646
+2026-08-05 11:50:55,821 | [51ff3663] | WARNING | Bloqueio detectado (Cloudflare challenge no crawl). Cooldown #2: 64s
+2026-08-05 11:50:55,898 | [51ff3663] | INFO | URL re-enfileirada apos timeout (tentativa 1/2): https://tdn.totvs.com/pages/viewpage.action?pageId=899211646
+2026-08-05 11:50:55,902 | [51ff3663] | INFO | Mapeando (38/infinito, fila=23): https://tdn.totvs.com/pages/viewpage.action?pageId=899211761
+2026-08-05 11:52:01,271 | [51ff3663] | WARNING | Cloudflare challenge detectado em https://tdn.totvs.com/pages/viewpage.action?pageId=899211761
+2026-08-05 11:52:01,274 | [51ff3663] | WARNING | Bloqueio detectado (Cloudflare challenge no crawl). Cooldown #3: 124s
+2026-08-05 11:52:01,384 | [51ff3663] | INFO | URL re-enfileirada apos timeout (tentativa 1/2): https://tdn.totvs.com/pages/viewpage.action?pageId=899211761
+2026-08-05 11:52:01,388 | [51ff3663] | INFO | Mapeando (39/infinito, fila=23): https://tdn.totvs.com/pages/viewpage.action?pageId=899211533
