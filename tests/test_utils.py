@@ -125,6 +125,35 @@ def test_is_blocking_error_detecta_codes():
     assert not is_blocking_error(Exception("File not found"))
 
 
+def test_is_blocking_error_ignora_digitos_embutidos_em_ids():
+    """Regressao: um ID/timestamp maior que contem '503' como substring
+    nao deve disparar falso positivo (ex: pageId ou cookie do GA)."""
+    assert not is_blocking_error(Exception("pageId=1785936503 nao encontrado"))
+    assert not is_blocking_error(Exception("timeout apos 5039 tentativas"))
+
+
+def test_is_blocking_error_ignora_call_log_echoado_pelo_playwright():
+    """Regressao real: erro local (cert TLS) tinha '503' embutido no cookie
+    ecoado pelo 'Call log' do Playwright, e era classificado como bloqueio."""
+    msg = (
+        "APIRequestContext.get: self-signed certificate in certificate chain\n"
+        "Call log:\n"
+        "  - -> GET https://tdn.totvs.com/rest/api/content/1/child/page\n"
+        "    - cookie: _ga_8RWQ11H2P1=GS2.1.s1785936468$o1$g1$t1785936503$j25$l0$h0"
+    )
+    assert not is_blocking_error(Exception(msg))
+
+
+def test_is_blocking_error_detecta_codigo_real_mesmo_com_call_log():
+    """Se o codigo de bloqueio estiver na headline (antes do Call log), ainda detecta."""
+    msg = (
+        "Request failed with status 503\n"
+        "Call log:\n"
+        "  - -> GET https://tdn.totvs.com/rest/api/content/1/child/page"
+    )
+    assert is_blocking_error(Exception(msg))
+
+
 def test_is_cloudflare_challenge_detecta():
     assert is_cloudflare_challenge("checking your browser before access")
     assert is_cloudflare_challenge("page contains ray id: abc123 marker")

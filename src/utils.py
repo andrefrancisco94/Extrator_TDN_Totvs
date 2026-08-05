@@ -273,23 +273,34 @@ def is_cloudflare_challenge(content_lower: str) -> bool:
     return any(k in content_lower for k in _CF_CHALLENGE_INDICATORS)
 
 
+_BLOCKING_HTTP_CODES = ("522", "523", "524", "525", "502", "503", "504", "429")
+_BLOCKING_TEXT_MARKERS = (
+    "net::err_aborted",
+    "net::err_connection_reset",
+    "net::err_connection_closed",
+    "net::err_timed_out",
+    "err_http_response_code_failure",
+)
+
+
 def is_blocking_error(exc: BaseException) -> bool:
     """Detecta excecoes que sugerem bloqueio do servidor (Cloudflare 5xx, 429).
 
     Heuristica conservadora: tem que ter palavras-chave especificas na mensagem.
+
+    So inspeciona a "headline" da excecao (antes de "\\nCall log:") — o
+    Playwright anexa ali um eco dos headers do request original (inclusive
+    Cookie), e numeros de sessao/timestamp (ex: cookies _ga_*) podem
+    coincidentemente conter "503" etc, causando falso positivo. Codigos
+    HTTP numericos usam lookaround pra nao casar digitos embutidos em IDs
+    maiores (ex: "503" dentro de "1785936503").
     """
-    msg = str(exc).lower()
-    keywords = (
-        "522", "523", "524", "525",  # Cloudflare origin errors
-        "502", "503", "504",  # Bad gateway / unavailable / timeout
-        "429",  # Too many requests
-        "net::err_aborted",
-        "net::err_connection_reset",
-        "net::err_connection_closed",
-        "net::err_timed_out",
-        "err_http_response_code_failure",
+    headline = str(exc).split("\nCall log:", 1)[0].lower()
+    if any(marker in headline for marker in _BLOCKING_TEXT_MARKERS):
+        return True
+    return any(
+        re.search(rf"(?<!\d){code}(?!\d)", headline) for code in _BLOCKING_HTTP_CODES
     )
-    return any(k in msg for k in keywords)
 
 
 @dataclass(frozen=True)
