@@ -1186,9 +1186,10 @@ def _is_pid_alive(pid: int) -> bool:
             import subprocess
             result = subprocess.run(
                 ["tasklist", "/FI", f"PID eq {pid}"],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, timeout=5,
             )
-            return str(pid) in result.stdout
+            output = result.stdout.decode("latin-1", errors="replace") if result.stdout else ""
+            return str(pid) in output
         except (OSError, subprocess.TimeoutExpired, ImportError):
             return False
     try:
