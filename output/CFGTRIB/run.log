@@ -361,3 +361,65 @@
 2026-05-25 17:10:21,480 | INFO | PDF gerado (122/122) em 2.4s (226.1 KB): 0122-cfgtrib-regras-de-ncm-linha-microsiga-protheus-tdn.pdf
 2026-05-25 17:10:27,773 | INFO | PDF consolidado gerado: C:\Users\andre.francisco\Desktop\GitHub (Repositorios)\Extrator_TDN_Totvs\output\CFGTRIB\TDN_TOTVS_consolidado.pdf (122 entradas, 0 ignoradas)
 2026-05-25 17:10:27,775 | INFO | Resumo: 122 URL(s), 122 PDF(s), 0 falha(s), 0 lenta(s), tempo total 8min 20s
+2026-08-05 10:27:42,801 | [b6c07267] | INFO | Run iniciado: correlation_id=b6c07267
+2026-08-05 10:27:44,562 | [b6c07267] | INFO | URL inicial: https://tdn.totvs.com/display/public/PROT/CFGTRIB+-+Configurador+de+Tributos+-+P12
+2026-08-05 10:27:44,564 | [b6c07267] | INFO | Diretorio de saida: C:\Users\andre.francisco\Desktop\GitHub\Extrator_TDN_Totvs\output\CFGTRIB
+2026-08-05 10:27:44,565 | [b6c07267] | INFO | Resume detectado: 122 URLs mapeadas, 122 PDFs ja exportados
+2026-08-05 10:27:44,566 | [b6c07267] | INFO | Re-crawl forcado: ignorando 122 URLs cacheadas do run anterior.
+2026-08-05 10:27:44,572 | [b6c07267] | INFO | Iniciando crawl em https://tdn.totvs.com/display/public/PROT/CFGTRIB+-+Configurador+de+Tributos+-+P12
+2026-08-05 10:27:44,573 | [b6c07267] | INFO | Escopo: dominio=tdn.totvs.com | path_prefix=/display/public/PROT/ | space=PROT
+2026-08-05 10:27:44,574 | [b6c07267] | INFO | Orcamento por pagina: 180s total | 90s DOM | slow >= 60s
+2026-08-05 10:27:44,575 | [b6c07267] | INFO | Rate limit: 2.0s entre requests | cooldown inicial 30s | workers=1
+2026-08-05 10:27:47,815 | [b6c07267] | INFO | Mapeando (1/infinito, fila=0): https://tdn.totvs.com/display/public/PROT/CFGTRIB+-+Configurador+de+Tributos+-+P12
+2026-08-05 10:27:50,451 | [b6c07267] | INFO | Mapeando (2/infinito, fila=24): https://tdn.totvs.com/pages/viewpage.action?pageId=1027814147
+2026-08-05 10:27:52,644 | [b6c07267] | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/pages/viewpage.action?pageId=1027814147
+2026-08-05 10:27:52,646 | [b6c07267] | INFO | Mapeando (3/infinito, fila=23): https://tdn.totvs.com/pages/viewpage.action?pageId=962623217
+2026-08-05 10:27:54,925 | [b6c07267] | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/pages/viewpage.action?pageId=962623217
+2026-08-05 10:27:54,927 | [b6c07267] | INFO | Mapeando (4/infinito, fila=22): https://tdn.totvs.com/pages/viewpage.action?pageId=822223872
+2026-08-05 10:27:57,373 | [b6c07267] | INFO | Mapeando (5/infinito, fila=25): https://tdn.totvs.com/pages/viewpage.action?pageId=825324804
+2026-08-05 10:27:59,393 | [b6c07267] | INFO | Mapeando (6/infinito, fila=26): https://tdn.totvs.com/display/PROT/CFGTRIB+-+Cadastro+de+Mensagens+no+Documento+Fiscal
+2026-08-05 10:28:02,196 | [b6c07267] | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/display/PROT/CFGTRIB+-+Cadastro+de+Mensagens+no+Documento+Fiscal
+2026-08-05 10:28:02,197 | [b6c07267] | INFO | Mapeando (7/infinito, fila=25): https://tdn.totvs.com/pages/viewpage.action?pageId=979039175
+2026-08-05 10:28:05,070 | [b6c07267] | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/pages/viewpage.action?pageId=979039175
+2026-08-05 10:28:05,072 | [b6c07267] | INFO | Mapeando (8/infinito, fila=24): https://tdn.totvs.com/pages/viewpage.action?pageId=676039354
+2026-08-05 10:28:07,796 | [b6c07267] | INFO | Mapeando (9/infinito, fila=33): https://tdn.totvs.com/pages/viewpage.action?pageId=906853167
+2026-08-05 10:28:09,816 | [b6c07267] | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/pages/viewpage.action?pageId=906853167
+2026-08-05 10:28:09,820 | [b6c07267] | INFO | Mapeando (10/infinito, fila=32): https://tdn.totvs.com/pages/viewpage.action?pageId=928965724
+2026-08-05 10:28:12,034 | [b6c07267] | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/pages/viewpage.action?pageId=928965724
+2026-08-05 10:28:12,045 | [b6c07267] | INFO | Mapeando (11/infinito, fila=31): https://tdn.totvs.com/display/PROT/CFGTRIB+-+Compartilhamento+de+Tabelas
+2026-08-05 10:28:14,370 | [b6c07267] | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/display/PROT/CFGTRIB+-+Compartilhamento+de+Tabelas
+2026-08-05 10:28:14,372 | [b6c07267] | INFO | Mapeando (12/infinito, fila=30): https://tdn.totvs.com/display/PROT/CFGTRIB+-+Compra+Governamental
+2026-08-05 10:28:16,502 | [b6c07267] | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/display/PROT/CFGTRIB+-+Compra+Governamental
+2026-08-05 10:28:16,504 | [b6c07267] | INFO | Mapeando (13/infinito, fila=29): https://tdn.totvs.com/display/PROT/CFGTRIB+-+Configurador+de+Tributos
+2026-08-05 10:28:20,753 | [b6c07267] | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/display/PROT/CFGTRIB+-+Configurador+de+Tributos
+2026-08-05 10:28:20,756 | [b6c07267] | INFO | Mapeando (14/infinito, fila=28): https://tdn.totvs.com/pages/viewpage.action?pageId=1016682375
+2026-08-05 10:28:23,143 | [b6c07267] | INFO | Nenhum link filho encontrado em https://tdn.totvs.com/pages/viewpage.action?pageId=1016682375
+2026-08-05 10:28:23,146 | [b6c07267] | INFO | Mapeando (15/infinito, fila=27): https://tdn.totvs.com/display/PROT/CFGTRIB+-+Dados+Adicionais
+2026-08-05 10:28:23,997 | [b6c07267] | WARNING | Bloqueio detectado (REST API: APIRequestContext.get: self-signed certificate in certificate chain
+Call log:
+  - → GET https://tdn.totvs.com/rest/api/content/945397604/child/page?limit=200&start=0
+    - user-agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0
+    - accept: */*
+    - accept-encoding: gzip,deflate,br
+    - Accept-Language: pt-BR,pt;q=0.9,en;q=0.8
+    - cookie: JSESSIONID=809454D3E08925491F46E15DD53D0DE0; CF_AppSession=bd5829fd65feb739; _gid=GA1.2.1485283202.1785936469; _gat=1; _ga_8RWQ11H2P1=GS2.1.s1785936468$o1$g1$t1785936503$j25$l0$h0; _ga=GA1.2.1203848821.1785936469
+). Cooldown #1: 35s
+2026-08-05 10:28:24,011 | [b6c07267] | WARNING | Bloqueio detectado em https://tdn.totvs.com/display/PROT/CFGTRIB+-+Dados+Adicionais (REST API)
+2026-08-05 10:28:24,097 | [b6c07267] | INFO | URL re-enfileirada apos timeout (tentativa 1/2): https://tdn.totvs.com/display/PROT/CFGTRIB+-+Dados+Adicionais
+2026-08-05 10:28:24,100 | [b6c07267] | INFO | Mapeando (16/infinito, fila=27): https://tdn.totvs.com/pages/viewpage.action?pageId=966220651
+2026-08-05 10:29:00,447 | [b6c07267] | WARNING | Cloudflare challenge detectado em https://tdn.totvs.com/pages/viewpage.action?pageId=966220651
+2026-08-05 10:29:00,449 | [b6c07267] | WARNING | Bloqueio detectado (Cloudflare challenge no crawl). Cooldown #2: 73s
+2026-08-05 10:29:00,531 | [b6c07267] | INFO | URL re-enfileirada apos timeout (tentativa 1/2): https://tdn.totvs.com/pages/viewpage.action?pageId=966220651
+2026-08-05 10:29:00,534 | [b6c07267] | INFO | Mapeando (17/infinito, fila=27): https://tdn.totvs.com/pages/viewpage.action?pageId=1016684365
+2026-08-05 10:30:15,777 | [b6c07267] | WARNING | Cloudflare challenge detectado em https://tdn.totvs.com/pages/viewpage.action?pageId=1016684365
+2026-08-05 10:30:15,780 | [b6c07267] | WARNING | Bloqueio detectado (Cloudflare challenge no crawl). Cooldown #3: 146s
+2026-08-05 10:30:15,858 | [b6c07267] | INFO | URL re-enfileirada apos timeout (tentativa 1/2): https://tdn.totvs.com/pages/viewpage.action?pageId=1016684365
+2026-08-05 10:30:15,861 | [b6c07267] | INFO | Mapeando (18/infinito, fila=27): https://tdn.totvs.com/pages/viewpage.action?pageId=960010301
+2026-08-05 10:32:43,422 | [b6c07267] | WARNING | Cloudflare challenge detectado em https://tdn.totvs.com/pages/viewpage.action?pageId=960010301
+2026-08-05 10:32:43,424 | [b6c07267] | WARNING | Bloqueio detectado (Cloudflare challenge no crawl). Cooldown #4: 299s
+2026-08-05 10:32:43,494 | [b6c07267] | INFO | URL re-enfileirada apos timeout (tentativa 1/2): https://tdn.totvs.com/pages/viewpage.action?pageId=960010301
+2026-08-05 10:32:43,497 | [b6c07267] | INFO | Mapeando (19/infinito, fila=27): https://tdn.totvs.com/pages/viewpage.action?pageId=942068847
+2026-08-05 10:37:43,814 | [b6c07267] | WARNING | Cloudflare challenge detectado em https://tdn.totvs.com/pages/viewpage.action?pageId=942068847
+2026-08-05 10:37:43,817 | [b6c07267] | WARNING | Bloqueio detectado (Cloudflare challenge no crawl). Cooldown #5: 587s
+2026-08-05 10:37:43,902 | [b6c07267] | INFO | URL re-enfileirada apos timeout (tentativa 1/2): https://tdn.totvs.com/pages/viewpage.action?pageId=942068847
+2026-08-05 10:37:43,905 | [b6c07267] | INFO | Mapeando (20/infinito, fila=27): https://tdn.totvs.com/pages/viewpage.action?pageId=1018572961

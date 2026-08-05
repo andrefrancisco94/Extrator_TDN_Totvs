@@ -11,6 +11,8 @@ from rich.panel import Panel
 from rich.table import Table
 
 from .crawler import crawl_confluence_tree
+from .markdown_exporter import export_pages_to_markdown
+from .markdown_merge import merge_markdown
 from .pdf_exporter import export_pages_to_pdf
 from .pdf_merge import merge_pdfs
 from .utils import (
@@ -739,6 +741,333 @@ def run(
     except KeyboardInterrupt:
         console.print("\n[bold yellow]Interrompido pelo usuario (Ctrl+C).[/bold yellow]")
         console.print("PDFs ja gerados foram preservados em pages/")
+        console.print("Rode novamente para continuar de onde parou (resume automatico).")
+        exit_code = 130
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"\n[bold red]Erro fatal:[/bold red] {exc}")
+        _suggest_action_for_error(console, exc)
+        console.print_exception(show_locals=False)
+        exit_code = 1
+
+    raise typer.Exit(exit_code)
+
+
+async def markdown_pipeline(
+    start_url: str,
+    output_dir: Path,
+    consolidated_name: str,
+    headless: bool,
+    timeout_seconds: int,
+    max_pages: int | None,
+    slow_threshold_seconds: float,
+    auto_confirm: bool,
+    force_recrawl: bool,
+    force_reexport: bool,
+    rate_limit: RateLimitConfig,
+    proxy: str | None = None,
+    dry_run: bool = False,
+    debug: bool = False,
+    quiet: bool = False,
+) -> int:
+    pages_dir, log_file = ensure_output_dirs(output_dir)
+    correlation_id = generate_correlation_id()
+    logger = setup_logger(log_file, debug=debug, correlation_id=correlation_id)
+    console = get_console()
+    if quiet:
+        console.quiet = True
+        import logging as _lg
+        for handler in list(logger.handlers):
+            if "Rich" in type(handler).__name__:
+                logger.removeHandler(handler)
+        logger.setLevel(_lg.WARNING)
+    logger.info("Run Markdown iniciado: correlation_id=%s", correlation_id)
+
+    job_lock = JobLock(output_dir)
+    try:
+        job_lock.acquire()
+    except JobLockError as exc:
+        console.print(f"[bold red]Lock conflict:[/bold red] {exc}")
+        return 2
+    try:
+        return await _markdown_pipeline_inner(
+            start_url, output_dir, consolidated_name, headless, timeout_seconds,
+            max_pages, slow_threshold_seconds, auto_confirm, force_recrawl,
+            force_reexport, rate_limit, proxy, dry_run,
+            pages_dir, log_file, logger, console,
+        )
+    finally:
+        job_lock.release()
+
+
+async def _markdown_pipeline_inner(
+    start_url, output_dir, consolidated_name, headless, timeout_seconds,
+    max_pages, slow_threshold_seconds, auto_confirm, force_recrawl,
+    force_reexport, rate_limit, proxy, dry_run,
+    pages_dir, log_file, logger, console,
+) -> int:
+    """Pipeline interno (encapsulado no lock): crawl (reusado) + export Markdown + merge."""
+    timeout_ms = timeout_seconds * 1000
+    pipeline_start = time.monotonic()
+
+    checkpoint = _setup_checkpoint(output_dir, start_url, pages_dir, logger)
+    resume_active = bool(
+        checkpoint.manifest.crawl_complete and checkpoint.manifest.mapped_urls
+    )
+    resume_md = len(checkpoint.manifest.exported_md)
+
+    force_recrawl = _maybe_force_recrawl_for_max_pages(
+        force_recrawl, checkpoint, max_pages, logger,
+    )
+
+    resume_line = (
+        f"\n[bold yellow]Resume:[/bold yellow] {resume_md} paginas Markdown ja existem"
+        if resume_active else ""
+    )
+    console.print(
+        Panel.fit(
+            f"[bold]URL inicial:[/bold] {start_url}\n"
+            f"[bold]Saida:[/bold] {output_dir / 'markdown'}\n"
+            f"[bold]Timeout:[/bold] {timeout_seconds}s | "
+            f"[bold]Slow:[/bold] >={slow_threshold_seconds:.0f}s | "
+            f"[bold]Headless:[/bold] {headless} | "
+            f"[bold]Max:[/bold] {max_pages or 'sem limite'}"
+            f"{resume_line}",
+            title="Extrator TDN TOTVS - Markdown",
+            border_style="green",
+        )
+    )
+
+    logger.info("URL inicial: %s", start_url)
+    logger.info("Diretorio de saida: %s", output_dir)
+    if resume_active:
+        logger.info(
+            "Resume detectado: %d URLs mapeadas, %d paginas Markdown ja exportadas",
+            len(checkpoint.manifest.mapped_urls), resume_md,
+        )
+
+    # Compartilha RateLimiter entre crawl e export (cooldown propaga entre fases).
+    shared_limiter = RateLimiter(rate_limit)
+    state_path = storage_state_path(output_dir)
+    if proxy:
+        logger.info("Proxy configurado: %s", sanitize_proxy_for_log(proxy))
+
+    try:
+        urls, slow_crawl = await crawl_confluence_tree(
+            start_url=start_url,
+            checkpoint=checkpoint,
+            logger=logger,
+            headless=headless,
+            timeout_ms=timeout_ms,
+            max_pages=max_pages,
+            slow_threshold_seconds=slow_threshold_seconds,
+            force_recrawl=force_recrawl,
+            rate_limit=rate_limit,
+            max_workers=1,
+            limiter=shared_limiter,
+            state_path=state_path,
+            proxy=proxy,
+        )
+    except KeyboardInterrupt:
+        logger.warning("Crawl interrompido pelo usuario (Ctrl+C).")
+        raise
+
+    if not urls:
+        logger.error("Nenhuma pagina foi encontrada a partir da URL inicial.")
+        return 1
+
+    if dry_run:
+        _print_dry_run_summary(console, logger, urls, output_dir)
+        return 0
+
+    if not _confirm_large_batch(urls, auto_confirm, logger, console):
+        logger.info("Usuario cancelou antes da exportacao.")
+        return 0
+
+    try:
+        md_entries, failures, slow_md = await export_pages_to_markdown(
+            urls=urls,
+            output_dir=output_dir,
+            checkpoint=checkpoint,
+            logger=logger,
+            headless=headless,
+            timeout_ms=timeout_ms,
+            slow_threshold_seconds=slow_threshold_seconds,
+            force_reexport=force_reexport,
+            rate_limit=rate_limit,
+            limiter=shared_limiter,
+            state_path=state_path,
+            proxy=proxy,
+        )
+    except KeyboardInterrupt:
+        logger.warning("Exportacao Markdown interrompida pelo usuario (Ctrl+C).")
+        raise
+
+    try:
+        checkpoint.flush()
+    except OSError as exc:
+        logger.warning("Falha ao flush manifest: %s", exc)
+
+    if not md_entries:
+        logger.error("Nenhuma pagina Markdown foi gerada.")
+        return 1
+
+    consolidated_path: Path | None = output_dir / "markdown" / consolidated_name
+    try:
+        merge_markdown(md_entries, consolidated_path, logger)
+    except Exception:  # noqa: BLE001
+        logger.exception("Falha ao consolidar Markdown")
+        consolidated_path = None
+
+    all_slow = slow_crawl + slow_md
+    slow_log_path = _maybe_write_slow_log(all_slow, output_dir, logger)
+
+    total_elapsed = time.monotonic() - pipeline_start
+    logger.info(
+        "Resumo Markdown: %s URL(s), %s pagina(s) MD, %s falha(s), %s lenta(s), tempo total %s",
+        len(urls), len(md_entries), len(failures), len(all_slow),
+        format_duration(total_elapsed),
+    )
+
+    failures_line = (
+        f"\n[bold red]Falhas:[/bold red] {len(failures)} (veja run.log)" if failures else ""
+    )
+    slow_line = f"\n[bold]Slow log:[/bold] {slow_log_path}" if slow_log_path else ""
+    console.print(
+        f"\n[bold green]Concluido:[/bold green] {len(md_entries)}/{len(urls)} paginas "
+        f"Markdown em {format_duration(total_elapsed)}.\n"
+        f"[bold]Consolidado:[/bold] {consolidated_path if consolidated_path else '[red]falhou[/red]'}\n"
+        f"[bold]Log:[/bold] {log_file}"
+        f"{slow_line}{failures_line}"
+    )
+
+    return 0 if consolidated_path else 2
+
+
+@app.command(name="markdown")
+def markdown_cmd(
+    start_url: str = typer.Argument(..., help="URL inicial da documentacao Confluence/TDN."),
+    output_dir: Path = typer.Option(
+        Path("output"), help="Pasta de saida (compartilha manifest.json com `run`).",
+    ),
+    consolidated_name: str = typer.Option(
+        "TDN_TOTVS_consolidado.md",
+        help="Nome do Markdown final consolidado (salvo em <output_dir>/markdown/).",
+    ),
+    headless: bool = typer.Option(True, "--headless/--headed", help="Executa navegador sem interface."),
+    timeout_seconds: int = typer.Option(
+        180, min=10, max=1800, help="Limite total por pagina (segundos).",
+    ),
+    slow_threshold_seconds: float = typer.Option(
+        60.0, min=5.0,
+        help="Paginas que demorarem >= este valor sao registradas em slow_pages.log.",
+    ),
+    max_pages: int | None = typer.Option(None, min=1, max=100_000, help="Limite de paginas."),
+    yes: bool = typer.Option(False, "--yes/--no-yes", "-y", help="Pula confirmacoes interativas."),
+    fresh: bool = typer.Option(False, "--fresh", help="Ignora manifest.json e comeca do zero."),
+    update: bool = typer.Option(
+        False, "--update", help="Re-mapeia a arvore para detectar paginas novas.",
+    ),
+    regenerate: bool = typer.Option(
+        False, "--regenerate", help="Re-mapeia + regenera todos os arquivos Markdown.",
+    ),
+    request_delay: float = typer.Option(
+        2.0, min=0.0, max=60.0, help="Pausa em segundos entre requests (anti-rate-limit).",
+    ),
+    backoff_initial: float = typer.Option(
+        30.0, min=5.0, max=600.0,
+        help="Cooldown inicial em segundos apos detectar bloqueio (5xx/429/timeout).",
+    ),
+    backoff_max: float = typer.Option(
+        900.0, min=60.0, max=7200.0, help="Teto do cooldown apos bloqueios sucessivos.",
+    ),
+    proxy: str | None = typer.Option(
+        None, help="HTTP/SOCKS proxy. Ex: http://host:8080. Fallback: env HTTP_PROXY/HTTPS_PROXY.",
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Mapeia a arvore mas nao exporta Markdown.",
+    ),
+    debug: bool = typer.Option(False, "--debug", help="Verbose: ativa DEBUG logging."),
+    quiet: bool = typer.Option(
+        False, "--quiet", "-q", help="Silencia output (so erros + summary final).",
+    ),
+) -> None:
+    """Mapeia a arvore do Confluence e exporta para Markdown consolidado com indice.
+
+    Baixa imagens/anexos referenciados em <output_dir>/markdown/attachments/ e
+    reescreve os links para caminhos locais relativos. Compartilha o crawl e o
+    manifest.json com o comando `run` (PDF); o resume do Markdown e independente
+    (namespace `exported_md`), entao rodar os dois formatos no mesmo output_dir
+    e seguro — nenhum interfere no checkpoint do outro.
+    """
+    console = get_console()
+
+    try:
+        validated_url = validate_start_url(start_url)
+    except InvalidStartUrlError as exc:
+        console.print(f"[bold red]URL invalida:[/bold red] {exc}")
+        raise typer.Exit(2)
+
+    try:
+        validate_safe_path(output_dir)
+    except ValueError as exc:
+        console.print(f"[bold red]Path invalido:[/bold red] {exc}")
+        raise typer.Exit(2)
+
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        console.print(f"[bold red]Falha ao criar pasta de saida {output_dir}:[/bold red] {exc}")
+        raise typer.Exit(2)
+
+    invalid_chars = set('<>:"/\\|?*')
+    if any(c in consolidated_name for c in invalid_chars):
+        console.print(
+            f"[bold red]Nome do consolidado contem caracteres invalidos[/bold red] "
+            f"(<>:\"/\\|?*): {consolidated_name!r}"
+        )
+        raise typer.Exit(2)
+    if not consolidated_name.lower().endswith(".md"):
+        consolidated_name = consolidated_name + ".md"
+
+    if fresh:
+        _handle_fresh_flag(output_dir, validated_url, console)
+
+    if not _check_disk_space(output_dir, console):
+        console.print("[red]Cancelado por falta de espaco.[/red]")
+        raise typer.Exit(2)
+
+    force_recrawl = update or regenerate
+    force_reexport = regenerate
+
+    rate_limit = RateLimitConfig(
+        base_delay_seconds=request_delay,
+        backoff_initial_seconds=backoff_initial,
+        backoff_max_seconds=backoff_max,
+    )
+
+    try:
+        exit_code = asyncio.run(
+            markdown_pipeline(
+                start_url=validated_url,
+                output_dir=output_dir,
+                consolidated_name=consolidated_name,
+                headless=headless,
+                timeout_seconds=timeout_seconds,
+                max_pages=max_pages,
+                slow_threshold_seconds=slow_threshold_seconds,
+                auto_confirm=yes,
+                force_recrawl=force_recrawl,
+                force_reexport=force_reexport,
+                rate_limit=rate_limit,
+                proxy=proxy,
+                dry_run=dry_run,
+                debug=debug,
+                quiet=quiet,
+            )
+        )
+    except KeyboardInterrupt:
+        console.print("\n[bold yellow]Interrompido pelo usuario (Ctrl+C).[/bold yellow]")
+        console.print("Paginas Markdown ja geradas foram preservadas em markdown/pages/")
         console.print("Rode novamente para continuar de onde parou (resume automatico).")
         exit_code = 130
     except Exception as exc:  # noqa: BLE001

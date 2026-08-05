@@ -329,6 +329,9 @@ class Manifest:
     # url -> {error, attempts, last_attempt}. URLs com failures voltam pra fila
     # no resume para nova tentativa (ate _MAX_RETRY_ATTEMPTS).
     failures: dict[str, dict] = field(default_factory=dict)
+    # url -> {filename, title, size_bytes, elapsed_seconds}. Espelha `exported`
+    # mas para a exportacao em Markdown (pipeline independente do PDF).
+    exported_md: dict[str, dict] = field(default_factory=dict)
 
 
 class Checkpoint:
@@ -445,6 +448,7 @@ class Checkpoint:
             crawl_seen=list(data.get("crawl_seen", [])),
             exported=dict(data.get("exported", {})),
             failures=failures,
+            exported_md=dict(data.get("exported_md", {})),
         )
 
     @staticmethod
@@ -556,6 +560,54 @@ class Checkpoint:
             return False
         path = pages_dir / filename
         return is_valid_pdf(path)
+
+    def is_exported_md(self, url: str, md_dir: Path) -> bool:
+        """True se URL ja tem arquivo Markdown no disco (checkpoint da pipeline MD)."""
+        entry = self.manifest.exported_md.get(url)
+        if not entry:
+            return False
+        filename = entry.get("filename", "")
+        if not filename:
+            return False
+        path = md_dir / filename
+        try:
+            return path.is_file() and path.stat().st_size > 0
+        except OSError:
+            return False
+
+    def record_export_md(
+        self, url: str, filename: str, title: str,
+        size_bytes: int, elapsed_seconds: float,
+    ) -> None:
+        """Registra export Markdown bem-sucedido (namespace separado de `exported`)."""
+        self.manifest.exported_md[url] = {
+            "filename": filename,
+            "title": title,
+            "size_bytes": size_bytes,
+            "elapsed_seconds": elapsed_seconds,
+        }
+        self._maybe_batched_save()
+
+    def reconcile_md_with_disk(self, md_dir: Path, logger=None) -> int:
+        """Remove do manifest entradas MD cujo arquivo nao existe mais. Retorna removidos."""
+        if not md_dir.exists() or not md_dir.is_dir():
+            return 0
+        removed = 0
+        for url in list(self.manifest.exported_md.keys()):
+            entry = self.manifest.exported_md[url]
+            filename = entry.get("filename", "")
+            path = md_dir / filename if filename else None
+            if not filename or not path.is_file() or path.stat().st_size == 0:
+                del self.manifest.exported_md[url]
+                removed += 1
+                if logger is not None:
+                    logger.warning(
+                        "Manifest MD dessincronizado: %s sem arquivo valido. "
+                        "Sera regenerado.", filename or url,
+                    )
+        if removed > 0:
+            self.save()
+        return removed
 
     def check_invariants(self, logger=None) -> list[str]:
         """Verifica invariantes do manifest e retorna lista de inconsistencias.
@@ -1435,18 +1487,25 @@ def _is_valid_page_action(path: str, query: dict) -> bool:
     return "pageId" in query
 
 
-def build_pdf_file_name(index: int, title: str, existing_names: Iterable[str]) -> str:
+def build_file_name(
+    index: int, title: str, existing_names: Iterable[str], ext: str = ".pdf",
+) -> str:
+    """Gera nome de arquivo unico `NNNN-slug.ext`, com fallback por hash em colisao."""
     base = f"{index:04d}-{slugify(title)}"
-    candidate = f"{base}.pdf"
+    candidate = f"{base}{ext}"
     used = set(existing_names)
     suffix = 2
 
     while candidate in used:
-        candidate = f"{base}-{suffix}.pdf"
+        candidate = f"{base}-{suffix}{ext}"
         suffix += 1
         if suffix > 99:
             digest = hashlib.md5(f"{index}-{title}".encode("utf-8")).hexdigest()[:8]
-            candidate = f"{base}-{digest}.pdf"
+            candidate = f"{base}-{digest}{ext}"
             break
 
     return candidate
+
+
+def build_pdf_file_name(index: int, title: str, existing_names: Iterable[str]) -> str:
+    return build_file_name(index, title, existing_names, ext=".pdf")
