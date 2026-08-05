@@ -2,7 +2,7 @@
   "version": 2,
   "start_url": "https://tdn.totvs.com/display/public/PROT/CFGTRIB+-+Configurador+de+Tributos+-+P12",
   "started_at": "2026-05-25T20:02:06+00:00",
-  "last_updated": "2026-08-05T13:28:12+00:00",
+  "last_updated": "2026-08-05T14:50:08+00:00",
   "crawl_complete": false,
   "crawl_max_pages": null,
   "mapped_urls": [
@@ -15,9 +15,7 @@
     "https://tdn.totvs.com/pages/viewpage.action?pageId=979039175",
     "https://tdn.totvs.com/pages/viewpage.action?pageId=676039354",
     "https://tdn.totvs.com/pages/viewpage.action?pageId=906853167",
-    "https://tdn.totvs.com/pages/viewpage.action?pageId=928965724"
-  ],
-  "crawl_queue": [
+    "https://tdn.totvs.com/pages/viewpage.action?pageId=928965724",
     "https://tdn.totvs.com/display/PROT/CFGTRIB+-+Compartilhamento+de+Tabelas",
     "https://tdn.totvs.com/display/PROT/CFGTRIB+-+Compra+Governamental",
     "https://tdn.totvs.com/display/PROT/CFGTRIB+-+Configurador+de+Tributos",
@@ -37,7 +35,9 @@
     "https://tdn.totvs.com/display/PROT/CFGTRIB+-+Frete+Pauta+considerado+nos+registros+C195+e+C197",
     "https://tdn.totvs.com/pages/viewpage.action?pageId=889126322",
     "https://tdn.totvs.com/pages/viewpage.action?pageId=847892777",
-    "https://tdn.totvs.com/pages/viewpage.action?pageId=822223908",
+    "https://tdn.totvs.com/pages/viewpage.action?pageId=822223908"
+  ],
+  "crawl_queue": [
     "https://tdn.totvs.com/pages/viewpage.action?pageId=825324831",
     "https://tdn.totvs.com/pages/viewpage.action?pageId=887731155",
     "https://tdn.totvs.com/display/PROT/CFGTRIB+-+Campos+da+TES",
@@ -49,19 +49,39 @@
     "https://tdn.totvs.com/pages/viewpage.action?pageId=899211533",
     "https://tdn.totvs.com/pages/viewpage.action?pageId=899211948",
     "https://tdn.totvs.com/display/PROT/CFGTRIB+-+Regras+por+NCM",
-    "https://tdn.totvs.com/display/PROT/CFGTRIB+-+Zona+Franca+de+Manaus"
+    "https://tdn.totvs.com/display/PROT/CFGTRIB+-+Zona+Franca+de+Manaus",
+    "https://tdn.totvs.com/pages/viewpage.action?pageId=1016682375",
+    "https://tdn.totvs.com/display/PROT/CFGTRIB+-+Dados+Adicionais",
+    "https://tdn.totvs.com/pages/viewpage.action?pageId=966220651",
+    "https://tdn.totvs.com/pages/viewpage.action?pageId=1016684365",
+    "https://tdn.totvs.com/pages/viewpage.action?pageId=960010301"
   ],
   "crawl_seen": [
-    "https://tdn.totvs.com/pages/viewpage.action?pageId=979039175",
-    "https://tdn.totvs.com/pages/viewpage.action?pageId=825324804",
-    "https://tdn.totvs.com/pages/viewpage.action?pageId=1027814147",
-    "https://tdn.totvs.com/display/public/PROT/CFGTRIB+-+Configurador+de+Tributos+-+P12",
-    "https://tdn.totvs.com/pages/viewpage.action?pageId=928965724",
-    "https://tdn.totvs.com/display/PROT/CFGTRIB+-+Cadastro+de+Mensagens+no+Documento+Fiscal",
     "https://tdn.totvs.com/pages/viewpage.action?pageId=906853167",
+    "https://tdn.totvs.com/pages/viewpage.action?pageId=825324804",
+    "https://tdn.totvs.com/pages/viewpage.action?pageId=877863294",
+    "https://tdn.totvs.com/pages/viewpage.action?pageId=822223908",
+    "https://tdn.totvs.com/display/PROT/CFGTRIB+-+Perguntas+e+Respostas+-+Configurador+de+Tributos",
+    "https://tdn.totvs.com/display/PROT/CFGTRIB+-+Compartilhamento+de+Tabelas",
+    "https://tdn.totvs.com/pages/viewpage.action?pageId=1027814147",
+    "https://tdn.totvs.com/pages/viewpage.action?pageId=979039175",
+    "https://tdn.totvs.com/display/PROT/CFGTRIB+-+Cadastro+de+Mensagens+no+Documento+Fiscal",
+    "https://tdn.totvs.com/pages/viewpage.action?pageId=1070065237",
+    "https://tdn.totvs.com/display/PROT/CFGTRIB+-+Configurador+de+Tributos",
+    "https://tdn.totvs.com/display/PROT/CFGTRIB+-+Frete+Pauta+considerado+nos+registros+C195+e+C197",
+    "https://tdn.totvs.com/pages/viewpage.action?pageId=847892777",
+    "https://tdn.totvs.com/display/PROT/CFGTRIB+-+Simulador+Comparativo",
+    "https://tdn.totvs.com/pages/viewpage.action?pageId=942068847",
     "https://tdn.totvs.com/pages/viewpage.action?pageId=822223872",
+    "https://tdn.totvs.com/display/PROT/CFGTRIB+-+Compra+Governamental",
+    "https://tdn.totvs.com/pages/viewpage.action?pageId=928965724",
     "https://tdn.totvs.com/pages/viewpage.action?pageId=676039354",
-    "https://tdn.totvs.com/pages/viewpage.action?pageId=962623217"
+    "https://tdn.totvs.com/display/public/PROT/CFGTRIB+-+Configurador+de+Tributos+-+P12",
+    "https://tdn.totvs.com/pages/viewpage.action?pageId=889126322",
+    "https://tdn.totvs.com/pages/viewpage.action?pageId=962623217",
+    "https://tdn.totvs.com/pages/viewpage.action?pageId=1018572961",
+    "https://tdn.totvs.com/pages/viewpage.action?pageId=1103673321",
+    "https://tdn.totvs.com/pages/viewpage.action?pageId=1027813812"
   ],
   "exported": {
     "https://tdn.totvs.com/display/public/PROT/CFGTRIB+-+Configurador+de+Tributos+-+P12": {
@@ -797,5 +817,6 @@
       "elapsed_seconds": 2.3677907999990566
     }
   },
-  "failures": {}
+  "failures": {},
+  "exported_md": {}
 }
