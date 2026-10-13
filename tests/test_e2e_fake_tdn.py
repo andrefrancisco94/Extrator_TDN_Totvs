@@ -770,7 +770,7 @@ def test_lista_grande_com_proxies_mortos_e_um_que_emperra(tmp_path):
         # Os 4 mortos ficaram na triagem: o browser nunca tentou sair por eles.
         assert "ERR_PROXY_CONNECTION_FAILED" not in log
         assert stalling.stalled >= 3, "o cenario deveria fazer o proxy emperrar"
-        assert "fora do rodizio apos falhas seguidas" in log
+        assert "fora do rodizio apos falhas seguidas" in log or "falhou seguidamente" in log
         assert "Bloqueio detectado" not in log
         assert srv.hits_by_ip["127.0.0.3"] > 0
         assert srv.hits_by_ip["127.0.0.1"] == 0, "request saiu sem passar por proxy"

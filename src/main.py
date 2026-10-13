@@ -333,12 +333,12 @@ async def _run_pipeline_inner(
     # Registra por onde os requests saem (credenciais sempre mascaradas).
     if len(pool) > 1:
         logger.info(
-            "Saidas de rede (%d, com rodizio em bloqueio): %s",
+            "Saidas de rede (%d, exportacao em paralelo e rodizio em bloqueio): %s",
             len(pool), pool.summary(),
         )
         console.print(
-            f"[bold]Saidas de rede:[/bold] {len(pool)} (rodizio automatico quando "
-            "um IP for bloqueado)"
+            f"[bold]Saidas de rede:[/bold] {len(pool)} (ate {min(max_workers, len(pool))} "
+            "simultaneas na exportacao; rodizio em bloqueios)"
         )
     elif pool.current:
         logger.info("Proxy configurado: %s", pool.current_label)

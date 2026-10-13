@@ -859,6 +859,22 @@ async def _slot_page(
 _MAX_RELAUNCH_REPLAYS = 6
 
 
+def _defer_to_free_worker(
+    url: str, index: int, total: int, acc: ExportAccumulators,
+    session: BrowserSession, limiter: RateLimiter, attempt: int,
+    last_attempt: bool, logger,
+) -> None:
+    if not last_attempt and limiter.cooldown_remaining() > 0 and any(
+        other is not session and other_limiter.cooldown_remaining() == 0
+        and (other.pool is None or other.pool.has_live_exits)
+        for other, other_limiter in acc.network_workers
+    ):
+        # Ban ou quarentena de proxy lento: outra saida pode terminar a URL.
+        acc.deferred_attempts[url] = attempt
+        logger.info("Pagina %s/%s devolvida a fila para outra saida de rede.", index, total)
+        raise _DeferExport()
+
+
 async def _export_with_retries(
     slot: _PageSlot,
     session: BrowserSession,
@@ -939,16 +955,9 @@ async def _export_with_retries(
             await rotate_exit_after_block(
                 session, limiter, cooldown, logger, generation=generation,
             )
-            if not last_attempt and limiter.cooldown_remaining() > 0 and any(
-                other is not session and other_limiter.cooldown_remaining() == 0
-                and (other.pool is None or other.pool.has_live_exits)
-                for other, other_limiter in acc.network_workers
-            ):
-                # Nao prende uma pagina por uma hora em um IP bloqueado se
-                # outro worker pode termina-la. Mantem o limite de tentativas.
-                acc.deferred_attempts[url] = attempt
-                logger.info("Pagina %s/%s devolvida a fila para outra saida de rede.", index, total)
-                raise _DeferExport()
+            _defer_to_free_worker(
+                url, index, total, acc, session, limiter, attempt, last_attempt, logger,
+            )
             if not last_attempt:
                 logger.info(
                     "Pagina %s/%s sera repetida apos o bloqueio (tentativa %d/%d).",
@@ -960,6 +969,9 @@ async def _export_with_retries(
             if outcome.exit_failure:
                 await note_exit_failure(
                     session, logger, limiter=limiter, generation=generation,
+                )
+                _defer_to_free_worker(
+                    url, index, total, acc, session, limiter, attempt, last_attempt, logger,
                 )
             if last_attempt or (outcome.status == _FAILED and attempt >= 2):
                 break
@@ -980,6 +992,9 @@ async def _export_with_retries(
                 started_at=started_at, generation=generation,
             )
             if via_proxy and not last_attempt:
+                _defer_to_free_worker(
+                    url, index, total, acc, session, limiter, attempt, last_attempt, logger,
+                )
                 logger.info(
                     "Pagina %s/%s sera repetida (tentativa %d/%d).",
                     index, total, attempt + 1, max_attempts,
@@ -1081,6 +1096,7 @@ async def export_pages_to_pdf(
         cfg.max_workers,
     )
 
+    skip_count = 0
     if force_reexport:
         logger.info("Re-export forcado: PDFs existentes serao regenerados.")
     else:
@@ -1096,16 +1112,15 @@ async def export_pages_to_pdf(
 
     try:
         async with async_playwright() as playwright, AsyncExitStack() as sessions:
-            pending_count = sum(
-                1 for url in urls
-                if force_reexport or not checkpoint.is_exported(url, pages_dir)
-            )
+            pending_count = total - skip_count
             groups = (
                 pool.partition(min(cfg.max_workers, pending_count))
                 if pool is not None and len(pool) > 1 and cfg.max_workers > 1
                 and pending_count > 1 else [pool]
             )
-            for index, group in enumerate(groups):
+            async def open_worker(
+                index: int, group: ProxyPool | None,
+            ) -> tuple[BrowserSession, RateLimiter]:
                 # Cookies de um IP nao devem ser carregados/salvos por outro.
                 worker_state = None if len(groups) > 1 else state_path
                 worker_limiter = active_limiter if index == 0 else RateLimiter(cfg.rate_limit, logger)
@@ -1119,7 +1134,18 @@ async def export_pages_to_pdf(
                     state_path=worker_state, proxy=proxy, pool=group, block_extras=True,
                 )
                 sessions.push_async_callback(_teardown_session, session, logger)
-                acc.network_workers.append((session, worker_limiter))
+                return session, worker_limiter
+
+            # Lancamentos independentes em paralelo; em falha/cancelamento,
+            # aguarda as tarefas antes de fechar as sessoes ja registradas.
+            launches = [asyncio.create_task(open_worker(index, group)) for index, group in enumerate(groups)]
+            try:
+                acc.network_workers = list(await asyncio.gather(*launches))
+            except BaseException:
+                for launch in launches:
+                    launch.cancel()
+                await asyncio.gather(*launches, return_exceptions=True)
+                raise
             session = acc.network_workers[0][0]
             if len(groups) > 1:
                 logger.info(
