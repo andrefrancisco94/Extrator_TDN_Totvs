@@ -137,7 +137,10 @@ python -m src.main run URL --proxy-file proxies.txt
 - Formatos aceitos: `http://usuario:senha@host:porta`, `host:porta`, `host:porta:usuario:senha`, `socks5://host:porta` e `direct` (conexão direta, para incluí-la no rodízio).
 - **Um proxy:** todos os requests saem por ele. **Vários:** quando um IP é bloqueado o extrator troca para o próximo livre; só espera se todos estiverem bloqueados.
 - Proxy digitado errado **aborta** a execução (nunca roda "sem proxy" em silêncio). SOCKS com usuário/senha não é suportado pelo Chromium.
-- Um proxy que falha ao conectar 3 vezes seguidas é descartado do rodízio.
+- **Proxy que falha sai do rodízio.** Erro de conexão **ou timeout de página** por um proxy conta contra *o proxy* (não vira "bloqueio do servidor": o ritmo dos requests não muda). Na 3ª falha seguida ele vai para a quarentena (10 min, depois 20) e o trabalho segue pelo próximo; na 3ª quarentena sem nenhum sucesso é descartado.
+- **Lista grande (6+ proxies) passa por triagem** no início de cada run: um request leve por proxy, em paralelo e sem browser (2000 proxies levam cerca de 2 a 3 min). Só entram os que respondem, do mais rápido ao mais lento. `python -m src.main proxy test` faz o mesmo teste e oferece regravar o `proxies.txt` só com os aprovados (`--prune`; o original fica em `proxies.txt.bak`). `TDN_SKIP_PROXY_CHECK=1` desliga a triagem.
+- **Listas públicas/gratuitas de proxy rendem pouco**: a maioria dos endereços está morta, os vivos são lentos e instáveis, e muitos já estão banidos no Cloudflare. A triagem e a quarentena evitam que o run trave neles, mas poucos proxies bons (pagos ou seus) funcionam melhor que milhares de públicos.
+- **Proxy não libera o modo rápido.** O limite é por IP: com 8 workers e 0,5 s de intervalo um IP é banido por 1 h em segundos (~10 páginas). Use o ritmo seguro/normal e deixe o rodízio para quando um ban acontecer.
 - `proxies.txt` pode conter senha: está no `.gitignore`. Nos logs as credenciais aparecem mascaradas.
 - O extrator não fornece proxies; use um serviço/servidor seu.
 

@@ -58,7 +58,7 @@ from .utils import (
 
 from .utils import LARGE_BATCH_THRESHOLD  # re-export para retrocompat
 
-__version__ = "0.11.0"
+__version__ = "0.11.1"
 
 MIN_DISK_FREE_BYTES = 500 * 1024 * 1024  # 500MB minimo razoavel
 

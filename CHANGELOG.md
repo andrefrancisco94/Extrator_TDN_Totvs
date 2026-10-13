@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.11.1] - 2026-10-13
+
+### Contexto
+Run real com `proxies.txt` de 2000 proxies públicos, 8 workers e 0,5 s de intervalo: o
+primeiro proxy (bom) foi banido por 1 h em 16 s; o segundo era lento e cada timeout de
+página foi tratado como bloqueio do servidor — o intervalo subiu de 0,5 s para 20 s e o
+proxy ruim nunca foi trocado (37 PDFs em 11 min, projeção de ~18 h para 2882 páginas).
+
+### Proxies
+- **Triagem de listas grandes** (6+ proxies) no início do run: um request leve por proxy,
+  em paralelo e sem browser (HTTP CONNECT, SOCKS5 e SOCKS4, TLS validado de ponta a
+  ponta). Só entram os que respondem, do mais rápido ao mais lento
+- **`proxy test` em massa** com resumo dos motivos de falha e `--prune` para regravar o
+  arquivo só com os aprovados (backup em `.bak`); `proxy list` mostra só os 20 primeiros
+- **Timeout por proxy conta contra o proxy**, não contra o servidor: sem cooldown global
+  e sem dobrar o intervalo; a página é repetida e, na 3ª falha seguida, o proxy sai do
+  rodízio (também no mapeamento, que antes desistia da página inicial em 2 timeouts)
+- **Quarentena em vez de descarte imediato**: 10 min, 20 min e só então descarte — um
+  proxy bom com instabilidade passageira volta; proxy único falhando espera a quarentena
+  em vez de encerrar o run na 3ª falha
+- Falhas vistas por workers que ainda estavam no proxy antigo não contam contra o novo
+- **Troca de proxy acorda quem dormia o ban do IP antigo**: um worker que reservou o slot
+  entre o registro do bloqueio e a troca ficava parado pelo ban inteiro (até 1 h) e
+  arrastava os demais
+- Log lista só as 5 primeiras saídas de rede (a linha com 2000 proxies tinha 55 KB)
+
 ## [0.11.0] - 2026-10-13
 
 ### Contexto
