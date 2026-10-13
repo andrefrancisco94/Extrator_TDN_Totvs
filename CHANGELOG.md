@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.12.0] - 2026-10-13
+
+- Exportação com proxies simultâneos: grupos exclusivos, navegador e rate limiter por worker. Trocas de proxy e cooldowns deixam de fechar/travar as páginas dos outros workers
+- Página bloqueada pode voltar à fila para outra saída livre, mantendo o limite de tentativas. Ao concluir, não espera os bans dos workers ociosos
+- Proxies extras ficam como reservas; uma saída esgotada redistribui a página enquanto outros workers continuam. Erros fatais cancelam e aguardam as tarefas antes do teardown
+- Preparação do PDF aguarda imagens/fontes do conteúdo e carrega imagens lazy, sem esperar scripts e iframes secundários
+- CLI e inicializador usam 4 workers por padrão; perfil paralelo usa 8 workers e 2 s por saída
+- Preserva arquivos, checkpoint e ordem do consolidado dos jobs existentes
+- Testes de concorrência, redistribuição, tentativas, cancelamento e Chromium com proxies locais e ban simulado de 1 hora
+
 ## [0.11.1] - 2026-10-13
 
 ### Contexto

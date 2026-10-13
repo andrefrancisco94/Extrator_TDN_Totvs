@@ -10,7 +10,7 @@ qualquer lugar sem ciclo).
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Iterable
 from urllib.parse import quote, unquote, urlparse
@@ -228,8 +228,32 @@ class ProxyPool:
     def can_rotate(self) -> bool:
         return sum(1 for e in self._exits if not e.dead) > 1
 
+    @property
+    def has_live_exits(self) -> bool:
+        return any(not state.dead for state in self._exits)
+
     def labels(self) -> list[str]:
         return [mask_proxy(e.proxy) for e in self._exits]
+
+    def partition(self, max_groups: int) -> list[ProxyPool]:
+        """Divide saidas entre workers sem repetir proxy nem perder cooldown.
+
+        Cada grupo tem seu proprio indice de rotacao. A saida atual fica no
+        primeiro grupo, preservando a espera do limiter usado no crawl.
+        Proxies extras ficam como reservas, distribuidos entre os grupos.
+        """
+        ordered = self._exits[self._index:] + self._exits[:self._index]
+        states = [state for state in ordered if not state.dead]
+        if not states:
+            raise AllProxiesDeadError("Todos os proxies configurados falharam ao conectar.")
+        count = min(max(1, max_groups), len(states))
+        groups = []
+        for index in range(count):
+            subset = states[index::count]
+            group = ProxyPool([state.proxy for state in subset], clock=self._clock)
+            group._exits = [replace(state) for state in subset]
+            groups.append(group)
+        return groups
 
     def summary(self, limit: int = 5) -> str:
         """Saidas para o log: as primeiras `limit` e quantas mais existem."""

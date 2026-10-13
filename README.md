@@ -54,7 +54,7 @@ py -m venv .venv
 - `--request-delay 2.0` — intervalo **inicial** entre requests; o extrator aumenta sozinho após um bloqueio e volta a reduzir aos poucos
 - `--backoff-initial 30` / `--backoff-max 900` — cooldown usado quando o servidor bloqueia **sem** informar `Retry-After`
 - `--max-block-wait 7200` — espera máxima por um único bloqueio; acima disso o run para com o progresso salvo (código de saída 3)
-- `--max-workers 1` — workers paralelos para PDFs (não aumentam o ritmo permitido por IP)
+- `--max-workers 4` — workers paralelos para PDFs (padrão 4; máximo 8). Com vários proxies, cada worker usa um grupo exclusivo de saídas, com navegador e espera próprios; sem eles, as abas compartilham o intervalo por IP
 - `--proxy URL` — proxy de saída; repita a flag (ou separe por vírgula) para vários
 - `--proxy-file proxies.txt` — arquivo com um proxy por linha
 - `--no-proxy` — ignora arquivo de proxies e variáveis `HTTP_PROXY`/`HTTPS_PROXY`
@@ -84,6 +84,9 @@ py -m venv .venv
 ```bash
 # Termina só o que faltou num job existente (URL lida do manifest)
 python -m src.main resume --output-dir output/area --mode retry-failed
+
+# Job grande: até 8 saídas em paralelo, mantendo 2s entre páginas por saída
+python -m src.main resume --output-dir "C:\Extrator" --max-workers 8 --request-delay 2 --proxy-file proxies.txt
 
 # Modo silencioso (suprime banners/progresso, só erros)
 python -m src.main run URL --quiet --yes
@@ -135,12 +138,13 @@ python -m src.main run URL --proxy-file proxies.txt
 ```
 
 - Formatos aceitos: `http://usuario:senha@host:porta`, `host:porta`, `host:porta:usuario:senha`, `socks5://host:porta` e `direct` (conexão direta, para incluí-la no rodízio).
-- **Um proxy:** todos os requests saem por ele. **Vários:** quando um IP é bloqueado o extrator troca para o próximo livre; só espera se todos estiverem bloqueados.
+- **Um proxy:** todos os requests saem por ele. **Vários, com workers paralelos:** os proxies trabalham ao mesmo tempo, com uma sessão por grupo e saídas exclusivas. Proxies extras ficam como reservas do grupo. Uma troca fecha apenas o navegador daquele worker; os demais continuam. Com um worker, mantém o rodízio sequencial.
+- **Página bloqueada volta para a fila** quando há outra saída livre, preservando o limite de tentativas. O worker bloqueado aguarda antes de reservar outra página; quando a fila termina, o run encerra sem esperar os bans dos workers ociosos.
 - Proxy digitado errado **aborta** a execução (nunca roda "sem proxy" em silêncio). SOCKS com usuário/senha não é suportado pelo Chromium.
 - **Proxy que falha sai do rodízio.** Erro de conexão **ou timeout de página** por um proxy conta contra *o proxy* (não vira "bloqueio do servidor": o ritmo dos requests não muda). Na 3ª falha seguida ele vai para a quarentena (10 min, depois 20) e o trabalho segue pelo próximo; na 3ª quarentena sem nenhum sucesso é descartado.
 - **Lista grande (6+ proxies) passa por triagem** no início de cada run: um request leve por proxy, em paralelo e sem browser (2000 proxies levam cerca de 2 a 3 min). Só entram os que respondem, do mais rápido ao mais lento. `python -m src.main proxy test` faz o mesmo teste e oferece regravar o `proxies.txt` só com os aprovados (`--prune`; o original fica em `proxies.txt.bak`). `TDN_SKIP_PROXY_CHECK=1` desliga a triagem.
 - **Listas públicas/gratuitas de proxy rendem pouco**: a maioria dos endereços está morta, os vivos são lentos e instáveis, e muitos já estão banidos no Cloudflare. A triagem e a quarentena evitam que o run trave neles, mas poucos proxies bons (pagos ou seus) funcionam melhor que milhares de públicos.
-- **Proxy não libera o modo rápido.** O limite é por IP: com 8 workers e 0,5 s de intervalo um IP é banido por 1 h em segundos (~10 páginas). Use o ritmo seguro/normal e deixe o rodízio para quando um ban acontecer.
+- **Intervalo por saída:** use inicialmente 2 s, inclusive com 8 workers. Os workers aumentam a concorrência entre saídas sem diminuir o intervalo de cada IP. No menu, o modo "Paralelo com proxies" configura 8 workers e 2 s. Se houver menos proxies utilizáveis que workers, usa uma sessão por proxy; sem proxies múltiplos, usa abas no mesmo navegador. O limite do servidor continua valendo por IP.
 - `proxies.txt` pode conter senha: está no `.gitignore`. Nos logs as credenciais aparecem mascaradas.
 - O extrator não fornece proxies; use um serviço/servidor seu.
 
@@ -180,7 +184,7 @@ O extrator usa `wait_until="domcontentloaded"` em vez de `"load"`, então retorn
 
 - Fase 1 — `goto` aguardando DOM: até metade do total (máximo 120s)
 - Fase 2 — `wait_for_selector` por conteúdo/sidebar: o tempo restante
-- Fase 3 — best-effort para imagens completarem (não falha se não terminar)
+- Fase 3 — até 20 s para imagens e fontes do conteúdo, incluindo imagens lazy das seções expandidas. Não espera o evento `load` da página inteira, que inclui scripts e iframes secundários
 
 **Detecção de páginas lentas:**
 
@@ -211,7 +215,7 @@ Resultado: o PDF contém todo o conteúdo das abas e seções, com headings clar
 - **Manifest atômico thread-safe** (lock + write-tmp + rename + fsync) — múltiplos workers não corrompem
 - **PDFs com escrita atômica** (.tmp + rename apenas após validar) — Ctrl+C nunca deixa arquivo parcial passando
 - **Resume exato do crawl** (fila, páginas resolvidas e ids persistidos)
-- **Consolidado na ordem do mapa**, mesmo com workers paralelos e páginas geradas em repescagem
+- **Consolidado na ordem do mapa**, mesmo com workers paralelos, proxies simultâneos e páginas redistribuídas/geradas em repescagem
 - **Código de saída 3 + quadro "DOCUMENTAÇÃO INCOMPLETA"** quando falta alguma página — nunca termina como sucesso com buracos
 - **Circuit breaker**: aborta export após 5 falhas consecutivas de login/desafio anti-bot
 - **Log com rotação automática** (10MB × 5 backups) — não enche disco

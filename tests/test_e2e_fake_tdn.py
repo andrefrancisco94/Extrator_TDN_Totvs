@@ -62,6 +62,7 @@ def _run(
     proxies: list[str] | None = None, force_recrawl: bool = False,
     retry_failed_only: bool = False, max_block_wait: float = 600.0,
     start_url: str | None = None,
+    quiet: bool = True,
 ) -> int:
     from src.main import run_pipeline
     from src.utils import RateLimitConfig
@@ -82,7 +83,7 @@ def _run(
             backoff_max_seconds=30.0, max_block_wait_seconds=max_block_wait,
         ),
         max_workers=workers,
-        quiet=True,
+        quiet=quiet,
         retry_failed_only=retry_failed_only,
         proxies=proxies,
     ))
@@ -352,6 +353,115 @@ def test_rodizio_de_proxy_com_workers_paralelos(tmp_path):
         for proxy in proxies:
             proxy.stop()
         srv.stop()
+
+
+def test_proxies_trabalham_simultaneamente_e_troca_nao_fecha_outras_paginas(tmp_path, monkeypatch):
+    from src import pdf_exporter as exporter
+
+    srv = _server(leaves_per_branch=5, branches=1, deep=False)
+    proxies = [LocalProxy(f"127.0.0.{i}") for i in range(2, 6)]
+    original = exporter._export_one
+    active = set()
+    simultaneous = set()
+    contexts = {}
+
+    async def observe(page, session, *args, **kwargs):
+        active.add(session.proxy)
+        contexts[session.proxy] = session.context
+        simultaneous.update(active if len(active) > 1 else ())
+        try:
+            await asyncio.sleep(0.1)
+            return await original(page, session, *args, **kwargs)
+        finally:
+            active.discard(session.proxy)
+
+    monkeypatch.setattr(exporter, "_export_one", observe)
+    try:
+        assert _run(srv, tmp_path, workers=2, proxies=[p.url for p in proxies], quiet=False) == 0
+        assert len(simultaneous) >= 2
+        assert len({id(context) for context in contexts.values()}) >= 2
+        assert len(_manifest(tmp_path)["exported"]) == len(srv.tree)
+        log = (tmp_path / "run.log").read_text(encoding="utf-8")
+        assert "context or browser has been closed" not in log
+    finally:
+        for proxy in proxies:
+            proxy.stop()
+        srv.stop()
+
+
+def test_pagina_com_ip_bloqueado_muda_de_worker_sem_aguardar_uma_hora(tmp_path, monkeypatch):
+    import time
+    from src import pdf_exporter as exporter
+
+    srv = _server(leaves_per_branch=3, branches=1, deep=False)
+    proxies = [LocalProxy("127.0.0.2"), LocalProxy("127.0.0.3")]
+    original = exporter._export_one
+    injected = []
+
+    async def block_once(page, session, *args, **kwargs):
+        if session.proxy == proxies[0].url and not injected:
+            injected.append(True)
+            return page, exporter.ExportOutcome(exporter._BLOCKED, "ban de teste", retry_after=3600)
+        return await original(page, session, *args, **kwargs)
+
+    monkeypatch.setattr(exporter, "_export_one", block_once)
+    try:
+        started = time.monotonic()
+        assert _run(srv, tmp_path, workers=2, proxies=[p.url for p in proxies], quiet=False) == 0
+        assert time.monotonic() - started < 30
+        assert injected
+        assert len(_manifest(tmp_path)["exported"]) == len(srv.tree)
+        assert _manifest(tmp_path)["failures"] == {}
+        assert "devolvida a fila" in (tmp_path / "run.log").read_text(encoding="utf-8")
+    finally:
+        for proxy in proxies:
+            proxy.stop()
+        srv.stop()
+
+
+def test_preparacao_espera_imagem_lazy_mas_nao_script_secundario(tmp_path):
+    import logging
+    import time
+    from playwright.async_api import async_playwright
+    from src.pdf_exporter import _prepare_page_for_pdf
+    from tests.fake_tdn import PNG
+
+    async def run():
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True, channel="chromium")
+            try:
+                page = await browser.new_page()
+                image_started = asyncio.Event()
+                script_release = asyncio.Event()
+
+                async def route(request):
+                    if request.request.url.endswith("image.png"):
+                        image_started.set()
+                        await asyncio.sleep(0.2)
+                        await request.fulfill(body=PNG, content_type="image/png")
+                    elif request.request.url.endswith("slow.js"):
+                        await script_release.wait()
+                        await request.fulfill(body="window.ready = true", content_type="application/javascript")
+                    else:
+                        await request.fulfill(body='''<html><body><div id="main-content">
+                        <h1>Conteudo</h1><img loading="lazy" src="/image.png" style="margin-top:4000px">
+                        </div><script async src="/slow.js"></script></body></html>''', content_type="text/html")
+
+                await page.route("http://assets.test/**", route)
+                await page.goto("http://assets.test/", wait_until="domcontentloaded")
+                started = time.monotonic()
+                await asyncio.wait_for(_prepare_page_for_pdf(
+                    page, started, 30_000, logging.getLogger("assets"), page.url,
+                ), timeout=5)
+                assert image_started.is_set()
+                assert await page.evaluate("document.images[0].complete && document.images[0].naturalWidth > 0")
+                assert await page.evaluate("document.readyState") != "complete"
+                script_release.set()
+                await page.wait_for_load_state("load")
+            finally:
+                await browser.close()
+
+    asyncio.run(run())
 
 
 def test_ctrl_c_no_meio_do_mapeamento_retoma_do_ponto_exato(tmp_path):

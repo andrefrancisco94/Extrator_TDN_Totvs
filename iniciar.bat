@@ -157,7 +157,7 @@ set "SPEED_MODE=safe"
 set "REQUEST_DELAY=2.0"
 set "BACKOFF_INITIAL=30"
 set "BACKOFF_MAX=900"
-set "WORKERS=1"
+set "WORKERS=4"
 set "TIMEOUT=180"
 set "SLOW=60"
 
@@ -422,12 +422,12 @@ echo --- Configurar Velocidade ---
 echo Modo atual: %SPEED_MODE%  ^(delay=%REQUEST_DELAY%s ^| workers=%WORKERS% ^| timeout=%TIMEOUT%s^)
 echo.
 echo O intervalo e o PONTO DE PARTIDA: a cada bloqueio do servidor o extrator
-echo desacelera sozinho e volta a acelerar aos poucos. Mais workers nao
-echo aumentam o ritmo permitido por IP; para ir mais rapido use proxies ^([P]^).
+echo desacelera sozinho e volta a acelerar aos poucos. Os workers geram PDFs
+echo em paralelo; com varios proxies, cada saida tem navegador e espera proprios.
 echo.
-echo   [1] Seguro               ^(2s/req, 1 worker, timeout 180s^)  - RECOMENDADO
-echo   [2] Medio                ^(1s/req, 2 workers, timeout 150s^)
-echo   [3] Rapido               ^(0.5s/req, 3 workers, timeout 120s^) - so com proxies
+echo   [1] Seguro               ^(2s/saida, 4 workers, timeout 180s^) - RECOMENDADO
+echo   [2] Medio                ^(1s/saida, 4 workers, timeout 150s^)
+echo   [3] Paralelo com proxies ^(2s/saida, 8 workers, timeout 120s^)
 echo   [4] Personalizado
 echo   [0] Voltar
 echo.
@@ -438,7 +438,7 @@ if "%SP%"=="1" (
     set "REQUEST_DELAY=2.0"
     set "BACKOFF_INITIAL=30"
     set "BACKOFF_MAX=900"
-    set "WORKERS=1"
+    set "WORKERS=4"
     set "TIMEOUT=180"
     set "SLOW=60"
     echo Modo seguro ativado.
@@ -449,21 +449,21 @@ if "%SP%"=="2" (
     set "REQUEST_DELAY=1.0"
     set "BACKOFF_INITIAL=60"
     set "BACKOFF_MAX=900"
-    set "WORKERS=2"
+    set "WORKERS=4"
     set "TIMEOUT=150"
     set "SLOW=60"
     echo Modo medio ativado.
     goto MENU
 )
 if "%SP%"=="3" (
-    set "SPEED_MODE=rapido"
-    set "REQUEST_DELAY=0.5"
+    set "SPEED_MODE=paralelo"
+    set "REQUEST_DELAY=2.0"
     set "BACKOFF_INITIAL=120"
     set "BACKOFF_MAX=1800"
-    set "WORKERS=3"
+    set "WORKERS=8"
     set "TIMEOUT=120"
     set "SLOW=60"
-    echo Modo rapido ativado. ATENCAO: sem proxies, mais bloqueios ^(erro 1015^).
+    echo Modo paralelo ativado: ate 8 saidas simultaneas, preservando o intervalo por IP.
     goto MENU
 )
 if "%SP%"=="4" goto SPEED_CUSTOM
@@ -508,8 +508,8 @@ REM ============================================================
 echo.
 echo --- Configurar Proxy ---
 echo O TDN limita os acessos POR IP (Cloudflare erro 1015). Com um proxy os
-echo requests saem por outro IP; com varios, o extrator troca de proxy quando
-echo um IP e bloqueado, em vez de ficar parado esperando.
+echo requests saem por outro IP; com varios e workers paralelos, usa varias
+echo saidas ao mesmo tempo, com trocas e esperas independentes.
 echo Formatos: http://usuario:senha@host:porta  ^|  host:porta  ^|  socks5://host:porta
 echo.
 "%VENV_PY%" -m src.main proxy list

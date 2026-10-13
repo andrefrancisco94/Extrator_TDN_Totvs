@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -39,8 +40,9 @@ from .browser import (
     safe_close_page as _safe_close_page,
     teardown_session as _teardown_session,
 )
-from .proxy import ProxyPool
+from .proxy import AllProxiesDeadError, ProxyPool
 from .utils import (
+    BlockedTooLongError,
     Checkpoint,
     MAX_RETRY_ATTEMPTS,
     RateLimitConfig,
@@ -269,6 +271,10 @@ class _PageSlot:
     generation: int
 
 
+class _DeferExport(Exception):
+    """Devolve a URL para a fila quando outra saida pode processa-la agora."""
+
+
 @dataclass
 class ExportAccumulators:
     pages_dir: Path
@@ -296,6 +302,10 @@ class ExportAccumulators:
     abort_requested: bool = False
     # Requests reais ao servidor nas paginas exportadas (diagnostico de ritmo).
     requests_total: int = 0
+    # Uma sessao por grupo de proxies, cada uma com limiter independente.
+    # Sem proxies multiplos, os workers compartilham a sessao e o limiter.
+    network_workers: list[tuple[BrowserSession, RateLimiter]] = field(default_factory=list)
+    deferred_attempts: dict[str, int] = field(default_factory=dict)
 
     def ordered_exports(self) -> list[tuple[Path, str]]:
         return [self.exported[index] for index in sorted(self.exported)]
@@ -387,19 +397,42 @@ async def _prepare_page_for_pdf(
     except PlaywrightError as exc:
         logger.warning("Falha ao expandir abas/secoes em %s: %s", url, exc)
 
-    elapsed_ms = (time.monotonic() - page_start) * 1000
-    remaining_ms = int(timeout_ms - elapsed_ms)
-    if remaining_ms > 2_000:
-        image_budget = min(remaining_ms, 20_000)
-        try:
-            await page.wait_for_load_state("load", timeout=image_budget)
-        except PlaywrightError:
-            pass
-
     try:
         await page.emulate_media(media="print")
     except PlaywrightError:
         pass
+
+    elapsed_ms = (time.monotonic() - page_start) * 1000
+    remaining_ms = int(timeout_ms - elapsed_ms)
+    if remaining_ms > 2_000:
+        try:
+            await page.evaluate(
+                """async ({selector, budget}) => {
+                    const root = document.querySelector(selector) || document.body;
+                    const images = Array.from(root.querySelectorAll('img'));
+                    const ready = images.map(img => {
+                        img.loading = 'eager';
+                        if (img.complete) return Promise.resolve();
+                        return new Promise(resolve => {
+                            img.addEventListener('load', resolve, {once: true});
+                            img.addEventListener('error', resolve, {once: true});
+                        });
+                    });
+                    root.getBoundingClientRect();
+                    if (document.fonts) ready.push(...Array.from(document.fonts)
+                        .filter(font => font.status === 'loading')
+                        .map(font => font.loaded.catch(() => {})));
+                    let timer;
+                    await Promise.race([
+                        Promise.all(ready),
+                        new Promise(resolve => {timer = setTimeout(resolve, budget);})
+                    ]);
+                    clearTimeout(timer);
+                }""",
+                {"selector": content_sel, "budget": min(remaining_ms, 20_000)},
+            )
+        except PlaywrightError:
+            pass
 
 
 async def _verify_page_assets(page: Page, logger, url: str, lenient: bool = False) -> None:
@@ -847,7 +880,7 @@ async def _export_with_retries(
     repete. Login/HTTP 4xx/timeout: nao repete agora.
     """
     outcome = ExportOutcome(_FAILED, "nao processada")
-    attempt = 0
+    attempt = acc.deferred_attempts.pop(url, 0)
     replays = 0
     while attempt < max_attempts:
         if acc.abort_requested:
@@ -906,6 +939,16 @@ async def _export_with_retries(
             await rotate_exit_after_block(
                 session, limiter, cooldown, logger, generation=generation,
             )
+            if not last_attempt and limiter.cooldown_remaining() > 0 and any(
+                other is not session and other_limiter.cooldown_remaining() == 0
+                and (other.pool is None or other.pool.has_live_exits)
+                for other, other_limiter in acc.network_workers
+            ):
+                # Nao prende uma pagina por uma hora em um IP bloqueado se
+                # outro worker pode termina-la. Mantem o limite de tentativas.
+                acc.deferred_attempts[url] = attempt
+                logger.info("Pagina %s/%s devolvida a fila para outra saida de rede.", index, total)
+                raise _DeferExport()
             if not last_attempt:
                 logger.info(
                     "Pagina %s/%s sera repetida apos o bloqueio (tentativa %d/%d).",
@@ -1052,18 +1095,47 @@ async def export_pages_to_pdf(
     active_limiter = limiter if limiter is not None else RateLimiter(cfg.rate_limit, logger)
 
     try:
-        async with async_playwright() as playwright:
-            session = await _launch_browser_session(
-                playwright, headless, timeout_ms, logger,
-                state_path=state_path, proxy=proxy, pool=pool, block_extras=True,
+        async with async_playwright() as playwright, AsyncExitStack() as sessions:
+            pending_count = sum(
+                1 for url in urls
+                if force_reexport or not checkpoint.is_exported(url, pages_dir)
             )
+            groups = (
+                pool.partition(min(cfg.max_workers, pending_count))
+                if pool is not None and len(pool) > 1 and cfg.max_workers > 1
+                and pending_count > 1 else [pool]
+            )
+            for index, group in enumerate(groups):
+                # Cookies de um IP nao devem ser carregados/salvos por outro.
+                worker_state = None if len(groups) > 1 else state_path
+                worker_limiter = active_limiter if index == 0 else RateLimiter(cfg.rate_limit, logger)
+                if group is not None:
+                    await worker_limiter.set_cooldown(max(
+                        worker_limiter.cooldown_remaining() if index == 0 else 0.0,
+                        group.remaining_block(),
+                    ))
+                session = await _launch_browser_session(
+                    playwright, headless, timeout_ms, logger,
+                    state_path=worker_state, proxy=proxy, pool=group, block_extras=True,
+                )
+                sessions.push_async_callback(_teardown_session, session, logger)
+                acc.network_workers.append((session, worker_limiter))
+            session = acc.network_workers[0][0]
+            if len(groups) > 1:
+                logger.info(
+                    "Paralelismo por rede: %d workers com navegadores e esperas independentes; "
+                    "%.1fs de intervalo por saida. Proxies extras ficam de reserva.",
+                    len(groups), cfg.rate_limit.base_delay_seconds,
+                )
             try:
                 await _run_export(
                     session, urls, total, acc, cfg, logger, console, active_limiter,
                 )
                 await _safe_close_page(session.page)
             finally:
-                await _teardown_session(session, logger)
+                for _session, worker_limiter in acc.network_workers[1:]:
+                    active_limiter.total_blocks += worker_limiter.total_blocks
+                    active_limiter.total_wait_seconds += worker_limiter.total_wait_seconds
     finally:
         # Grava o que ja foi exportado mesmo em Ctrl+C/erro: sem isto ate 19
         # PDFs prontos ficavam fora do manifest e eram baixados de novo.
@@ -1147,7 +1219,7 @@ async def _run_pass(
     limiter: RateLimiter,
     max_attempts: int,
 ) -> None:
-    if cfg.max_workers > 1 and len(items) > 1:
+    if len(acc.network_workers) > 1 or (cfg.max_workers > 1 and len(items) > 1):
         await _run_parallel(
             session, items, total, acc, cfg, logger, progress, task, limiter,
             max_attempts,
@@ -1214,47 +1286,49 @@ async def _run_parallel(
     limiter: RateLimiter,
     max_attempts: int,
 ) -> None:
-    """Paralelizacao com N workers, cada um com sua propria page.
-
-    Compartilham 1 browser + 1 context para manter cookies/sessao. Cada worker
-    consome URLs de uma fila comum. O limiter serializa o intervalo entre
-    requests entre todos os workers: sob rate limit por IP, mais workers NAO
-    aumentam o ritmo permitido — so adiantam a renderizacao.
-    """
-    queue: asyncio.Queue[tuple[int, str] | None] = asyncio.Queue()
+    """Fila comum, paginas em paralelo e isolamento quando ha varios proxies."""
+    queue: asyncio.Queue[tuple[int, str]] = asyncio.Queue()
     for item in items:
         queue.put_nowait(item)
-    workers_count = min(cfg.max_workers, len(items))
-    for _ in range(workers_count):
-        queue.put_nowait(None)  # sentinela para cada worker
-
+    resources = acc.network_workers or [(session, limiter)]
+    if len(resources) > 1:
+        resources = sorted(
+            [item for item in resources if item[0].pool is None or item[0].pool.has_live_exits],
+            key=lambda item: item[1].cooldown_remaining(),
+        )
+        if not resources:
+            raise AllProxiesDeadError("Todos os workers ficaram sem proxies utilizaveis.")
+        resources = resources[:len(items)]
+        workers_count = len(resources)
+    else:
+        workers_count = min(cfg.max_workers, len(items))
+        resources = resources * workers_count
     progress.update(task, description=f"Gerando PDFs (workers={workers_count})")
     workers = [
         asyncio.create_task(
             _worker_loop(
-                wid, session, queue, total, acc, cfg, logger, limiter, progress, task,
+                wid, worker_session, queue, total, acc, cfg, logger, worker_limiter, progress, task,
                 max_attempts,
             )
         )
-        for wid in range(workers_count)
+        for wid, (worker_session, worker_limiter) in enumerate(resources)
     ]
-    # Erro fatal em um worker (ban acima do limite, proxies esgotados, Ctrl+C):
-    # para os demais em vez de deixa-los seguir ate esvaziar a fila.
+    # join inclui URLs devolvidas a fila. Ao terminar, cancela os workers
+    # ociosos ou aguardando cooldown, sem esperar o ban deles expirar.
+    joined = asyncio.create_task(queue.join())
+    waiting = set(workers) | {joined}
     try:
-        done, pending = await asyncio.wait(workers, return_when=asyncio.FIRST_EXCEPTION)
-    except BaseException:
-        # Ctrl+C/cancelamento chega aqui (na task principal): os workers nao
-        # podem continuar usando o browser enquanto ele e encerrado.
+        while joined in waiting:
+            done, waiting = await asyncio.wait(waiting, return_when=asyncio.FIRST_COMPLETED)
+            for finished in done:
+                finished.result()  # propaga erro fatal; finally encerra os demais
+            if waiting == {joined} and not joined.done():
+                raise RuntimeError("Nenhum worker disponivel para concluir a fila de PDFs.")
+    finally:
         for worker in workers:
             worker.cancel()
-        await asyncio.gather(*workers, return_exceptions=True)
-        raise
-    failed = next((t for t in done if not t.cancelled() and t.exception() is not None), None)
-    if failed is not None:
-        for worker in pending:
-            worker.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
-        raise failed.exception()
+        joined.cancel()
+        await asyncio.gather(*workers, joined, return_exceptions=True)
 
 
 async def _worker_loop(
@@ -1275,6 +1349,21 @@ async def _worker_loop(
     processed = 0
     try:
         while True:
+            if len(acc.network_workers) > 1 and limiter.cooldown_remaining() > 0:
+                # Espera antes de reservar outra URL; os workers livres
+                # continuam consumindo a fila durante o ban deste IP.
+                try:
+                    await limiter.wait()
+                except BlockedTooLongError:
+                    if not any(
+                        other is not session and other_limiter.cooldown_remaining()
+                        <= other_limiter.config.max_block_wait_seconds
+                        and (other.pool is None or other.pool.has_live_exits)
+                        for other, other_limiter in acc.network_workers
+                    ):
+                        raise
+                    logger.warning("Worker %d com ban longo; os demais continuam a fila.", worker_id)
+                    return
             item = await queue.get()  # propaga CancelledError naturalmente
             try:
                 if item is None:
@@ -1289,10 +1378,24 @@ async def _worker_loop(
                     progress.update(
                         task, description=f"W{worker_id} {index}/{total}: {short_url}",
                     )
-                    await _export_with_retries(
-                        slot, session, url, index, total, acc, cfg, logger, limiter,
-                        max_attempts=max_attempts,
-                    )
+                    try:
+                        await _export_with_retries(
+                            slot, session, url, index, total, acc, cfg, logger, limiter,
+                            max_attempts=max_attempts,
+                        )
+                    except _DeferExport:
+                        queue.put_nowait(item)
+                        continue
+                    except AllProxiesDeadError:
+                        if not any(
+                            other is not session and other.pool is not None
+                            and other.pool.has_live_exits
+                            for other, _other_limiter in acc.network_workers
+                        ):
+                            raise
+                        logger.warning("Worker %d sem proxies utilizaveis; redistribuindo a pagina.", worker_id)
+                        queue.put_nowait(item)
+                        return
                     processed += 1
                     # Rotacao periodica para liberar memoria
                     if processed % _PAGE_ROTATION_INTERVAL == 0:

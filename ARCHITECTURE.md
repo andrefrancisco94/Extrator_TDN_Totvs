@@ -49,8 +49,8 @@ src/
                              ▼ list[URL]
               ┌──────────────────────────────────┐
               │ pdf_exporter.export_pages_to_pdf │
-              │  - 1 worker (default) ou N       │
-              │  - storage_state compartilhado   │
+              │  - 4 workers (default), até 8    │
+              │  - sessões por grupo de proxies  │
               │  - HTML→PDF + SHA-256            │
               │  - circuit breaker login/CF      │
               └──────────────┬───────────────────┘
@@ -94,6 +94,14 @@ O limite do TDN é por IP e conta requests. A estratégia tem três partes:
 3. **Trocar de IP** (`proxy.py`)
    - `ProxyPool`: cooldown por saída; em bloqueio a próxima saída livre assume e o browser é relançado (`relaunch_session`, `generation` invalida pages antigas)
    - Proxy com 3 falhas de conexão seguidas é descartado; credenciais sempre mascaradas
+
+### Exportação em paralelo
+- Com múltiplos proxies e workers, `ProxyPool.partition` distribui saídas em grupos exclusivos, preservando cooldown e quarentena. Cada grupo usa um navegador e um `RateLimiter`; proxies extras ficam como reservas
+- Cada grupo tem um worker consumindo uma fila comum. Se uma saída entra em cooldown e outra está livre, a URL volta à fila sem perder a contagem de tentativas
+- `queue.join()` inclui páginas redistribuídas. Ao concluir, cancela os workers ociosos ou aguardando ban; erro fatal/cancelamento encerra e aguarda todas as tarefas antes de fechar os navegadores
+- Com uma saída, os workers compartilham contexto e limiter: sobrepõem carregamento/renderização sem multiplicar o ritmo permitido por IP
+- Os resultados continuam indexados pela posição original; conclusão fora de ordem não altera nomes nem ordem do consolidado. As métricas dos limiters são somadas no resumo
+- A preparação espera imagens e fontes do conteúdo, tornando imagens lazy eager depois de expandir seções, sem esperar scripts/iframes secundários do evento `load`
 
 Não confundir: desafio anti-bot / bloqueio de WAF (403) e tela de login contam no circuit breaker (5 seguidos abortam). Rate limit não conta — ele é esperado e tratado.
 

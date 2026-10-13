@@ -58,7 +58,7 @@ from .utils import (
 
 from .utils import LARGE_BATCH_THRESHOLD  # re-export para retrocompat
 
-__version__ = "0.11.1"
+__version__ = "0.12.0"
 
 MIN_DISK_FREE_BYTES = 500 * 1024 * 1024  # 500MB minimo razoavel
 
@@ -1044,8 +1044,8 @@ def run(
         help="Teto do cooldown (default 900s = 15min) apos bloqueios sucessivos.",
     ),
     max_workers: int = typer.Option(
-        1, min=1, max=8,
-        help="Workers paralelos para exportar PDFs (cuidado: muitos = bloqueio do servidor).",
+        4, min=1, max=8,
+        help="Workers paralelos para PDFs (default 4). Com varios proxies, usa saidas independentes.",
     ),
     proxy: list[str] | None = typer.Option(
         None, "--proxy",
@@ -1328,7 +1328,7 @@ def resume(
     backoff_max: float = typer.Option(
         900.0, min=60.0, max=7200.0, help="Teto do cooldown apos bloqueios sucessivos.",
     ),
-    max_workers: int = typer.Option(1, min=1, max=8, help="Workers paralelos para exportar PDFs."),
+    max_workers: int = typer.Option(4, min=1, max=8, help="Workers paralelos para PDFs (default 4)."),
     consolidated_name: str | None = typer.Option(
         None, "--consolidated-name",
         help="Nome do PDF consolidado. Padrao: o mesmo usado quando o job foi criado.",
