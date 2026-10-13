@@ -36,6 +36,7 @@ from .browser import (
     launch_browser_session as _launch_browser_session_helper,
     new_page as _new_page,
     note_exit_failure,
+    note_page_timeout,
     rotate_exit_after_block,
     safe_close_page as _safe_close_page,
     teardown_session as _teardown_session,
@@ -360,7 +361,9 @@ async def _process_markdown_iteration(
             continue
         if outcome.status in (_TRANSIENT, _FAILED):
             if outcome.exit_failure:
-                await note_exit_failure(session, logger)
+                await note_exit_failure(
+                    session, logger, limiter=limiter, generation=generation,
+                )
             if last_attempt or (outcome.status == _FAILED and attempt >= 2):
                 break
             await asyncio.sleep(min(20.0, 4.0 * attempt))
@@ -642,8 +645,9 @@ async def _export_one_markdown(
     except PlaywrightTimeoutError:
         msg = f"TIMEOUT apos {elapsed():.1f}s (limite {cfg.timeout_ms / 1000:.0f}s)"
         logger.error("%s: %s", msg, url)
-        # Pagina pesada ou servidor lento: desacelera e deixa para a repescagem.
-        await limiter.report_block(logger, "timeout no Markdown")
+        # Direto: pagina pesada ou servidor lento, desacelera. Por proxy: a
+        # falha conta contra a saida. Em ambos, fica para a repescagem.
+        await note_page_timeout(session, limiter, logger, "timeout no Markdown")
         outcome = _Outcome(_TIMEOUT, msg, phase="md-timeout", elapsed=elapsed())
 
     except PlaywrightError as exc:

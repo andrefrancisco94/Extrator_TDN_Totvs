@@ -180,6 +180,10 @@ class FakeTDN:
         parsed = urlparse(h.path)
         path, query = parsed.path, parse_qs(parsed.query)
         ip = h.client_address[0]
+        if path == "/cdn-cgi/trace":
+            # Served by the edge (as on Cloudflare): outside the rate limit.
+            h._send(200, f"fl=0\nh=fake\nip={ip}\nts=0\n".encode(), "text/plain")
+            return
         static = path.startswith("/s/static/") or path == "/favicon.ico"
         category = self._category(path)
         with self.lock:

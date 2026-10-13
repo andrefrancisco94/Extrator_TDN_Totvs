@@ -30,6 +30,8 @@ from .proxy import (
     save_proxy_file,
     to_playwright_proxy,
 )
+from .proxy_check import DEFAULT_TIMEOUT_SECONDS as PROBE_TIMEOUT_SECONDS
+from .proxy_check import estimate_seconds, probe_many, rank_working
 from .utils import (
     BlockedTooLongError,
     Checkpoint,
@@ -122,7 +124,7 @@ async def run_pipeline(
         # NAO chama release — lock nunca foi adquirido por este processo
         return 2
     try:
-        pool = _build_pool(proxies, proxy)
+        pool = await _build_checked_pool(proxies, proxy, start_url, logger, console)
         return await _run_pipeline_inner(
             start_url, output_dir, consolidated_name, headless, timeout_seconds,
             max_pages, slow_threshold_seconds, auto_confirm, force_recrawl,
@@ -146,11 +148,85 @@ async def run_pipeline(
         job_lock.release()
 
 
+def _normalized_exits(proxies: list[str | None] | None, proxy: str | None) -> list[str | None]:
+    if proxies:
+        return [normalize_proxy_url(item) if item else None for item in proxies]
+    return [normalize_proxy_url(proxy)]
+
+
 def _build_pool(proxies: list[str | None] | None, proxy: str | None) -> ProxyPool:
     """Monta o rodizio de saidas de rede a partir da lista ou do proxy unico."""
-    if proxies:
-        return ProxyPool([normalize_proxy_url(item) if item else None for item in proxies])
-    return ProxyPool([normalize_proxy_url(proxy)])
+    return ProxyPool(_normalized_exits(proxies, proxy))
+
+
+# A partir de quantos proxies a lista passa pela triagem antes do run. Listas
+# pequenas sao proxies escolhidos a dedo; as grandes (publicas) vem cheias de
+# enderecos mortos, e descobrir isso pelo browser custa minutos por proxy.
+_TRIAGE_MIN_PROXIES = 6
+
+
+def _with_direct(working: list[str], exits: list[str | None]) -> list[str | None]:
+    """Recoloca a conexao direta ('direct' na lista) junto dos proxies aprovados,
+    como primeira ou ultima opcao, conforme estava na lista original."""
+    if None not in exits:
+        return list(working)
+    return [None, *working] if exits[0] is None else [*working, None]
+
+
+def _progress_printer(console, label: str):
+    """Callback de progresso da triagem: uma linha a cada ~10%."""
+    state = {"next": 10}
+
+    def report(done: int, total: int) -> None:
+        percent = done * 100 // max(1, total)
+        if percent >= state["next"] and done < total:
+            state["next"] = percent - percent % 10 + 10
+            console.print(f"[dim]  {label}: {done}/{total}[/dim]")
+
+    return report
+
+
+async def _build_checked_pool(
+    proxies: list[str | None] | None, proxy: str | None, start_url: str, logger, console,
+) -> ProxyPool:
+    """Monta o rodizio; lista grande passa antes pela triagem.
+
+    So entram os proxies que respondem, do mais rapido ao mais lento (1 request
+    leve por proxy, em paralelo). TDN_SKIP_PROXY_CHECK=1 desliga a triagem.
+    """
+    exits = _normalized_exits(proxies, proxy)
+    candidates = [item for item in dict.fromkeys(exits) if item is not None]
+    if len(candidates) < _TRIAGE_MIN_PROXIES or os.environ.get("TDN_SKIP_PROXY_CHECK") == "1":
+        return ProxyPool(exits)
+    from urllib.parse import urlsplit  # noqa: PLC0415
+
+    origin = urlsplit(start_url)
+    target = f"{origin.scheme}://{origin.netloc}/cdn-cgi/trace"
+    console.print(
+        f"[bold]Testando {len(candidates)} proxies[/bold] antes de comecar "
+        f"(no maximo ~{format_duration(estimate_seconds(len(candidates)))})..."
+    )
+    started = time.monotonic()
+    results = await probe_many(
+        candidates, target, on_progress=_progress_printer(console, "testados"),
+    )
+    working = rank_working(results)
+    logger.info(
+        "Triagem de proxies: %d de %d responderam em ate %.0fs (levou %s).",
+        len(working), len(candidates), PROBE_TIMEOUT_SECONDS,
+        format_duration(time.monotonic() - started),
+    )
+    if not working:
+        raise AllProxiesDeadError(
+            f"Nenhum dos {len(candidates)} proxies da lista respondeu. Troque a lista "
+            "(opcao [P] do menu) ou remova-a para usar a conexao direta."
+        )
+    console.print(
+        f"[green]{len(working)} de {len(candidates)} proxies responderam[/green]; "
+        f"o run usa so esses, do mais rapido ({working[0].seconds:.1f}s) "
+        f"ao mais lento ({working[-1].seconds:.1f}s)."
+    )
+    return ProxyPool(_with_direct([item.proxy for item in working], exits))
 
 
 def _resume_hint(force_recrawl: bool, force_reexport: bool) -> tuple[str, str]:
@@ -258,7 +334,7 @@ async def _run_pipeline_inner(
     if len(pool) > 1:
         logger.info(
             "Saidas de rede (%d, com rodizio em bloqueio): %s",
-            len(pool), ", ".join(pool.labels()),
+            len(pool), pool.summary(),
         )
         console.print(
             f"[bold]Saidas de rede:[/bold] {len(pool)} (rodizio automatico quando "
@@ -1413,7 +1489,7 @@ async def markdown_pipeline(
         console.print(f"[bold red]Lock conflict:[/bold red] {exc}")
         return 2
     try:
-        pool = _build_pool(proxies, proxy)
+        pool = await _build_checked_pool(proxies, proxy, start_url, logger, console)
         return await _markdown_pipeline_inner(
             start_url, output_dir, consolidated_name, headless, timeout_seconds,
             max_pages, slow_threshold_seconds, auto_confirm, force_recrawl,
@@ -1495,7 +1571,7 @@ async def _markdown_pipeline_inner(
     if len(pool) > 1:
         logger.info(
             "Saidas de rede (%d, com rodizio em bloqueio): %s",
-            len(pool), ", ".join(pool.labels()),
+            len(pool), pool.summary(),
         )
     elif pool.current:
         logger.info("Proxy configurado: %s", pool.current_label)
@@ -1829,8 +1905,11 @@ def proxy_list(file: Path = _PROXY_FILE_OPTION) -> None:
     table = Table(title=f"Proxies em {file}", border_style="cyan")
     table.add_column("#", justify="right", style="bold cyan")
     table.add_column("Saida de rede")
-    for i, item in enumerate(exits, start=1):
+    shown = exits[:20]
+    for i, item in enumerate(shown, start=1):
         table.add_row(str(i), mask_proxy(item))
+    if len(exits) > len(shown):
+        table.add_row("...", f"(+{len(exits) - len(shown)} proxies)")
     console.print(table)
     if len(exits) > 1:
         console.print("Com mais de uma saida, o extrator troca de IP quando uma e bloqueada.")
@@ -1943,6 +2022,63 @@ async def _probe_exits(exits: list[str | None], url: str, timeout_ms: int) -> li
     return results
 
 
+def _proxy_test_bulk(console, file: Path, exits: list[str | None], url: str,
+                     prune: bool | None) -> None:
+    """Teste em massa (lista grande): resumo, os mais rapidos e limpeza opcional."""
+    candidates = [item for item in exits if item is not None]
+    console.print(
+        f"Testando {len(candidates)} proxies em {url} "
+        f"(no maximo ~{format_duration(estimate_seconds(len(candidates)))})..."
+    )
+    results = asyncio.run(
+        probe_many(candidates, url, on_progress=_progress_printer(console, "testados"))
+    )
+    working = rank_working(results)
+    reasons: dict[str, int] = {}
+    for item in results:
+        if not item.ok:
+            reasons[item.detail] = reasons.get(item.detail, 0) + 1
+    console.print(
+        f"\n[bold]{len(working)} de {len(candidates)} proxies responderam[/bold] "
+        f"em ate {PROBE_TIMEOUT_SECONDS:.0f}s."
+    )
+    for detail, count in sorted(reasons.items(), key=lambda pair: -pair[1])[:6]:
+        console.print(f"[dim]  {count:>5} x {detail}[/dim]")
+    if not working:
+        console.print("[red]Nenhum proxy utilizavel nesta lista.[/red]")
+        raise typer.Exit(1)
+    table = Table(title="Proxies mais rapidos", border_style="cyan")
+    table.add_column("Saida")
+    table.add_column("Tempo", justify="right")
+    table.add_column("IP visto pelo servidor")
+    for item in working[:15]:
+        table.add_row(item.label, f"{item.seconds:.1f}s", item.ip or "-")
+    console.print(table)
+    console.print(
+        "[dim]Responder aqui nao garante que o IP esteja livre de bloqueio (erro 1015) "
+        "nas paginas da documentacao.[/dim]"
+    )
+    if prune is None:
+        prune = sys.stdin.isatty() and typer.confirm(
+            f"Regravar {file} so com os {len(working)} que responderam "
+            f"(original salvo em {file}.bak)?", default=True,
+        )
+    if not prune:
+        return
+    backup = file.with_name(file.name + ".bak")
+    kept = _with_direct([item.proxy for item in working], exits)
+    try:
+        shutil.copyfile(file, backup)
+        save_proxy_file(file, kept)
+    except OSError as exc:
+        console.print(f"[red]Erro ao regravar {file}: {exc}[/red]")
+        raise typer.Exit(1)
+    console.print(
+        f"[green]{file} agora tem {len(working)} proxies[/green] (do mais rapido ao "
+        f"mais lento). Lista original: {backup}"
+    )
+
+
 @proxy_app.command("test")
 def proxy_test(
     file: Path = _PROXY_FILE_OPTION,
@@ -1951,6 +2087,11 @@ def proxy_test(
         help="Endereco aberto no teste (1 request por saida de rede).",
     ),
     timeout_seconds: int = typer.Option(30, min=5, max=120, help="Timeout por saida."),
+    prune: bool | None = typer.Option(
+        None, "--prune/--no-prune",
+        help="Lista grande: regrava o arquivo so com os proxies que responderam "
+             "(original salvo em <arquivo>.bak). Sem a flag, pergunta.",
+    ),
 ) -> None:
     """Testa cada proxy da lista (e a conexao direta, se nao houver lista):
     faz UM request por saida e mostra o status e o IP visto pelo servidor.
@@ -1958,9 +2099,15 @@ def proxy_test(
     E um teste de CONECTIVIDADE: o endereco padrao e servido pela borda do
     Cloudflare e pode responder 200 mesmo para um IP que esteja banido (erro
     1015) nas paginas da documentacao.
+
+    Listas grandes sao testadas em paralelo, sem browser, e podem ser
+    reduzidas aos proxies que respondem (--prune).
     """
     console = get_console()
     exits = _load_proxy_list_or_exit(console, file) or [None]
+    if sum(1 for item in exits if item is not None) >= _TRIAGE_MIN_PROXIES:
+        _proxy_test_bulk(console, file, exits, url, prune)
+        return
     console.print(f"Testando {len(exits)} saida(s) de rede em {url} ...")
     try:
         results = asyncio.run(_probe_exits(exits, url, timeout_seconds * 1000))

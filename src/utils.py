@@ -159,6 +159,8 @@ class RateLimiter:
         self._last_block_at: float = float("-inf")
         # Quando o cooldown foi substituido de fora (troca de proxy).
         self._cooldown_overridden_at: float = float("-inf")
+        # Acorda quem esta dormindo em wait() quando o cooldown e substituido.
+        self._wake = asyncio.Event()
         self._current_delay: float = max(0.0, config.base_delay_seconds)
         self._success_streak: int = 0
         # Metricas do run (mostradas no resumo final).
@@ -198,20 +200,33 @@ class RateLimiter:
                 if cooldown_part > self.config.max_block_wait_seconds:
                     raise BlockedTooLongError(cooldown_part)
                 self._last_request_at = slot
+                wake = self._wake
 
             if total_sleep <= 0:
                 return
-            await self._sleep(total_sleep, announce=cooldown_part >= 60.0)
-            self.total_wait_seconds += total_sleep
+            slept_from = time.monotonic()
+            interrupted = await self._sleep(total_sleep, cooldown_part >= 60.0, wake)
+            self.total_wait_seconds += time.monotonic() - slept_from
+            if interrupted:
+                continue  # cooldown substituido (troca de proxy): recalcula o slot
             if time.monotonic() >= self._cooldown_until:
                 return
 
-    async def _sleep(self, seconds: float, announce: bool) -> None:
-        """Dorme `seconds`. Em esperas longas avisa o horario de retomada e da
-        sinal de vida a cada 5 min (senao parece que o programa travou)."""
+    @staticmethod
+    async def _nap(seconds: float, wake: asyncio.Event) -> bool:
+        """Dorme ate `seconds`. Retorna True se foi acordado por set_cooldown()."""
+        try:
+            await asyncio.wait_for(wake.wait(), timeout=seconds)
+        except asyncio.TimeoutError:
+            return False
+        return True
+
+    async def _sleep(self, seconds: float, announce: bool, wake: asyncio.Event) -> bool:
+        """Dorme `seconds`; True se interrompido por set_cooldown(). Em esperas
+        longas avisa o horario de retomada e da sinal de vida a cada 5 min
+        (senao parece que o programa travou)."""
         if not announce or self.logger is None:
-            await asyncio.sleep(seconds)
-            return
+            return await self._nap(seconds, wake)
         resume_at = datetime.now() + timedelta(seconds=seconds)
         self.logger.warning(
             "Aguardando %s ate o bloqueio expirar (retoma as %s). "
@@ -222,8 +237,9 @@ class RateLimiter:
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                return
-            await asyncio.sleep(min(remaining, 300.0))
+                return False
+            if await self._nap(min(remaining, 300.0), wake):
+                return True
             remaining = deadline - time.monotonic()
             if remaining > 5.0:
                 self.logger.info(
@@ -323,6 +339,12 @@ class RateLimiter:
             now = time.monotonic()
             self._cooldown_until = now + max(0.0, seconds)
             self._cooldown_overridden_at = now
+            # Quem ja estava dormindo o cooldown antigo (ou reservou um slot
+            # depois dele) acorda e recalcula: senao um worker continuaria
+            # parado pelo ban de um IP que nao esta mais em uso.
+            self._last_request_at = min(self._last_request_at, now)
+            self._wake.set()
+            self._wake = asyncio.Event()
 
     @property
     def consecutive_blocks(self) -> int:

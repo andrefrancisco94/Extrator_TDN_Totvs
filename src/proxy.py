@@ -24,7 +24,9 @@ _DEFAULT_PORTS = {"http": 80, "https": 443, "socks5": 1080, "socks4": 1080}
 _SCHEME_ALIASES = {"socks5h": "socks5", "socks": "socks5", "socks4a": "socks4"}
 
 # Erros de conexao consecutivos ate um proxy ser considerado fora do ar.
-_DEAD_AFTER_FAILURES = 3
+_DEAD_AFTER_FAILURES = 3      # falhas seguidas ate a saida ir para a quarentena
+_QUARANTINE_SECONDS = 600.0   # 1a quarentena; dobra na reincidencia
+_DEAD_AFTER_STRIKES = 3       # quarentenas sem nenhum sucesso ate o descarte
 
 _FORMATS_HINT = (
     "Formatos aceitos: http://host:porta | http://usuario:senha@host:porta | "
@@ -186,6 +188,7 @@ class ExitState:
     blocked_until: float = 0.0
     blocks: int = 0
     consecutive_failures: int = 0
+    strikes: int = 0
     dead: bool = False
 
 
@@ -228,8 +231,16 @@ class ProxyPool:
     def labels(self) -> list[str]:
         return [mask_proxy(e.proxy) for e in self._exits]
 
+    def summary(self, limit: int = 5) -> str:
+        """Saidas para o log: as primeiras `limit` e quantas mais existem."""
+        labels = self.labels()
+        extra = len(labels) - limit
+        return ", ".join(labels[:limit]) + (f" ... (+{extra})" if extra > 0 else "")
+
     def mark_ok(self) -> None:
-        self._exits[self._index].consecutive_failures = 0
+        state = self._exits[self._index]
+        state.consecutive_failures = 0
+        state.strikes = 0
 
     def mark_blocked(self, seconds: float) -> None:
         """Registra que a saida atual esta banida pelos proximos `seconds`."""
@@ -238,12 +249,26 @@ class ProxyPool:
         state.blocked_until = max(state.blocked_until, self._clock() + max(0.0, seconds))
 
     def mark_failed(self) -> bool:
-        """Erro de conexao na saida atual. Retorna True se ela foi descartada."""
+        """Erro de conexao ou timeout na saida atual. Retorna True se ela saiu
+        do rodizio.
+
+        Na 3a falha seguida o proxy vai para a quarentena (10 min, depois 20):
+        pode ser so uma instabilidade, entao ele volta a ser tentado. Na 3a
+        quarentena sem nenhum sucesso no meio, e descartado de vez. A conexao
+        direta nunca sai do rodizio (falha nela e problema de rede local).
+        """
         state = self._exits[self._index]
         state.consecutive_failures += 1
-        if state.proxy is not None and state.consecutive_failures >= _DEAD_AFTER_FAILURES:
+        if state.proxy is None or state.consecutive_failures < _DEAD_AFTER_FAILURES:
+            return False
+        state.consecutive_failures = 0
+        state.strikes += 1
+        if state.strikes >= _DEAD_AFTER_STRIKES:
             state.dead = True
-        return state.dead
+        else:
+            penalty = _QUARANTINE_SECONDS * (2 ** (state.strikes - 1))
+            state.blocked_until = max(state.blocked_until, self._clock() + penalty)
+        return True
 
     def remaining_block(self) -> float:
         """Segundos de ban restantes na saida atual (0 se livre)."""

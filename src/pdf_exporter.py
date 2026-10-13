@@ -33,6 +33,7 @@ from .browser import (
     launch_browser_session as _launch_browser_session_helper,
     new_page as _new_page,
     note_exit_failure,
+    note_page_timeout,
     relaunch_session,
     rotate_exit_after_block,
     safe_close_page as _safe_close_page,
@@ -914,7 +915,9 @@ async def _export_with_retries(
 
         if outcome.status in (_TRANSIENT, _FAILED):
             if outcome.exit_failure:
-                await note_exit_failure(session, logger)
+                await note_exit_failure(
+                    session, logger, limiter=limiter, generation=generation,
+                )
             if last_attempt or (outcome.status == _FAILED and attempt >= 2):
                 break
             pause = min(20.0, 4.0 * attempt)
@@ -926,8 +929,19 @@ async def _export_with_retries(
             continue
 
         if outcome.status == _TIMEOUT:
-            # Pagina pesada ou servidor lento: desacelera e deixa para a repescagem.
-            await limiter.report_block(logger, "timeout no PDF", started_at=started_at)
+            # Direto: pagina pesada ou servidor lento, desacelera e deixa para a
+            # repescagem. Por proxy: a falha conta contra a saida e a pagina e
+            # repetida (na 3a seguida o proxy sai do rodizio).
+            via_proxy = await note_page_timeout(
+                session, limiter, logger, "timeout no PDF",
+                started_at=started_at, generation=generation,
+            )
+            if via_proxy and not last_attempt:
+                logger.info(
+                    "Pagina %s/%s sera repetida (tentativa %d/%d).",
+                    index, total, attempt + 1, max_attempts,
+                )
+                continue
         break
 
     await _record_export_failure(

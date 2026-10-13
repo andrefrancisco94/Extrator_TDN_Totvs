@@ -29,6 +29,7 @@ from .browser import (
     launch_browser_session as _launch_browser_session_helper,
     new_page as _new_page,
     note_exit_failure,
+    note_page_timeout,
     relaunch_session,
     rotate_exit_after_block,
     safe_close_page as _safe_close_page,
@@ -1193,6 +1194,7 @@ async def _resolve_node(
 
     blocks = 0
     errors = 0
+    proxy_timeouts = 0
     force_navigation = False
     skip_api = False
 
@@ -1264,7 +1266,15 @@ async def _resolve_node(
             continue
 
         if result.status == _TIMEOUT:
-            await limiter.report_block(logger, "timeout no crawl", started_at=started_at)
+            via_proxy = await note_page_timeout(
+                session, limiter, logger, "timeout no crawl",
+                started_at=started_at, generation=generation,
+            )
+            proxy_timeouts += via_proxy
+            if via_proxy and proxy_timeouts < _NODE_BLOCK_RETRIES:
+                # O suspeito e o proxy (na 3a falha seguida ele sai do rodizio):
+                # repete o no em vez de gastar as tentativas da pagina.
+                continue
             await _maybe_requeue_timed_out(current, state, logger, checkpoint)
             if current in state.queued:
                 return _RESOLVED  # volta a ser processado mais adiante neste run
@@ -1278,7 +1288,7 @@ async def _resolve_node(
             current, errors, _NODE_ERROR_RETRIES, result.detail,
         )
         if result.transient:
-            await note_exit_failure(session, logger)
+            await note_exit_failure(session, logger, limiter=limiter, generation=generation)
         if errors >= _NODE_ERROR_RETRIES:
             logger.error(
                 "Filhos de %s nao listados apos %d tentativas; a pagina fica "

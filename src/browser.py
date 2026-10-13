@@ -338,28 +338,61 @@ async def rotate_exit_after_block(
         return True
 
 
-async def note_exit_failure(session: BrowserSession, logger) -> bool:
-    """Registra erro de conexao na saida atual; descarta proxy morto e troca.
+async def note_exit_failure(
+    session: BrowserSession, logger, limiter=None, generation: int | None = None,
+) -> bool:
+    """Registra erro de conexao (ou timeout) na saida atual; tira do rodizio o
+    proxy que falha seguidamente e troca para o proximo.
 
     Retorna True se a saida foi trocada. Pode levantar AllProxiesDeadError
     quando nao sobra nenhuma saida utilizavel.
+
+    generation: geracao da sessao vista por quem sofreu a falha. Se outro
+    worker ja trocou de saida, a falha era do proxy ANTIGO: nao conta contra o
+    novo. limiter: recebe a espera da saida escolhida (zero se estiver livre).
     """
     pool = session.pool
     if pool is None:
         return False
     async with session.rotation_lock:
+        if generation is not None and generation != session.generation:
+            return True
         failed_label = pool.current_label
         if not pool.mark_failed():
             return False
-        switched, _wait = pool.pick_best()
-        logger.error(
-            "Proxy %s descartado apos falhas de conexao consecutivas.%s",
-            failed_label,
-            f" Alternando para {pool.current_label}." if switched else "",
-        )
+        switched, wait = pool.pick_best()
+        if limiter is not None:
+            await limiter.set_cooldown(wait)
         if switched:
+            logger.warning(
+                "Proxy %s fora do rodizio apos falhas seguidas (conexao/timeout). "
+                "Alternando para %s.", failed_label, pool.current_label,
+            )
             await relaunch_session(session, logger)
+        else:
+            logger.warning(
+                "Proxy %s falhou seguidamente e nao ha outra saida livre. "
+                "Nova tentativa em %s.", failed_label, format_duration(wait),
+            )
         return switched
+
+
+async def note_page_timeout(
+    session: BrowserSession, limiter, logger, reason: str,
+    started_at: float | None = None, generation: int | None = None,
+) -> bool:
+    """Trata o timeout de uma pagina. Retorna True se ela saiu por um proxy.
+
+    Por proxy, o suspeito e a saida (lenta ou morta), nao o servidor: conta
+    como falha dela e o ritmo dos requests NAO muda. Em conexao direta, pode
+    ser o servidor segurando o IP: vale como bloqueio (cooldown + desacelera).
+    """
+    pool = session.pool
+    if pool is not None and pool.current is not None:
+        await note_exit_failure(session, logger, limiter=limiter, generation=generation)
+        return True
+    await limiter.report_block(logger, reason, started_at=started_at)
+    return False
 
 
 async def classify_page_block(page, response) -> BlockInfo | None:

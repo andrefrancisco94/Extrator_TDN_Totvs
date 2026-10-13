@@ -573,3 +573,98 @@ def test_update_com_pagina_inicial_fora_do_ar_mantem_o_mapa(tmp_path):
         assert len(_consolidated_titles(tmp_path)) == len(srv.tree)
     finally:
         srv.stop()
+
+
+# =============================================================================
+# Lista grande de proxies publicos: mortos, um que emperra e um bom
+# =============================================================================
+
+class _StallingProxy(LocalProxy):
+    """Proxy publico tipico: responde ao teste de conectividade e a pagina
+    inicial, mas emperra nas demais paginas (segura a conexao sem responder)."""
+
+    def __init__(self, source_ip: str, keep_url: str, stall: float = 15.0):
+        self.keep_url = keep_url
+        self.stall = stall
+        self.stalled = 0
+        super().__init__(source_ip)
+
+    def _serve(self, conn):
+        import socket
+        import time
+
+        try:
+            first_line = conn.recv(4096, socket.MSG_PEEK).split(b"\r\n", 1)[0].decode("latin-1")
+        except OSError:
+            first_line = ""
+        target = first_line.split(" ")[1] if first_line.count(" ") >= 2 else ""
+        is_page = "/display/" in target or "/pages/" in target
+        if is_page and target != self.keep_url:
+            self.stalled += 1
+            time.sleep(self.stall)
+            conn.close()
+            return
+        super()._serve(conn)
+
+
+class _SlowFirstProxy(LocalProxy):
+    """Proxy bom, mas mais lento no primeiro contato: fica atras na triagem."""
+
+    def __init__(self, source_ip: str):
+        self.first = True
+        super().__init__(source_ip)
+
+    def _serve(self, conn):
+        import time
+
+        if self.first:
+            self.first = False
+            time.sleep(0.6)
+        super()._serve(conn)
+
+
+def _closed_port() -> int:
+    import socket
+
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def test_lista_grande_com_proxies_mortos_e_um_que_emperra(tmp_path):
+    """Cenario do run real com 2000 proxies publicos: a triagem tira os mortos;
+    o proxy que passa no teste mas emperra nas paginas sai do rodizio depois de
+    3 timeouts, SEM virar "bloqueio do servidor" (nada de cooldown nem de
+    intervalo dobrado), e as paginas saem pelo proxy bom."""
+    from src.main import run_pipeline
+    from src.utils import RateLimitConfig
+
+    srv = _server()
+    root_url = srv.url_for(srv.root_id)
+    stalling = _StallingProxy("127.0.0.2", keep_url=root_url)
+    good = _SlowFirstProxy("127.0.0.3")
+    dead = [f"http://127.0.0.1:{_closed_port()}" for _ in range(4)]
+    try:
+        code = asyncio.run(run_pipeline(
+            start_url=root_url, output_dir=tmp_path, consolidated_name="consolidado.pdf",
+            headless=True, timeout_seconds=10, max_pages=None, slow_threshold_seconds=60.0,
+            auto_confirm=True, force_recrawl=False, force_reexport=False,
+            rate_limit=RateLimitConfig(base_delay_seconds=0.05, backoff_initial_seconds=1.0),
+            max_workers=3, quiet=True, proxies=[*dead, stalling.url, good.url],
+        ))
+        log = (tmp_path / "run.log").read_text(encoding="utf-8")
+        assert code == 0, log[-3000:]
+        manifest = _manifest(tmp_path)
+        assert len(manifest["exported"]) == len(srv.tree)
+        assert manifest["failures"] == {}
+        # Os 4 mortos ficaram na triagem: o browser nunca tentou sair por eles.
+        assert "ERR_PROXY_CONNECTION_FAILED" not in log
+        assert stalling.stalled >= 3, "o cenario deveria fazer o proxy emperrar"
+        assert "fora do rodizio apos falhas seguidas" in log
+        assert "Bloqueio detectado" not in log
+        assert srv.hits_by_ip["127.0.0.3"] > 0
+        assert srv.hits_by_ip["127.0.0.1"] == 0, "request saiu sem passar por proxy"
+    finally:
+        stalling.stop()
+        good.stop()
+        srv.stop()

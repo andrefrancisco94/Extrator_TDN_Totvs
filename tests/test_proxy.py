@@ -173,10 +173,10 @@ def test_pool_descarta_proxy_morto_e_segue_com_os_demais():
     pool, _ = _pool(["http://morto:1", "http://vivo:2"])
     assert not pool.mark_failed()
     assert not pool.mark_failed()
-    assert pool.mark_failed()  # 3a falha seguida descarta
+    assert pool.mark_failed()  # 3a falha seguida tira do rodizio (quarentena)
     switched, wait = pool.pick_best()
     assert switched and pool.current == "http://vivo:2"
-    assert not pool.can_rotate
+    assert wait == 0.0
 
 
 def test_pool_mark_ok_zera_falhas_consecutivas():
@@ -189,7 +189,7 @@ def test_pool_mark_ok_zera_falhas_consecutivas():
 
 def test_pool_todos_mortos_levanta_erro():
     pool, _ = _pool(["http://a:1"])
-    for _ in range(3):
+    for _ in range(9):  # 3 quarentenas seguidas, sem nenhum sucesso
         pool.mark_failed()
     with pytest.raises(AllProxiesDeadError):
         pool.pick_best()
