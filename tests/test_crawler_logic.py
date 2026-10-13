@@ -66,16 +66,34 @@ def test_restore_with_mapped_only(logger):
 
 
 def test_restore_re_enqueues_failures(logger):
-    """URLs em failures (com attempts < MAX) voltam pra fila."""
+    """Desistencias do CRAWL (filhos nunca listados) voltam pra fila."""
     with tempfile.TemporaryDirectory() as td:
         ck = Checkpoint(Path(td), "https://x.com/a")
         ck.manifest.mapped_urls = ["https://x.com/url1"]
         ck.manifest.failures["https://x.com/url2"] = {
-            "error": "timeout", "attempts": 1, "last_attempt": "",
+            "error": "crawl timeout apos 2 tentativas intra-run", "attempts": 1,
+            "last_attempt": "",
         }
         state = CrawlState(queue=deque(), queued=set())
         _restore_state_from_checkpoint(state, ck, "https://x.com/url1", logger)
         assert "https://x.com/url2" in state.queued
+
+
+def test_restore_nao_re_enfileira_falha_de_exportacao(logger):
+    """Pagina que so falhou no PDF ja teve os filhos listados: re-enfileira-la
+    no crawl custaria um request por pagina a toa. Quem re-tenta e o export."""
+    with tempfile.TemporaryDirectory() as td:
+        ck = Checkpoint(Path(td), "https://x.com/a")
+        ck.manifest.mapped_urls = ["https://x.com/url1", "https://x.com/url2"]
+        ck.manifest.crawl_seen = ["https://x.com/url1", "https://x.com/url2"]
+        ck.manifest.crawl_queue = ["https://x.com/url3"]
+        ck.manifest.failures["https://x.com/url2"] = {
+            "error": "HTTP 429", "attempts": 1, "last_attempt": "",
+        }
+        state = CrawlState(queue=deque(), queued=set())
+        _restore_state_from_checkpoint(state, ck, "https://x.com/url1", logger)
+        assert list(state.queue) == ["https://x.com/url3"]
+        assert "https://x.com/url2" in state.seen
 
 
 def test_restore_ignores_exhausted_failures(logger):

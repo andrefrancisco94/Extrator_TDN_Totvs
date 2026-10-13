@@ -1,8 +1,9 @@
-.PHONY: help test test-cov lint clean install install-dev
+.PHONY: help test test-e2e test-cov lint clean install install-dev
 
 help:
 	@echo "Targets disponiveis:"
 	@echo "  test         - Roda suite de testes (pytest)"
+	@echo "  test-e2e     - Testes de ponta a ponta contra um TDN falso local (precisa do Chromium)"
 	@echo "  test-cov     - Roda testes com cobertura"
 	@echo "  install      - Instala dependencias de producao"
 	@echo "  install-dev  - Instala dependencias de dev (pytest, etc)"
@@ -10,6 +11,9 @@ help:
 
 test:
 	.venv/Scripts/python.exe -m pytest tests/
+
+test-e2e:
+	.venv/Scripts/python.exe -m pytest tests/ -m e2e
 
 test-cov:
 	.venv/Scripts/python.exe -m pytest tests/ --cov=src --cov-report=term-missing --cov-report=html

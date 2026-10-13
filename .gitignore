@@ -44,6 +44,15 @@ output/
 *.tmp
 manifest.json.bak.*
 
+# Arquivos de job em QUALQUER pasta (um job pode ser criado fora de output/).
+# browser_state.json guarda cookies de sessao: nunca deve ir para o repositorio.
+browser_state.json
+manifest.json
+slow_pages.log
+
+# Lista de proxies (pode conter usuario/senha)
+proxies.txt
+
 # Logs
 *.log
 *.log.*

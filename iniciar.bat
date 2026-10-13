@@ -162,30 +162,42 @@ set "TIMEOUT=180"
 set "SLOW=60"
 
 :MENU
+REM Proxies: se existir proxies.txt (opcao [P]), todas as execucoes o utilizam.
+set "PROXY_OPT="
+set "PROXY_TXT=sem proxy"
+if exist "proxies.txt" (
+    set "PROXY_OPT=--proxy-file proxies.txt"
+    set "PROXY_TXT=com proxy"
+)
+set "RUN_FLAGS=--timeout-seconds %TIMEOUT% --slow-threshold-seconds %SLOW% --headless --request-delay %REQUEST_DELAY% --backoff-initial %BACKOFF_INITIAL% --backoff-max %BACKOFF_MAX% --max-workers %WORKERS% %PROXY_OPT%"
 echo.
 echo ============================================================
-echo   Menu Principal  ^(velocidade: %SPEED_MODE% ^| %REQUEST_DELAY%s/req ^| %WORKERS% worker^(s^)^)
+echo   Menu Principal  ^(velocidade: %SPEED_MODE% ^| %REQUEST_DELAY%s/req ^| %WORKERS% worker^(s^) ^| %PROXY_TXT%^)
 echo ============================================================
-echo   [1] Continuar trabalho anterior  ^(detecta automaticamente^)
+echo   [1] Continuar trabalho anterior  ^(retoma de onde parou^)
+echo   [F] Reprocessar paginas que faltaram  ^(so as falhas, sem re-mapear^)
 echo   [2] Iniciar novo trabalho  ^(rapido, so URL + pasta^)
 echo   [3] Execucao avancada  ^(configura tudo^)
-echo   [4] Verificar atualizacoes  ^(--update: busca paginas novas^)
-echo   [5] Regenerar todos os PDFs  ^(--regenerate: refaz tudo^)
+echo   [4] Verificar atualizacoes  ^(escolhe um job e busca paginas novas^)
+echo   [5] Regenerar todos os PDFs  ^(escolhe um job e refaz tudo^)
 echo   [6] Configurar velocidade  ^(rate limit, workers^)
-echo   [7] Listar trabalhos pendentes  ^(jobs incompletos^)
+echo   [P] Configurar proxy  ^(contorna o bloqueio 1015 por IP^)
+echo   [7] Listar trabalhos  ^(jobs encontrados^)
 echo   [8] Reinstalar dependencias Python
 echo   [9] Reinstalar Chromium  ^(use se der erro de ICU/launch^)
 echo   [0] Sair
 echo ============================================================
 set "OPC="
-set /p "OPC=Escolha uma opcao [0-9]: "
+set /p "OPC=Escolha uma opcao [0-9, F, P]: "
 
 if "%OPC%"=="1" goto RESUME
+if /i "%OPC%"=="F" goto RETRY_FAILED
 if "%OPC%"=="2" goto QUICK
 if "%OPC%"=="3" goto ADVANCED
 if "%OPC%"=="4" goto UPDATE_MODE
 if "%OPC%"=="5" goto REGENERATE_MODE
 if "%OPC%"=="6" goto SPEED_MENU
+if /i "%OPC%"=="P" goto PROXY_MENU
 if "%OPC%"=="7" goto LIST_JOBS
 if "%OPC%"=="8" goto REINSTALL
 if "%OPC%"=="9" goto REINSTALL_CHROME
@@ -195,78 +207,34 @@ echo.
 goto MENU
 
 REM ============================================================
-REM  [1] Continuar trabalho anterior - detecta jobs incompletos
+REM  [1] Continuar trabalho anterior
+REM      Lista os jobs incompletos (em output\ e na pasta atual), pergunta
+REM      qual retomar e le a URL do proprio job - nada de redigitar.
 REM ============================================================
 :RESUME
 echo.
 echo --- Continuar Trabalho Anterior ---
-echo Procurando trabalhos incompletos em output/...
 echo.
-
-REM Lista jobs pendentes em formato linha (pasta^|url)
-set "JOBS_FILE=%TEMP%\extrator_jobs.tmp"
-"%VENV_PY%" -c "from pathlib import Path; from src.utils import find_pending_jobs; jobs = find_pending_jobs(Path('output')); [print(f'{j.output_dir}|{j.start_url}|{j.mapped_count}|{j.queue_count}|{j.exported_count}|{j.failure_count}|{j.last_updated}') for j in jobs]" > "%JOBS_FILE%" 2>nul
-
-if not exist "%JOBS_FILE%" (
-    echo [INFO] Nenhum job pendente encontrado.
-    echo Use opcao [2] para iniciar um trabalho novo.
-    pause
-    goto MENU
-)
-
-REM Conta linhas (jobs)
-set "JOB_COUNT=0"
-for /f "usebackq" %%L in ("%JOBS_FILE%") do set /a JOB_COUNT+=1
-if "%JOB_COUNT%"=="0" (
-    echo [INFO] Nenhum job pendente encontrado.
-    echo Use opcao [2] para iniciar um trabalho novo.
-    del "%JOBS_FILE%" >nul 2>nul
-    pause
-    goto MENU
-)
-
-echo Jobs incompletos encontrados:
-echo.
-set "IDX=0"
-for /f "usebackq tokens=1-7 delims=|" %%A in ("%JOBS_FILE%") do (
-    set /a IDX+=1
-    set "JOB_!IDX!_DIR=%%A"
-    set "JOB_!IDX!_URL=%%B"
-    echo   [!IDX!] %%~nxA  ^(mapeadas=%%C^|fila=%%D^|PDFs=%%E^|falhas=%%F^)
-    echo        URL: %%B
-    echo        Atualizado: %%G
-    echo.
-)
-del "%JOBS_FILE%" >nul 2>nul
-
-set "JOB_PICK="
-set /p "JOB_PICK=Qual job continuar? [1-%JOB_COUNT%] (0 = cancelar): "
-if "%JOB_PICK%"=="0" goto MENU
-if "%JOB_PICK%"=="" goto MENU
-
-set "PICKED_DIR=!JOB_%JOB_PICK%_DIR!"
-set "PICKED_URL=!JOB_%JOB_PICK%_URL!"
-if "%PICKED_DIR%"=="" (
-    echo [ERRO] Selecao invalida.
-    pause
-    goto MENU
-)
-
-echo.
-echo Continuando job:
-echo   Pasta : %PICKED_DIR%
-echo   URL   : %PICKED_URL%
-echo   Rate  : %REQUEST_DELAY%s/req ^| backoff %BACKOFF_INITIAL%s -^> %BACKOFF_MAX%s ^| workers=%WORKERS%
-echo   Timeout: %TIMEOUT%s/pagina ^| slow %SLOW%s
-echo.
-
-"%VENV_PY%" -m src.main run "%PICKED_URL%" --output-dir "%PICKED_DIR%" --timeout-seconds %TIMEOUT% --slow-threshold-seconds %SLOW% --headless --request-delay %REQUEST_DELAY% --backoff-initial %BACKOFF_INITIAL% --backoff-max %BACKOFF_MAX% --max-workers %WORKERS% --yes
+"%VENV_PY%" -m src.main resume --mode auto %RUN_FLAGS%
 set "EXITCODE=%errorlevel%"
-if not "%EXITCODE%"=="0" (
-    echo.
-    echo [ERRO] A execucao terminou com codigo %EXITCODE%. Veja a mensagem acima.
-    pause
-)
+REM 4 = nenhum job / escolha cancelada: volta ao menu sem encerrar.
+if "%EXITCODE%"=="4" goto MENU
+call :REPORT_EXIT
+goto AFTER_RUN
+
+REM ============================================================
+REM  [F] Reprocessar somente as paginas que faltaram
+REM      Nao re-mapeia a arvore: tenta de novo so o que ficou sem PDF.
+REM ============================================================
+:RETRY_FAILED
+echo.
+echo --- Reprocessar Paginas que Faltaram ---
+echo.
+"%VENV_PY%" -m src.main resume --mode retry-failed %RUN_FLAGS%
+set "EXITCODE=%errorlevel%"
+REM 4 = nenhum job / escolha cancelada: volta ao menu sem encerrar.
+if "%EXITCODE%"=="4" goto MENU
+call :REPORT_EXIT
 goto AFTER_RUN
 
 REM ============================================================
@@ -291,6 +259,7 @@ echo Sugestao: use uma subpasta por projeto, ex: output\MinhaArea
 set /p "OUTDIR=Pasta de saida [%DEFAULT_DIR%]: "
 if defined OUTDIR set "OUTDIR=%OUTDIR:"=%"
 if "%OUTDIR%"=="" set "OUTDIR=%DEFAULT_DIR%"
+call :NORMALIZE_OUTDIR
 
 echo.
 echo Executando com:
@@ -298,16 +267,12 @@ echo   URL          = %URL%
 echo   Saida        = %OUTDIR%
 echo   Consolidado  = TDN_TOTVS_consolidado.pdf
 echo   Timeout      = %TIMEOUT%s/pagina  Slow = %SLOW%s
-echo   Rate limit   = %REQUEST_DELAY%s/req  Workers = %WORKERS%
+echo   Rate limit   = %REQUEST_DELAY%s/req  Workers = %WORKERS%  Rede = %PROXY_TXT%
 echo   Backoff      = %BACKOFF_INITIAL%s -^> %BACKOFF_MAX%s (em bloqueio)
 echo.
-"%VENV_PY%" -m src.main run "%URL%" --output-dir "%OUTDIR%" --timeout-seconds %TIMEOUT% --slow-threshold-seconds %SLOW% --headless --request-delay %REQUEST_DELAY% --backoff-initial %BACKOFF_INITIAL% --backoff-max %BACKOFF_MAX% --max-workers %WORKERS%
+"%VENV_PY%" -m src.main run "%URL%" --output-dir "%OUTDIR%" %RUN_FLAGS%
 set "EXITCODE=%errorlevel%"
-if not "%EXITCODE%"=="0" (
-    echo.
-    echo [ERRO] A execucao terminou com codigo %EXITCODE%. Veja a mensagem acima.
-    pause
-)
+call :REPORT_EXIT
 goto AFTER_RUN
 
 REM ============================================================
@@ -331,6 +296,7 @@ set "OUTDIR="
 set /p "OUTDIR=Pasta de saida [output]: "
 if defined OUTDIR set "OUTDIR=%OUTDIR:"=%"
 if "%OUTDIR%"=="" set "OUTDIR=output"
+call :NORMALIZE_OUTDIR
 
 set "CONSOL="
 set /p "CONSOL=Nome do PDF consolidado [TDN_TOTVS_consolidado.pdf]: "
@@ -407,46 +373,28 @@ if "%MAX%"=="" (
 )
 echo.
 
-"%VENV_PY%" -m src.main run "%URL%" --output-dir "%OUTDIR%" --consolidated-name "%CONSOL%" --timeout-seconds %ADV_TIMEOUT% --slow-threshold-seconds %ADV_SLOW% %HEADLESS_OPT% %MAX_OPT% --request-delay %ADV_DELAY% --backoff-initial %BACKOFF_INITIAL% --backoff-max %BACKOFF_MAX% --max-workers %ADV_WORKERS%
+"%VENV_PY%" -m src.main run "%URL%" --output-dir "%OUTDIR%" --consolidated-name "%CONSOL%" --timeout-seconds %ADV_TIMEOUT% --slow-threshold-seconds %ADV_SLOW% %HEADLESS_OPT% %MAX_OPT% --request-delay %ADV_DELAY% --backoff-initial %BACKOFF_INITIAL% --backoff-max %BACKOFF_MAX% --max-workers %ADV_WORKERS% %PROXY_OPT%
 set "EXITCODE=%errorlevel%"
-if not "%EXITCODE%"=="0" (
-    echo.
-    echo [ERRO] A execucao terminou com codigo %EXITCODE%. Veja a mensagem acima.
-    pause
-)
+call :REPORT_EXIT
 goto AFTER_RUN
 
 REM ============================================================
 REM  [4] Verificar atualizacoes (--update)
+REM      Escolhe um job EXISTENTE na lista (URL e pasta vem do job). Antes a
+REM      pasta era digitada: um nome diferente do job criava um job novo e
+REM      baixava tudo de novo.
 REM ============================================================
 :UPDATE_MODE
 echo.
 echo --- Verificar Atualizacoes da TDN ---
-echo Re-mapeia a arvore procurando paginas novas.
-echo PDFs ja gerados em runs anteriores serao reaproveitados.
+echo Re-mapeia a arvore do job escolhido procurando paginas novas.
+echo PDFs ja gerados sao reaproveitados; so o que e novo ou faltou e baixado.
 echo.
-set "URL="
-set /p "URL=URL inicial da documentacao TDN: "
-if defined URL set "URL=%URL:"=%"
-if "%URL%"=="" (
-    echo [ERRO] URL obrigatoria.
-    echo.
-    goto MENU
-)
-set "OUTDIR="
-set /p "OUTDIR=Pasta de saida [output]: "
-if defined OUTDIR set "OUTDIR=%OUTDIR:"=%"
-if "%OUTDIR%"=="" set "OUTDIR=output"
-echo.
-echo Executando em modo UPDATE...
-echo.
-"%VENV_PY%" -m src.main run "%URL%" --output-dir "%OUTDIR%" --timeout-seconds %TIMEOUT% --slow-threshold-seconds %SLOW% --headless --update --yes --request-delay %REQUEST_DELAY% --backoff-initial %BACKOFF_INITIAL% --backoff-max %BACKOFF_MAX% --max-workers %WORKERS%
+"%VENV_PY%" -m src.main resume --mode update %RUN_FLAGS%
 set "EXITCODE=%errorlevel%"
-if not "%EXITCODE%"=="0" (
-    echo.
-    echo [ERRO] A execucao terminou com codigo %EXITCODE%. Veja a mensagem acima.
-    pause
-)
+REM 4 = nenhum job / escolha cancelada: volta ao menu sem encerrar.
+if "%EXITCODE%"=="4" goto MENU
+call :REPORT_EXIT
 goto AFTER_RUN
 
 REM ============================================================
@@ -455,32 +403,14 @@ REM ============================================================
 :REGENERATE_MODE
 echo.
 echo --- Regenerar Todos os PDFs ---
-echo Re-mapeia a arvore E regenera TODOS os PDFs.
+echo Re-mapeia a arvore do job escolhido E regenera TODOS os PDFs.
 echo Use isto quando suspeitar que paginas foram modificadas.
-echo Mantem o manifest.json para historico.
 echo.
-set "URL="
-set /p "URL=URL inicial da documentacao TDN: "
-if defined URL set "URL=%URL:"=%"
-if "%URL%"=="" (
-    echo [ERRO] URL obrigatoria.
-    echo.
-    goto MENU
-)
-set "OUTDIR="
-set /p "OUTDIR=Pasta de saida [output]: "
-if defined OUTDIR set "OUTDIR=%OUTDIR:"=%"
-if "%OUTDIR%"=="" set "OUTDIR=output"
-echo.
-echo Executando em modo REGENERATE (pode demorar - refaz todos os PDFs)...
-echo.
-"%VENV_PY%" -m src.main run "%URL%" --output-dir "%OUTDIR%" --timeout-seconds %TIMEOUT% --slow-threshold-seconds %SLOW% --headless --regenerate --yes --request-delay %REQUEST_DELAY% --backoff-initial %BACKOFF_INITIAL% --backoff-max %BACKOFF_MAX% --max-workers %WORKERS%
+"%VENV_PY%" -m src.main resume --mode regenerate %RUN_FLAGS%
 set "EXITCODE=%errorlevel%"
-if not "%EXITCODE%"=="0" (
-    echo.
-    echo [ERRO] A execucao terminou com codigo %EXITCODE%. Veja a mensagem acima.
-    pause
-)
+REM 4 = nenhum job / escolha cancelada: volta ao menu sem encerrar.
+if "%EXITCODE%"=="4" goto MENU
+call :REPORT_EXIT
 goto AFTER_RUN
 
 REM ============================================================
@@ -491,9 +421,13 @@ echo.
 echo --- Configurar Velocidade ---
 echo Modo atual: %SPEED_MODE%  ^(delay=%REQUEST_DELAY%s ^| workers=%WORKERS% ^| timeout=%TIMEOUT%s^)
 echo.
-echo   [1] Lento e seguro      ^(2s/req, 1 worker, timeout 180s^)  - RECOMENDADO
+echo O intervalo e o PONTO DE PARTIDA: a cada bloqueio do servidor o extrator
+echo desacelera sozinho e volta a acelerar aos poucos. Mais workers nao
+echo aumentam o ritmo permitido por IP; para ir mais rapido use proxies ^([P]^).
+echo.
+echo   [1] Seguro               ^(2s/req, 1 worker, timeout 180s^)  - RECOMENDADO
 echo   [2] Medio                ^(1s/req, 2 workers, timeout 150s^)
-echo   [3] Rapido               ^(0.5s/req, 3 workers, timeout 120s^) - CUIDADO 522
+echo   [3] Rapido               ^(0.5s/req, 3 workers, timeout 120s^) - so com proxies
 echo   [4] Personalizado
 echo   [0] Voltar
 echo.
@@ -529,7 +463,7 @@ if "%SP%"=="3" (
     set "WORKERS=3"
     set "TIMEOUT=120"
     set "SLOW=60"
-    echo Modo rapido ativado. ATENCAO: maior risco de bloqueio (522).
+    echo Modo rapido ativado. ATENCAO: sem proxies, mais bloqueios ^(erro 1015^).
     goto MENU
 )
 if "%SP%"=="4" goto SPEED_CUSTOM
@@ -558,14 +492,58 @@ echo Configuracao personalizada salva.
 goto MENU
 
 REM ============================================================
-REM  [7] Listar jobs pendentes
+REM  [7] Listar jobs (em output\ e na pasta atual)
 REM ============================================================
 :LIST_JOBS
 echo.
-"%VENV_PY%" -m src.main jobs --output-dir output
+"%VENV_PY%" -m src.main jobs --all
 echo.
 pause
 goto MENU
+
+REM ============================================================
+REM  [P] Proxies (arquivo proxies.txt, usado por todas as execucoes)
+REM ============================================================
+:PROXY_MENU
+echo.
+echo --- Configurar Proxy ---
+echo O TDN limita os acessos POR IP (Cloudflare erro 1015). Com um proxy os
+echo requests saem por outro IP; com varios, o extrator troca de proxy quando
+echo um IP e bloqueado, em vez de ficar parado esperando.
+echo Formatos: http://usuario:senha@host:porta  ^|  host:porta  ^|  socks5://host:porta
+echo.
+"%VENV_PY%" -m src.main proxy list
+echo.
+echo   [1] Adicionar proxy
+echo   [2] Testar  ^(1 request por saida de rede^)
+echo   [3] Remover todos  ^(volta para a conexao direta^)
+echo   [0] Voltar
+echo.
+set "PX="
+set /p "PX=Escolha [0-3]: "
+if "%PX%"=="1" goto PROXY_ADD
+if "%PX%"=="2" goto PROXY_TEST
+if "%PX%"=="3" goto PROXY_CLEAR
+if "%PX%"=="0" goto MENU
+echo Opcao invalida.
+goto PROXY_MENU
+
+:PROXY_ADD
+echo.
+"%VENV_PY%" -m src.main proxy add
+goto PROXY_MENU
+
+:PROXY_TEST
+echo.
+"%VENV_PY%" -m src.main proxy test
+echo.
+pause
+goto PROXY_MENU
+
+:PROXY_CLEAR
+echo.
+"%VENV_PY%" -m src.main proxy clear
+goto PROXY_MENU
 
 REM ============================================================
 REM  [8] Reinstalar dependencias
@@ -605,6 +583,41 @@ echo.
 echo Chromium reinstalado com sucesso.
 echo.
 goto MENU
+
+REM ============================================================
+REM  Sub-rotinas
+REM ============================================================
+
+REM Nome simples (sem \ / :) vira subpasta de output\. Evita espalhar jobs pela
+REM pasta do projeto: "CFGTRIB" e "output\CFGTRIB" seriam jobs diferentes.
+:NORMALIZE_OUTDIR
+if /i "%OUTDIR%"=="output" goto :eof
+set "_T=%OUTDIR%"
+if not "%_T:\=%"=="%_T%" goto :eof
+if not "%_T:/=%"=="%_T%" goto :eof
+if not "%_T::=%"=="%_T%" goto :eof
+set "OUTDIR=output\%OUTDIR%"
+echo [INFO] Pasta de saida ajustada para %OUTDIR%
+goto :eof
+
+REM Explica o codigo de saida da ultima execucao.
+REM   0 = completo ^| 3 = documentacao incompleta ^(progresso salvo^) ^| 4 = nada a fazer ^| 130 = Ctrl+C
+:REPORT_EXIT
+if "%EXITCODE%"=="0" goto :eof
+if "%EXITCODE%"=="4" goto :eof
+if "%EXITCODE%"=="130" goto :eof
+echo.
+if "%EXITCODE%"=="3" goto REPORT_INCOMPLETE
+echo [ERRO] A execucao terminou com codigo %EXITCODE%. Veja a mensagem acima.
+pause
+goto :eof
+
+:REPORT_INCOMPLETE
+echo [ATENCAO] A documentacao ficou INCOMPLETA - veja o quadro acima.
+echo           O progresso esta salvo. O quadro indica a opcao do menu que
+echo           conclui o que faltou, sem refazer o que ja esta pronto.
+pause
+goto :eof
 
 :AFTER_RUN
 set "AGAIN="

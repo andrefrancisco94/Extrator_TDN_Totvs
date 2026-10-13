@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
+import re
 import shutil
 import sys
 import time
@@ -15,7 +18,20 @@ from .markdown_exporter import export_pages_to_markdown
 from .markdown_merge import merge_markdown
 from .pdf_exporter import export_pages_to_pdf
 from .pdf_merge import merge_pdfs
+from .proxy import (
+    PROXY_FILE_DEFAULT,
+    AllProxiesDeadError,
+    ProxyConfigError,
+    ProxyPool,
+    load_proxy_file,
+    mask_proxy,
+    normalize_proxy_url,
+    resolve_exits,
+    save_proxy_file,
+    to_playwright_proxy,
+)
 from .utils import (
+    BlockedTooLongError,
     Checkpoint,
     InvalidStartUrlError,
     JobLock,
@@ -23,14 +39,15 @@ from .utils import (
     MANIFEST_FILENAME,
     RateLimitConfig,
     RateLimiter,
+    chrome_user_agent,
     ensure_output_dirs,
-    find_pending_jobs,
+    find_jobs,
     format_bytes,
     format_duration,
     generate_correlation_id,
     get_console,
-    sanitize_proxy_for_log,
     setup_logger,
+    start_url_key,
     storage_state_path,
     validate_safe_path,
     validate_start_url,
@@ -39,9 +56,21 @@ from .utils import (
 
 from .utils import LARGE_BATCH_THRESHOLD  # re-export para retrocompat
 
-__version__ = "0.10.0"
+__version__ = "0.11.0"
 
 MIN_DISK_FREE_BYTES = 500 * 1024 * 1024  # 500MB minimo razoavel
+
+# Codigo de saida quando o run terminou mas a documentacao ficou incompleta
+# (paginas faltando, mapeamento incompleto ou IP bloqueado por tempo demais).
+# O progresso esta salvo: basta retomar o job.
+EXIT_INCOMPLETE = 3
+# `resume` sem nada a fazer (nenhum job encontrado ou escolha cancelada). O
+# menu usa este codigo para voltar direto ao menu em vez de encerrar.
+EXIT_NOTHING_TO_DO = 4
+
+# Onde o menu procura jobs existentes: a pasta padrao e a pasta atual (um job
+# criado fora de output/ nao pode ficar invisivel).
+JOB_ROOTS = (Path("output"), Path("."))
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
 
@@ -64,6 +93,7 @@ async def run_pipeline(
     debug: bool = False,
     retry_failed_only: bool = False,
     quiet: bool = False,
+    proxies: list[str | None] | None = None,
 ) -> int:
     pages_dir, log_file = ensure_output_dirs(output_dir)
     correlation_id = generate_correlation_id()
@@ -92,28 +122,103 @@ async def run_pipeline(
         # NAO chama release — lock nunca foi adquirido por este processo
         return 2
     try:
+        pool = _build_pool(proxies, proxy)
         return await _run_pipeline_inner(
             start_url, output_dir, consolidated_name, headless, timeout_seconds,
             max_pages, slow_threshold_seconds, auto_confirm, force_recrawl,
             force_reexport, rate_limit, max_workers, proxy, dry_run,
-            pages_dir, log_file, logger, console, retry_failed_only,
+            pages_dir, log_file, logger, console, retry_failed_only, pool,
         )
+    except BlockedTooLongError as exc:
+        logger.error("Run interrompido: %s", exc)
+        _print_blocked_panel(console, exc, output_dir, _resume_hint(force_recrawl, force_reexport))
+        return EXIT_INCOMPLETE
+    except AllProxiesDeadError as exc:
+        logger.error("Run interrompido: %s", exc)
+        console.print(f"\n[bold red]Proxies indisponiveis:[/bold red] {exc}")
+        console.print("O progresso foi salvo. Corrija a lista de proxies e retome o job.")
+        return EXIT_INCOMPLETE
+    except ProxyConfigError as exc:
+        console.print(f"[bold red]Proxy invalido:[/bold red] {exc}")
+        return 2
     finally:
         # release() eh idempotente (verifica _held interno)
         job_lock.release()
+
+
+def _build_pool(proxies: list[str | None] | None, proxy: str | None) -> ProxyPool:
+    """Monta o rodizio de saidas de rede a partir da lista ou do proxy unico."""
+    if proxies:
+        return ProxyPool([normalize_proxy_url(item) if item else None for item in proxies])
+    return ProxyPool([normalize_proxy_url(proxy)])
+
+
+def _resume_hint(force_recrawl: bool, force_reexport: bool) -> tuple[str, str]:
+    """(opcao do menu, modo do `resume`) que realmente continua o que foi pedido.
+
+    Um re-mapeamento interrompido (--update/--regenerate) mantem o mapa antigo
+    marcado como completo: [1] e [F] NAO o refazem. So repetindo a mesma opcao.
+    """
+    if force_reexport:
+        return "[5] Regenerar todos os PDFs", "regenerate"
+    if force_recrawl:
+        return "[4] Verificar atualizacoes", "update"
+    return "[1] Continuar trabalho anterior", "auto"
+
+
+def _print_blocked_panel(
+    console, exc: BlockedTooLongError, output_dir: Path,
+    hint: tuple[str, str] = ("[1] Continuar trabalho anterior", "auto"),
+) -> None:
+    resume_at = time.strftime("%H:%M", time.localtime(time.time() + exc.seconds))
+    option, mode = hint
+    console.print(Panel.fit(
+        f"O servidor bloqueou este IP (Cloudflare erro 1015) por mais "
+        f"{format_duration(exc.seconds)} — ate cerca de {resume_at}.\n"
+        "Isso passa do limite de espera configurado (--max-block-wait), entao o "
+        "run parou.\n\n"
+        f"[bold]Nada foi perdido:[/bold] o progresso esta salvo em {output_dir}.\n"
+        f"Depois desse horario use a opcao {option} do menu\n"
+        f"(CLI: python -m src.main resume --output-dir \"{output_dir}\" --mode {mode}),\n"
+        "ou configure proxies na opcao [P] para nao depender de um unico IP.",
+        title="IP bloqueado pelo servidor", border_style="red",
+    ))
 
 
 async def _run_pipeline_inner(
     start_url, output_dir, consolidated_name, headless, timeout_seconds,
     max_pages, slow_threshold_seconds, auto_confirm, force_recrawl,
     force_reexport, rate_limit, max_workers, proxy, dry_run,
-    pages_dir, log_file, logger, console, retry_failed_only=False,
+    pages_dir, log_file, logger, console, retry_failed_only=False, pool=None,
 ) -> int:
     """Pipeline interno (encapsulado no lock). Mantem assinatura original."""
     timeout_ms = timeout_seconds * 1000
     pipeline_start = time.monotonic()
+    if pool is None:
+        pool = _build_pool(None, proxy)
 
     checkpoint = _setup_checkpoint(output_dir, start_url, pages_dir, logger)
+    if checkpoint.previous_start_url:
+        return _abort_start_url_mismatch(
+            console, logger, output_dir, start_url, checkpoint.previous_start_url,
+        )
+    # Mesma pagina digitada de outra forma (barra final, /display/ vs
+    # /display/public/): segue com a URL gravada no manifest, para que as
+    # chaves das paginas ja exportadas continuem batendo.
+    if checkpoint.manifest.start_url and checkpoint.manifest.start_url != start_url:
+        logger.info(
+            "URL inicial equivalente a do manifest; usando a forma gravada: %s",
+            checkpoint.manifest.start_url,
+        )
+        start_url = checkpoint.manifest.start_url
+
+    is_new_job = not checkpoint.manifest.mapped_urls and not checkpoint.manifest.exported
+    if is_new_job:
+        _warn_job_for_same_url_elsewhere(console, logger, start_url, output_dir, force_recrawl)
+    # Gravado no manifest para que `resume` reuse o MESMO nome de consolidado
+    # (sem adivinhar por arquivos da pasta).
+    checkpoint.manifest.consolidated_name = consolidated_name
+
     resume_active = bool(
         checkpoint.manifest.crawl_complete and checkpoint.manifest.mapped_urls
     )
@@ -140,21 +245,45 @@ async def _run_pipeline_inner(
 
     # Captura estado anterior do crawl ANTES de re-executar (para computar diff)
     previous_mapped = set(checkpoint.manifest.mapped_urls)
+    previous_map_complete = bool(checkpoint.manifest.crawl_complete)
 
     # Compartilha RateLimiter entre crawl e export: se o servidor bloquear no
     # crawl, o cooldown propaga para o export — evita o pipeline pegar 522
     # logo no inicio do export depois de ter sido bloqueado no crawl.
-    shared_limiter = RateLimiter(rate_limit)
+    shared_limiter = RateLimiter(rate_limit, logger)
 
     # Storage state: cookies/localStorage persistidos entre runs.
     state_path = storage_state_path(output_dir)
-    if proxy:
-        # Mascara credenciais no log para nao vazar password/token
-        logger.info("Proxy configurado: %s", sanitize_proxy_for_log(proxy))
+    # Registra por onde os requests saem (credenciais sempre mascaradas).
+    if len(pool) > 1:
+        logger.info(
+            "Saidas de rede (%d, com rodizio em bloqueio): %s",
+            len(pool), ", ".join(pool.labels()),
+        )
+        console.print(
+            f"[bold]Saidas de rede:[/bold] {len(pool)} (rodizio automatico quando "
+            "um IP for bloqueado)"
+        )
+    elif pool.current:
+        logger.info("Proxy configurado: %s", pool.current_label)
+        console.print(f"[bold]Proxy:[/bold] {pool.current_label}")
+    else:
+        logger.info("Saida de rede: conexao direta (sem proxy).")
 
+    crawl_complete = True
+    crawl_note = ""
     if retry_failed_only:
         urls = list(checkpoint.manifest.mapped_urls)
         slow_crawl = []
+        crawl_complete = bool(checkpoint.manifest.crawl_complete)
+        legacy_giveups = checkpoint.crawl_giveups()
+        if crawl_complete and legacy_giveups:
+            # Mapa fechado por versao antiga com paginas sem os filhos listados:
+            # este modo nao re-mapeia, entao nao pode dizer que esta completo.
+            crawl_complete = False
+            crawl_note = (
+                f"mapa antigo com {len(legacy_giveups)} pagina(s) sem os filhos listados"
+            )
         if not urls and not checkpoint.manifest.failures:
             logger.error(
                 "Modo --retry-failed-only requer manifest com URLs mapeadas ou "
@@ -172,7 +301,7 @@ async def _run_pipeline_inner(
         )
     else:
         try:
-            urls, slow_crawl = await crawl_confluence_tree(
+            crawl = await crawl_confluence_tree(
                 start_url=start_url,
                 checkpoint=checkpoint,
                 logger=logger,
@@ -186,28 +315,51 @@ async def _run_pipeline_inner(
                 limiter=shared_limiter,
                 state_path=state_path,
                 proxy=proxy,
+                pool=pool,
             )
         except KeyboardInterrupt:
             logger.warning("Crawl interrompido pelo usuario (Ctrl+C).")
             raise
+        urls, slow_crawl = crawl.urls, crawl.slow_records
+        crawl_complete, crawl_note = crawl.complete, crawl.note
 
     if not urls:
         logger.error("Nenhuma pagina foi encontrada a partir da URL inicial.")
         return 1
 
-    # Diff de URLs (so relevante em modo update/regenerate)
+    # Diff de URLs (so relevante em modo update/regenerate). Um re-mapeamento
+    # que nao terminou nao prova que alguma pagina saiu da TDN: sem diff.
+    # So ha "paginas novas/removidas" quando um mapa COMPLETO foi re-mapeado por
+    # inteiro; retomar um mapeamento interrompido nao e novidade na TDN.
     current_set = set(urls)
-    added_urls = sorted(current_set - previous_mapped) if previous_mapped else []
-    removed_urls = sorted(previous_mapped - current_set) if previous_mapped else []
-    if force_recrawl and previous_mapped:
+    diff_valid = (
+        force_recrawl and previous_map_complete and bool(previous_mapped) and crawl_complete
+    )
+    # Compara por chave independente da forma da URL: /display/X/T e
+    # /display/public/X/T sao a mesma pagina (mapas antigos misturam as duas).
+    def _page_key(url: str) -> str:
+        return url.replace("/display/public/", "/display/", 1)
+
+    current_keys = {_page_key(u) for u in current_set}
+    previous_keys = {_page_key(u) for u in previous_mapped}
+    added_urls = sorted(u for u in current_set if _page_key(u) not in previous_keys) if diff_valid else []
+    removed_urls = sorted(u for u in previous_mapped if _page_key(u) not in current_keys) if diff_valid else []
+    if force_recrawl and diff_valid:
         logger.info(
             "Diff do re-crawl: %d novas, %d removidas, %d inalteradas.",
             len(added_urls), len(removed_urls),
-            len(current_set & previous_mapped),
+            len(current_keys & previous_keys),
         )
 
     if dry_run:
         _print_dry_run_summary(console, logger, urls, output_dir)
+        if not crawl_complete:
+            logger.warning("Dry-run com mapeamento incompleto: %s", crawl_note)
+            console.print(
+                f"[bold red]Atencao:[/bold red] o mapeamento NAO terminou ({crawl_note}); "
+                "a contagem acima e parcial. Rode de novo para retomar."
+            )
+            return EXIT_INCOMPLETE
         return 0
 
     # Confirmacao para batches grandes (apenas em TTY)
@@ -230,6 +382,7 @@ async def _run_pipeline_inner(
             limiter=shared_limiter,
             state_path=state_path,
             proxy=proxy,
+            pool=pool,
         )
     except KeyboardInterrupt:
         logger.warning("Exportacao de PDFs interrompida pelo usuario (Ctrl+C).")
@@ -241,16 +394,50 @@ async def _run_pipeline_inner(
     except OSError as exc:
         logger.warning("Falha ao flush manifest: %s", exc)
 
-    if not pdf_entries:
+    # O consolidado e montado a partir do MANIFEST, na ordem do mapa: entra toda
+    # pagina que tem PDF valido, tenha sido gerada agora ou em run anterior. A
+    # lista devolvida pelo export so tem o que ESTE run processou; usa-la faria
+    # um run abortado (ou um --regenerate com falhas) encolher o consolidado.
+    merge_entries: list[tuple[Path, str]] = []
+    missing_urls: list[str] = []
+    for url in urls:
+        entry = checkpoint.get_exported_entry(url) if checkpoint.is_exported(url, pages_dir) else None
+        if entry is None:
+            missing_urls.append(url)
+        else:
+            merge_entries.append((pages_dir / entry["filename"], str(entry.get("title", ""))))
+
+    if not merge_entries:
         logger.error("Nenhum PDF individual foi gerado.")
         return 1
 
+    # --regenerate: pagina que falhou ou nem chegou a ser processada continua
+    # com o PDF ANTIGO. Nao esta "faltando", mas tambem nao foi atualizada.
+    stale_urls: list[str] = []
+    if force_reexport:
+        fresh_paths = {path for path, _title in pdf_entries}
+        missing_set = set(missing_urls)
+        stale_urls = [
+            url for url in urls
+            if url not in missing_set
+            and pages_dir / checkpoint.get_exported_entry(url)["filename"] not in fresh_paths
+        ]
+    # Havia mapa completo e o mapeamento desta execucao nao fechou: o mapa
+    # antigo foi mantido e so um novo re-mapeamento ([4]) resolve.
+    remap_pending = previous_map_complete and not crawl_complete
+    incomplete = bool(missing_urls) or bool(stale_urls) or not crawl_complete
+
     consolidated_path: Path | None = output_dir / consolidated_name
     try:
-        merge_pdfs(pdf_entries, consolidated_path, logger)
+        merge_pdfs(merge_entries, consolidated_path, logger)
     except Exception:  # noqa: BLE001
         logger.exception("Falha ao consolidar PDFs")
         consolidated_path = None
+    if consolidated_path and missing_urls:
+        logger.warning(
+            "PDF consolidado INCOMPLETO: faltam %d de %d paginas.",
+            len(missing_urls), len(urls),
+        )
 
     all_slow = slow_crawl + slow_pdf
     slow_log_path = _maybe_write_slow_log(all_slow, output_dir, logger)
@@ -258,21 +445,160 @@ async def _run_pipeline_inner(
     total_elapsed = time.monotonic() - pipeline_start
     logger.info(
         "Resumo: %s URL(s), %s PDF(s), %s falha(s), %s lenta(s), tempo total %s",
-        len(urls), len(pdf_entries), len(failures), len(all_slow),
+        len(urls), len(merge_entries), len(failures), len(all_slow),
         format_duration(total_elapsed),
+    )
+    logger.info(
+        "Rate limit: %d bloqueio(s) no run, %s aguardando, intervalo final %.1fs.",
+        shared_limiter.total_blocks,
+        format_duration(shared_limiter.total_wait_seconds),
+        shared_limiter.current_delay,
     )
 
     _print_summary_tables(
         console=console,
-        urls=urls, pdf_entries=pdf_entries, failures=failures, all_slow=all_slow,
+        urls=urls, pdf_entries=merge_entries, failures=failures, all_slow=all_slow,
         slow_threshold_seconds=slow_threshold_seconds,
         consolidated_path=consolidated_path, log_file=log_file,
         slow_log_path=slow_log_path, manifest_path=checkpoint.path,
         total_elapsed=total_elapsed,
         added_urls=added_urls, removed_urls=removed_urls,
+        blocks=shared_limiter.total_blocks,
+        missing_count=len(missing_urls),
     )
 
-    return 0 if consolidated_path else 2
+    if incomplete:
+        _print_incomplete_panel(
+            console, logger, output_dir, total=len(urls), missing_urls=missing_urls,
+            crawl_complete=crawl_complete, crawl_note=crawl_note,
+            stale_urls=stale_urls,
+            hint=(
+                _resume_hint(force_recrawl or remap_pending, force_reexport)
+                if (remap_pending or stale_urls) else None
+            ),
+        )
+    if not consolidated_path:
+        return 2
+    return EXIT_INCOMPLETE if incomplete else 0
+
+
+def _abort_start_url_mismatch(
+    console, logger, output_dir: Path, start_url: str, previous: str,
+) -> int:
+    """Recusa reutilizar a pasta de um job de OUTRA URL (nunca descarta sozinho)."""
+    logger.error(
+        "A pasta %s ja contem um job de outra URL inicial (%s); pedido atual: %s. "
+        "Nada foi alterado.", output_dir, previous, start_url,
+    )
+    console.print(Panel.fit(
+        f"A pasta [bold]{output_dir}[/bold] ja contem um job de OUTRA URL inicial:\n"
+        f"  gravada : {previous}\n"
+        f"  pedida  : {start_url}\n\n"
+        "Continuar descartaria o registro das paginas ja exportadas, entao o run "
+        "foi cancelado e nada foi alterado.\n"
+        "  - Para continuar o job existente: opcao [1] do menu (a URL e lida do job).\n"
+        "  - Para um job novo: escolha outra pasta de saida.\n"
+        "  - Para realmente recomecar nesta pasta: use --fresh.",
+        title="Pasta pertence a outro job", border_style="red",
+    ))
+    return 2
+
+
+def _warn_job_for_same_url_elsewhere(
+    console, logger, start_url: str, output_dir: Path, force_recrawl: bool,
+) -> None:
+    """Avisa quando ja existe, em outra pasta, um job para a mesma URL inicial.
+
+    Foi assim que uma "verificacao de atualizacoes" virou extracao completa:
+    a pasta digitada (CFGTRIB) nao era a do job existente (output\\CFGTRIB).
+    """
+    try:
+        target = output_dir.resolve()
+        key = start_url_key(start_url)
+        others = [
+            job for job in find_jobs(JOB_ROOTS, include_complete=True)
+            if start_url_key(job.start_url) == key and job.output_dir.resolve() != target
+        ]
+    except OSError:
+        return
+    if not others:
+        return
+    lines = "\n".join(
+        f"  - {job.output_dir}  ({job.exported_count} PDFs, {job.mapped_count} paginas mapeadas)"
+        for job in others
+    )
+    mode = "atualizacao (--update)" if force_recrawl else "execucao"
+    logger.warning(
+        "Ja existe job para esta URL em outra pasta (%s); esta %s cria um job NOVO em %s.",
+        ", ".join(str(job.output_dir) for job in others), mode, output_dir,
+    )
+    console.print(Panel.fit(
+        f"Ja existe um job para esta mesma URL em:\n{lines}\n\n"
+        f"Esta {mode} vai criar um job [bold]novo[/bold] em {output_dir} e baixar "
+        "tudo de novo.\nSe a intencao era atualizar o job existente, interrompa "
+        "(Ctrl+C) e use a opcao [4] do menu, escolhendo-o na lista.",
+        title="Atencao: pasta diferente do job existente", border_style="yellow",
+    ))
+
+
+def _print_incomplete_panel(
+    console, logger, output_dir: Path, *, total: int, missing_urls: list[str],
+    crawl_complete: bool, crawl_note: str,
+    stale_urls: list[str] | None = None,
+    hint: tuple[str, str] | None = None,
+) -> None:
+    """Diz claramente que a documentacao ficou incompleta e como terminar.
+
+    hint: (opcao do menu, modo do resume) quando o que ficou pendente e um
+    re-mapeamento ou uma regeneracao — nesses casos [F]/[1] nao resolvem.
+    """
+    stale_urls = stale_urls or []
+    lines: list[str] = []
+    if missing_urls:
+        lines.append(
+            f"[bold]{len(missing_urls)} de {total} paginas ficaram sem PDF[/bold] "
+            "(o consolidado foi gerado SEM elas):"
+        )
+        lines.extend(f"  - {url}" for url in missing_urls[:15])
+        if len(missing_urls) > 15:
+            lines.append(f"  ... e mais {len(missing_urls) - 15}")
+    if stale_urls:
+        lines.append(
+            f"[bold]{len(stale_urls)} de {total} paginas NAO foram regeneradas[/bold] "
+            "(o PDF antigo foi mantido no consolidado):"
+        )
+        lines.extend(f"  - {url}" for url in stale_urls[:15])
+        if len(stale_urls) > 15:
+            lines.append(f"  ... e mais {len(stale_urls) - 15}")
+    if not crawl_complete:
+        lines.append(
+            "[bold]O mapeamento da arvore nao terminou[/bold]"
+            + (f" ({crawl_note})" if crawl_note else "")
+            + (
+                ": o mapa anterior foi mantido; paginas novas ainda nao foram procuradas."
+                if hint else ": pode haver paginas ainda nao descobertas."
+            )
+        )
+    lines.append("")
+    if hint:
+        option, mode = hint
+        lines.append("Para concluir, repita a mesma operacao (o que ja esta pronto e reaproveitado):")
+        lines.append(f"  - menu: opcao {option}")
+    else:
+        mode = "retry-failed"
+        lines.append("Para terminar SO o que falta (sem refazer o que ja esta pronto):")
+        lines.append("  - menu: opcao [F] Reprocessar paginas que faltaram")
+    lines.append(
+        f"  - CLI : python -m src.main resume --output-dir \"{output_dir}\" --mode {mode}"
+    )
+    logger.warning(
+        "Documentacao INCOMPLETA em %s: %d pagina(s) sem PDF, %d nao regenerada(s), mapeamento %s.",
+        output_dir, len(missing_urls), len(stale_urls),
+        "completo" if crawl_complete else "incompleto",
+    )
+    console.print(Panel.fit(
+        "\n".join(lines), title="DOCUMENTACAO INCOMPLETA", border_style="red",
+    ))
 
 
 def _maybe_force_recrawl_for_max_pages(
@@ -309,12 +635,9 @@ def _setup_checkpoint(
     """Inicializa checkpoint e reconcilia com disco."""
     checkpoint = Checkpoint(output_dir, start_url, logger=logger)
     if checkpoint.previous_start_url:
-        logger.warning(
-            "Atencao: manifest tinha outro start_url (%s). "
-            "Estado anterior descartado — comecando novo crawl. "
-            "Use --output-dir diferente se quer manter o crawl anterior.",
-            checkpoint.previous_start_url,
-        )
+        # Pasta de outro job: o chamador aborta sem gravar nada (o manifest em
+        # memoria e novo e vazio; reconciliar/salvar apagaria o do disco).
+        return checkpoint
     removed = checkpoint.reconcile_with_disk(pages_dir, logger=logger)
     if removed > 0:
         logger.warning(
@@ -436,6 +759,8 @@ def _print_summary_tables(
     total_elapsed: float,
     added_urls: list[str] | None = None,
     removed_urls: list[str] | None = None,
+    blocks: int = 0,
+    missing_count: int = 0,
 ) -> None:
     main_table = _build_main_summary_table(
         urls=urls, pdf_entries=pdf_entries, failures=failures, all_slow=all_slow,
@@ -444,6 +769,7 @@ def _print_summary_tables(
         slow_log_path=slow_log_path, manifest_path=manifest_path,
         total_elapsed=total_elapsed,
         added_urls=added_urls, removed_urls=removed_urls,
+        blocks=blocks, missing_count=missing_count,
     )
     console.print(main_table)
 
@@ -502,6 +828,8 @@ def _build_main_summary_table(
     total_elapsed: float,
     added_urls: list[str] | None,
     removed_urls: list[str] | None,
+    blocks: int = 0,
+    missing_count: int = 0,
 ) -> Table:
     total_bytes = 0
     for path, _ in pdf_entries:
@@ -519,7 +847,8 @@ def _build_main_summary_table(
 
     avg_per_page = total_elapsed / len(pdf_entries) if pdf_entries else 0
 
-    table = Table(title="Resumo da execucao", border_style="green", show_header=False)
+    border = "red" if missing_count else "green"
+    table = Table(title="Resumo da execucao", border_style=border, show_header=False)
     table.add_column("Metrica", style="bold cyan")
     table.add_column("Valor")
     table.add_row("URLs mapeadas", str(len(urls)))
@@ -527,7 +856,12 @@ def _build_main_summary_table(
         table.add_row("URLs novas", f"[green]+{len(added_urls)}[/green]")
         table.add_row("URLs removidas", f"[bright_black]-{len(removed_urls or [])}[/bright_black]")
     table.add_row("PDFs individuais", str(len(pdf_entries)))
+    table.add_row(
+        "Paginas sem PDF",
+        f"[bold red]{missing_count}[/bold red]" if missing_count else "0",
+    )
     table.add_row("Falhas", str(len(failures)))
+    table.add_row("Bloqueios do servidor", str(blocks))
     table.add_row("Paginas lentas", f"{len(all_slow)} (>= {slow_threshold_seconds:.0f}s)")
     table.add_row("Tempo total", format_duration(total_elapsed))
     table.add_row("Media por pagina", format_duration(avg_per_page))
@@ -637,9 +971,24 @@ def run(
         1, min=1, max=8,
         help="Workers paralelos para exportar PDFs (cuidado: muitos = bloqueio do servidor).",
     ),
-    proxy: str | None = typer.Option(
-        None, help="HTTP/SOCKS proxy. Ex: http://host:8080 ou socks5://host:1080. "
-        "Fallback: env HTTP_PROXY/HTTPS_PROXY.",
+    proxy: list[str] | None = typer.Option(
+        None, "--proxy",
+        help="Proxy de saida. Repita a flag (ou separe por virgula) para varios: o "
+        "extrator troca de proxy quando um IP e bloqueado. Ex: http://usuario:senha@host:8080, "
+        "host:porta, socks5://host:1080. 'direct' = conexao direta.",
+    ),
+    proxy_file: Path | None = typer.Option(
+        None, "--proxy-file",
+        help="Arquivo com um proxy por linha (ver 'proxy add'). Usado se --proxy nao for informado.",
+    ),
+    no_proxy: bool = typer.Option(
+        False, "--no-proxy",
+        help="Conexao direta: ignora --proxy-file e as variaveis HTTP_PROXY/HTTPS_PROXY.",
+    ),
+    max_block_wait: float = typer.Option(
+        7200.0, "--max-block-wait", min=0.0, max=86400.0,
+        help="Espera maxima (s) por UM bloqueio do servidor. O extrator aguarda o ban "
+        "acabar e continua sozinho; acima deste limite ele para com o progresso salvo.",
     ),
     dry_run: bool = typer.Option(
         False, "--dry-run",
@@ -706,6 +1055,8 @@ def run(
         console.print("[red]Cancelado por falta de espaco.[/red]")
         raise typer.Exit(2)
 
+    exits = _resolve_network_exits(console, proxy, proxy_file, no_proxy)
+
     # --regenerate implica --update (recrawl). --update sozinho so recrawl.
     force_recrawl = update or regenerate
     force_reexport = regenerate
@@ -714,41 +1065,313 @@ def run(
         base_delay_seconds=request_delay,
         backoff_initial_seconds=backoff_initial,
         backoff_max_seconds=backoff_max,
+        max_block_wait_seconds=max_block_wait,
     )
 
+    exit_code = _launch_pdf_run(
+        console,
+        start_url=validated_url,
+        output_dir=output_dir,
+        consolidated_name=consolidated_name,
+        headless=headless,
+        timeout_seconds=timeout_seconds,
+        max_pages=max_pages,
+        slow_threshold_seconds=slow_threshold_seconds,
+        auto_confirm=yes,
+        force_recrawl=force_recrawl,
+        force_reexport=force_reexport,
+        rate_limit=rate_limit,
+        max_workers=max_workers,
+        dry_run=dry_run,
+        debug=debug,
+        retry_failed_only=retry_failed_only,
+        quiet=quiet,
+        proxies=exits,
+    )
+    raise typer.Exit(exit_code)
+
+
+def _resolve_network_exits(
+    console, proxy_args: list[str] | None, proxy_file: Path | None, no_proxy: bool,
+) -> list[str | None]:
+    """Valida e resolve as saidas de rede da CLI. Sai com codigo 2 se invalido."""
+    if no_proxy:
+        return [None]
+    if proxy_file is not None and not proxy_file.exists():
+        console.print(f"[bold red]Arquivo de proxies nao encontrado:[/bold red] {proxy_file}")
+        raise typer.Exit(2)
     try:
-        exit_code = asyncio.run(
-            run_pipeline(
-                start_url=validated_url,
-                output_dir=output_dir,
-                consolidated_name=consolidated_name,
-                headless=headless,
-                timeout_seconds=timeout_seconds,
-                max_pages=max_pages,
-                slow_threshold_seconds=slow_threshold_seconds,
-                auto_confirm=yes,
-                force_recrawl=force_recrawl,
-                force_reexport=force_reexport,
-                rate_limit=rate_limit,
-                max_workers=max_workers,
-                proxy=proxy,
-                dry_run=dry_run,
-                debug=debug,
-                retry_failed_only=retry_failed_only,
-                quiet=quiet,
-            )
+        exits, origin = resolve_exits(proxy_args, proxy_file, dict(os.environ))
+    except ProxyConfigError as exc:
+        console.print(f"[bold red]Proxy invalido:[/bold red] {exc}")
+        raise typer.Exit(2)
+    if origin.startswith("variavel de ambiente"):
+        console.print(
+            f"[dim]Proxy vindo da {origin}: {mask_proxy(exits[0])}. "
+            "Use --no-proxy para ignorar.[/dim]"
         )
+    return exits
+
+
+def _launch_pdf_run(console, **pipeline_kwargs) -> int:
+    """Executa o pipeline de PDF tratando Ctrl+C e erros fatais. Retorna o exit code."""
+    try:
+        return asyncio.run(run_pipeline(**pipeline_kwargs))
     except KeyboardInterrupt:
         console.print("\n[bold yellow]Interrompido pelo usuario (Ctrl+C).[/bold yellow]")
         console.print("PDFs ja gerados foram preservados em pages/")
         console.print("Rode novamente para continuar de onde parou (resume automatico).")
-        exit_code = 130
+        return 130
     except Exception as exc:  # noqa: BLE001
         console.print(f"\n[bold red]Erro fatal:[/bold red] {exc}")
         _suggest_action_for_error(console, exc)
         console.print_exception(show_locals=False)
-        exit_code = 1
+        return 1
 
+
+_RESUME_MODES = ("auto", "retry-failed", "update", "regenerate")
+
+
+def _resolve_consolidated_name(console, requested: str | None, data: dict, output_dir: Path) -> str:
+    """Nome do consolidado para `resume`: flag > manifest > PDF gerado por nos > padrao."""
+    name = (requested or str(data.get("consolidated_name") or "")).strip()
+    if not name:
+        return _guess_consolidated_name(output_dir)
+    if any(c in name for c in '<>:"/\\|?*'):
+        console.print(
+            f"[bold red]Nome do consolidado contem caracteres invalidos:[/bold red] {name!r}"
+        )
+        raise typer.Exit(2)
+    return name if name.lower().endswith(".pdf") else name + ".pdf"
+
+
+def _job_label(job) -> str:
+    """Caminho do job como o usuario o digitaria (nao so o nome da ultima pasta:
+    output\\CFGTRIB e CFGTRIB sao jobs diferentes)."""
+    try:
+        return str(job.output_dir.resolve().relative_to(Path.cwd().resolve()))
+    except (ValueError, OSError):
+        return job.display_name
+
+
+def _jobs_table(found, title: str) -> Table:
+    table = Table(title=title, border_style="yellow")
+    table.add_column("#", justify="right", style="bold cyan")
+    table.add_column("Pasta", style="bold")
+    table.add_column("URL", overflow="fold")
+    table.add_column("Mapeadas", justify="right")
+    table.add_column("Fila", justify="right")
+    table.add_column("PDFs", justify="right")
+    table.add_column("Falhas", justify="right", style="red")
+    table.add_column("Atualizado")
+    for i, job in enumerate(found, start=1):
+        status = "" if job.crawl_complete else "[yellow](crawl incompleto)[/yellow] "
+        table.add_row(
+            str(i),
+            f"{status}{_job_label(job)}",
+            job.start_url,
+            str(job.mapped_count),
+            str(job.queue_count),
+            str(job.exported_count),
+            str(job.failure_count),
+            job.last_updated.replace("T", " ").replace("+00:00", "Z"),
+        )
+    return table
+
+
+def _pick_job(console, found, title: str) -> Path | None:
+    """Mostra os jobs e pergunta qual usar. Devolve a pasta, ou None se cancelado.
+
+    SEMPRE pergunta: escolher sozinho quando ha um unico job dispararia um run
+    (requests ao servidor) sem ninguem ter confirmado. Aceita tambem o caminho
+    de uma pasta, para jobs fora de output/ e da pasta atual.
+    """
+    if found:
+        console.print(_jobs_table(found, title))
+        question = f"Qual job? [1-{len(found)}], ou o caminho de outra pasta (0 = cancelar)"
+    else:
+        question = "Caminho da pasta do job (0 = cancelar)"
+    answer = str(typer.prompt(question, default="0")).strip().strip('"')
+    if not answer or answer == "0":
+        return None
+    if answer.isdigit():
+        choice = int(answer)
+        return found[choice - 1].output_dir if 1 <= choice <= len(found) else None
+    return Path(answer)
+
+
+_DEFAULT_CONSOLIDATED = "TDN_TOTVS_consolidado.pdf"
+
+
+def _guess_consolidated_name(output_dir: Path, default: str = _DEFAULT_CONSOLIDATED) -> str:
+    """Nome do consolidado de um job antigo (sem o nome gravado no manifest).
+
+    So aceita um PDF da pasta se ele foi GERADO pelo extrator (metadado
+    /Producer) e for o unico assim: um PDF qualquer que o usuario guardou na
+    pasta nunca pode ser tomado por consolidado e sobrescrito.
+    """
+    from pypdf import PdfReader  # noqa: PLC0415
+
+    ours: list[str] = []
+    try:
+        candidates = [p for p in output_dir.glob("*.pdf") if p.is_file()]
+    except OSError:
+        return default
+    for path in candidates:
+        try:
+            producer = str((PdfReader(str(path)).metadata or {}).get("/Producer", ""))
+        except Exception:  # noqa: BLE001 - PDF ilegivel nao e nosso
+            continue
+        if producer.startswith("Extrator TDN TOTVS"):
+            ours.append(path.name)
+    return ours[0] if len(ours) == 1 else default
+
+
+@app.command()
+def resume(
+    output_dir: Path | None = typer.Option(
+        None, "--output-dir",
+        help="Pasta do job. Se omitida, lista os jobs encontrados para voce escolher.",
+    ),
+    mode: str = typer.Option(
+        "auto", "--mode",
+        help="auto: continua de onde parou | retry-failed: so as paginas que faltaram | "
+        "update: re-mapeia e baixa paginas novas | regenerate: refaz todos os PDFs.",
+    ),
+    headless: bool = typer.Option(True, "--headless/--headed", help="Executa navegador sem interface."),
+    timeout_seconds: int = typer.Option(180, min=10, max=1800, help="Limite total por pagina (segundos)."),
+    slow_threshold_seconds: float = typer.Option(
+        60.0, min=5.0, help="Paginas que demorarem >= este valor vao para slow_pages.log.",
+    ),
+    request_delay: float = typer.Option(
+        2.0, min=0.0, max=60.0, help="Pausa em segundos entre requests (anti-rate-limit).",
+    ),
+    backoff_initial: float = typer.Option(
+        30.0, min=5.0, max=600.0, help="Cooldown inicial apos bloqueio sem Retry-After.",
+    ),
+    backoff_max: float = typer.Option(
+        900.0, min=60.0, max=7200.0, help="Teto do cooldown apos bloqueios sucessivos.",
+    ),
+    max_workers: int = typer.Option(1, min=1, max=8, help="Workers paralelos para exportar PDFs."),
+    consolidated_name: str | None = typer.Option(
+        None, "--consolidated-name",
+        help="Nome do PDF consolidado. Padrao: o mesmo usado quando o job foi criado.",
+    ),
+    proxy: list[str] | None = typer.Option(
+        None, "--proxy",
+        help="Proxy de saida. Repita a flag (ou separe por virgula) para varios: o "
+        "extrator troca de proxy quando um IP e bloqueado. Ex: http://usuario:senha@host:8080, "
+        "host:porta, socks5://host:1080. 'direct' = conexao direta.",
+    ),
+    proxy_file: Path | None = typer.Option(
+        None, "--proxy-file",
+        help="Arquivo com um proxy por linha (ver 'proxy add'). Usado se --proxy nao for informado.",
+    ),
+    no_proxy: bool = typer.Option(
+        False, "--no-proxy",
+        help="Conexao direta: ignora --proxy-file e as variaveis HTTP_PROXY/HTTPS_PROXY.",
+    ),
+    max_block_wait: float = typer.Option(
+        7200.0, "--max-block-wait", min=0.0, max=86400.0,
+        help="Espera maxima (s) por UM bloqueio do servidor. O extrator aguarda o ban "
+        "acabar e continua sozinho; acima deste limite ele para com o progresso salvo.",
+    ),
+    debug: bool = typer.Option(False, "--debug", help="Verbose: ativa DEBUG logging."),
+    quiet: bool = typer.Option(False, "--quiet", "-q", help="Silencia output (so erros + summary)."),
+) -> None:
+    """Retoma, completa ou atualiza um job EXISTENTE sem redigitar a URL.
+
+    A URL inicial e lida do manifest.json do job. Sem --output-dir, procura
+    jobs em output/ e na pasta atual e pergunta qual usar.
+    """
+    console = get_console()
+    mode = mode.strip().lower()
+    if mode not in _RESUME_MODES:
+        console.print(
+            f"[bold red]Modo invalido:[/bold red] {mode!r}. Use: {', '.join(_RESUME_MODES)}."
+        )
+        raise typer.Exit(2)
+
+    if output_dir is None:
+        include_complete = mode in ("update", "regenerate")
+        found = find_jobs(JOB_ROOTS, include_complete=include_complete)
+        if not found:
+            console.print(
+                "[yellow]Nenhum job "
+                + ("" if include_complete else "pendente ")
+                + "encontrado em output/ nem na pasta atual.[/yellow]\n"
+                "Use a opcao [2] do menu para iniciar um trabalho novo, ou informe a "
+                "pasta de um job guardado em outro lugar."
+            )
+        titles = {
+            "auto": "Jobs incompletos",
+            "retry-failed": "Jobs com paginas faltando",
+            "update": "Jobs existentes (verificar atualizacoes)",
+            "regenerate": "Jobs existentes (regenerar todos os PDFs)",
+        }
+        output_dir = _pick_job(console, found, titles[mode])
+        if output_dir is None:
+            console.print("Nada a fazer.")
+            raise typer.Exit(EXIT_NOTHING_TO_DO)
+
+    manifest_path = output_dir / MANIFEST_FILENAME
+    if not manifest_path.exists():
+        console.print(
+            f"[bold red]manifest.json nao encontrado em {output_dir}.[/bold red] "
+            "Esta pasta nao contem um job; use a opcao [2] para iniciar um novo."
+        )
+        raise typer.Exit(1)
+    try:
+        with manifest_path.open("r", encoding="utf-8") as fp:
+            data = json.load(fp)
+    except (OSError, ValueError) as exc:
+        console.print(f"[red]Erro ao ler manifest: {exc}[/red]")
+        raise typer.Exit(1)
+
+    try:
+        validated_url = validate_start_url(str(data.get("start_url", "")))
+    except InvalidStartUrlError as exc:
+        console.print(f"[bold red]URL inicial invalida no manifest:[/bold red] {exc}")
+        raise typer.Exit(2)
+
+    exits = _resolve_network_exits(console, proxy, proxy_file, no_proxy)
+    crawl_complete = bool(data.get("crawl_complete")) and bool(data.get("mapped_urls"))
+    # retry-failed pula o mapeamento; se ele nao terminou, retoma normalmente
+    # (primeiro completa o mapa, depois exporta o que falta).
+    retry_failed_only = mode == "retry-failed" and crawl_complete
+    max_pages = data.get("crawl_max_pages")
+    max_pages = max_pages if isinstance(max_pages, int) and max_pages > 0 else None
+
+    console.print(
+        f"[bold]Job:[/bold] {output_dir}  |  [bold]Modo:[/bold] {mode}\n"
+        f"[bold]URL:[/bold] {validated_url}"
+    )
+    rate_limit = RateLimitConfig(
+        base_delay_seconds=request_delay,
+        backoff_initial_seconds=backoff_initial,
+        backoff_max_seconds=backoff_max,
+        max_block_wait_seconds=max_block_wait,
+    )
+    exit_code = _launch_pdf_run(
+        console,
+        start_url=validated_url,
+        output_dir=output_dir,
+        consolidated_name=_resolve_consolidated_name(console, consolidated_name, data, output_dir),
+        headless=headless,
+        timeout_seconds=timeout_seconds,
+        max_pages=max_pages,
+        slow_threshold_seconds=slow_threshold_seconds,
+        auto_confirm=True,
+        force_recrawl=mode in ("update", "regenerate"),
+        force_reexport=mode == "regenerate",
+        rate_limit=rate_limit,
+        max_workers=max_workers,
+        dry_run=False,
+        debug=debug,
+        retry_failed_only=retry_failed_only,
+        quiet=quiet,
+        proxies=exits,
+    )
     raise typer.Exit(exit_code)
 
 
@@ -768,6 +1391,7 @@ async def markdown_pipeline(
     dry_run: bool = False,
     debug: bool = False,
     quiet: bool = False,
+    proxies: list[str | None] | None = None,
 ) -> int:
     pages_dir, log_file = ensure_output_dirs(output_dir)
     correlation_id = generate_correlation_id()
@@ -789,12 +1413,24 @@ async def markdown_pipeline(
         console.print(f"[bold red]Lock conflict:[/bold red] {exc}")
         return 2
     try:
+        pool = _build_pool(proxies, proxy)
         return await _markdown_pipeline_inner(
             start_url, output_dir, consolidated_name, headless, timeout_seconds,
             max_pages, slow_threshold_seconds, auto_confirm, force_recrawl,
             force_reexport, rate_limit, proxy, dry_run,
-            pages_dir, log_file, logger, console,
+            pages_dir, log_file, logger, console, pool,
         )
+    except BlockedTooLongError as exc:
+        logger.error("Run interrompido: %s", exc)
+        _print_blocked_panel(console, exc, output_dir)
+        return EXIT_INCOMPLETE
+    except AllProxiesDeadError as exc:
+        logger.error("Run interrompido: %s", exc)
+        console.print(f"\n[bold red]Proxies indisponiveis:[/bold red] {exc}")
+        return EXIT_INCOMPLETE
+    except ProxyConfigError as exc:
+        console.print(f"[bold red]Proxy invalido:[/bold red] {exc}")
+        return 2
     finally:
         job_lock.release()
 
@@ -803,13 +1439,21 @@ async def _markdown_pipeline_inner(
     start_url, output_dir, consolidated_name, headless, timeout_seconds,
     max_pages, slow_threshold_seconds, auto_confirm, force_recrawl,
     force_reexport, rate_limit, proxy, dry_run,
-    pages_dir, log_file, logger, console,
+    pages_dir, log_file, logger, console, pool=None,
 ) -> int:
     """Pipeline interno (encapsulado no lock): crawl (reusado) + export Markdown + merge."""
     timeout_ms = timeout_seconds * 1000
     pipeline_start = time.monotonic()
+    if pool is None:
+        pool = _build_pool(None, proxy)
 
     checkpoint = _setup_checkpoint(output_dir, start_url, pages_dir, logger)
+    if checkpoint.previous_start_url:
+        return _abort_start_url_mismatch(
+            console, logger, output_dir, start_url, checkpoint.previous_start_url,
+        )
+    if checkpoint.manifest.start_url and checkpoint.manifest.start_url != start_url:
+        start_url = checkpoint.manifest.start_url
     resume_active = bool(
         checkpoint.manifest.crawl_complete and checkpoint.manifest.mapped_urls
     )
@@ -846,13 +1490,18 @@ async def _markdown_pipeline_inner(
         )
 
     # Compartilha RateLimiter entre crawl e export (cooldown propaga entre fases).
-    shared_limiter = RateLimiter(rate_limit)
+    shared_limiter = RateLimiter(rate_limit, logger)
     state_path = storage_state_path(output_dir)
-    if proxy:
-        logger.info("Proxy configurado: %s", sanitize_proxy_for_log(proxy))
+    if len(pool) > 1:
+        logger.info(
+            "Saidas de rede (%d, com rodizio em bloqueio): %s",
+            len(pool), ", ".join(pool.labels()),
+        )
+    elif pool.current:
+        logger.info("Proxy configurado: %s", pool.current_label)
 
     try:
-        urls, slow_crawl = await crawl_confluence_tree(
+        crawl = await crawl_confluence_tree(
             start_url=start_url,
             checkpoint=checkpoint,
             logger=logger,
@@ -866,10 +1515,12 @@ async def _markdown_pipeline_inner(
             limiter=shared_limiter,
             state_path=state_path,
             proxy=proxy,
+            pool=pool,
         )
     except KeyboardInterrupt:
         logger.warning("Crawl interrompido pelo usuario (Ctrl+C).")
         raise
+    urls, slow_crawl = crawl.urls, crawl.slow_records
 
     if not urls:
         logger.error("Nenhuma pagina foi encontrada a partir da URL inicial.")
@@ -897,6 +1548,7 @@ async def _markdown_pipeline_inner(
             limiter=shared_limiter,
             state_path=state_path,
             proxy=proxy,
+            pool=pool,
         )
     except KeyboardInterrupt:
         logger.warning("Exportacao Markdown interrompida pelo usuario (Ctrl+C).")
@@ -928,9 +1580,17 @@ async def _markdown_pipeline_inner(
         format_duration(total_elapsed),
     )
 
+    incomplete = bool(failures) or not crawl.complete
     failures_line = (
-        f"\n[bold red]Falhas:[/bold red] {len(failures)} (veja run.log)" if failures else ""
+        f"\n[bold red]Falhas:[/bold red] {len(failures)} pagina(s) ficaram de fora "
+        "(veja run.log). Rode o mesmo comando de novo para gerar so as que faltam."
+        if failures else ""
     )
+    if not crawl.complete:
+        failures_line += (
+            f"\n[bold red]Mapeamento incompleto[/bold red] ({crawl.note}): "
+            "rode de novo para retomar."
+        )
     slow_line = f"\n[bold]Slow log:[/bold] {slow_log_path}" if slow_log_path else ""
     console.print(
         f"\n[bold green]Concluido:[/bold green] {len(md_entries)}/{len(urls)} paginas "
@@ -940,7 +1600,9 @@ async def _markdown_pipeline_inner(
         f"{slow_line}{failures_line}"
     )
 
-    return 0 if consolidated_path else 2
+    if not consolidated_path:
+        return 2
+    return EXIT_INCOMPLETE if incomplete else 0
 
 
 @app.command(name="markdown")
@@ -980,8 +1642,19 @@ def markdown_cmd(
     backoff_max: float = typer.Option(
         900.0, min=60.0, max=7200.0, help="Teto do cooldown apos bloqueios sucessivos.",
     ),
-    proxy: str | None = typer.Option(
-        None, help="HTTP/SOCKS proxy. Ex: http://host:8080. Fallback: env HTTP_PROXY/HTTPS_PROXY.",
+    proxy: list[str] | None = typer.Option(
+        None, "--proxy",
+        help="Proxy de saida. Repita a flag (ou separe por virgula) para varios.",
+    ),
+    proxy_file: Path | None = typer.Option(
+        None, "--proxy-file", help="Arquivo com um proxy por linha.",
+    ),
+    no_proxy: bool = typer.Option(
+        False, "--no-proxy", help="Conexao direta: ignora arquivo e variaveis de ambiente.",
+    ),
+    max_block_wait: float = typer.Option(
+        7200.0, "--max-block-wait", min=0.0, max=86400.0,
+        help="Espera maxima (s) por um bloqueio do servidor antes de parar.",
     ),
     dry_run: bool = typer.Option(
         False, "--dry-run", help="Mapeia a arvore mas nao exporta Markdown.",
@@ -1036,6 +1709,8 @@ def markdown_cmd(
         console.print("[red]Cancelado por falta de espaco.[/red]")
         raise typer.Exit(2)
 
+    exits = _resolve_network_exits(console, proxy, proxy_file, no_proxy)
+
     force_recrawl = update or regenerate
     force_reexport = regenerate
 
@@ -1043,6 +1718,7 @@ def markdown_cmd(
         base_delay_seconds=request_delay,
         backoff_initial_seconds=backoff_initial,
         backoff_max_seconds=backoff_max,
+        max_block_wait_seconds=max_block_wait,
     )
 
     try:
@@ -1059,7 +1735,7 @@ def markdown_cmd(
                 force_recrawl=force_recrawl,
                 force_reexport=force_reexport,
                 rate_limit=rate_limit,
-                proxy=proxy,
+                proxies=exits,
                 dry_run=dry_run,
                 debug=debug,
                 quiet=quiet,
@@ -1085,11 +1761,12 @@ def _suggest_action_for_error(console, exc: BaseException) -> None:
     if any(k in msg for k in ("522", "523", "524", "429", "cloudflare")):
         console.print(
             "\n[bold yellow]Acao sugerida:[/bold yellow] o servidor TDN esta bloqueando "
-            "(rate limit/Cloudflare).\n"
-            "  1. Espere 15-60 minutos antes de tentar de novo.\n"
-            "  2. Aumente --request-delay para 5.0 ou mais (ex: --request-delay 5).\n"
-            "  3. Reduza --max-workers para 1.\n"
-            "  4. Use modo [Lento e seguro] no iniciar.bat.\n"
+            "este IP (rate limit do Cloudflare, erro 1015).\n"
+            "  1. Retome o job pela opcao [1] do menu: o extrator espera o bloqueio "
+            "acabar e continua de onde parou.\n"
+            "  2. Configure proxies na opcao [P]: com mais de uma saida de rede o "
+            "extrator troca de IP quando um e bloqueado.\n"
+            "  3. Se o bloqueio for frequente, aumente --request-delay (ex: 5).\n"
         )
     elif "playwright" in msg or "chromium" in msg or "browser" in msg:
         console.print(
@@ -1117,6 +1794,205 @@ def version() -> None:
     typer.echo(__version__)
 
 
+proxy_app = typer.Typer(
+    add_completion=False, no_args_is_help=True,
+    help="Gerencia a lista de proxies usada com --proxy-file (padrao: proxies.txt).",
+)
+app.add_typer(proxy_app, name="proxy")
+
+_PROXY_FILE_OPTION = typer.Option(
+    Path(PROXY_FILE_DEFAULT), "--file", help="Arquivo da lista de proxies.",
+)
+
+
+def _load_proxy_list_or_exit(console, file: Path) -> list[str | None]:
+    if not file.exists():
+        return []
+    try:
+        return load_proxy_file(file)
+    except ProxyConfigError as exc:
+        console.print(f"[bold red]Lista de proxies invalida:[/bold red] {exc}")
+        raise typer.Exit(2)
+
+
+@proxy_app.command("list")
+def proxy_list(file: Path = _PROXY_FILE_OPTION) -> None:
+    """Mostra os proxies configurados (credenciais mascaradas)."""
+    console = get_console()
+    exits = _load_proxy_list_or_exit(console, file)
+    if not exits:
+        console.print(
+            f"[yellow]Nenhum proxy configurado[/yellow] ({file} nao existe ou esta vazio). "
+            "O extrator usa a conexao direta."
+        )
+        return
+    table = Table(title=f"Proxies em {file}", border_style="cyan")
+    table.add_column("#", justify="right", style="bold cyan")
+    table.add_column("Saida de rede")
+    for i, item in enumerate(exits, start=1):
+        table.add_row(str(i), mask_proxy(item))
+    console.print(table)
+    if len(exits) > 1:
+        console.print("Com mais de uma saida, o extrator troca de IP quando uma e bloqueada.")
+
+
+@proxy_app.command("add")
+def proxy_add(
+    url: str | None = typer.Argument(
+        None, help="Proxy a adicionar. Se omitido, pergunta (evita problemas com caracteres especiais no terminal).",
+    ),
+    file: Path = _PROXY_FILE_OPTION,
+) -> None:
+    """Adiciona um proxy a lista. Aceita http://usuario:senha@host:porta, host:porta,
+    host:porta:usuario:senha, socks5://host:porta ou 'direct' (conexao direta)."""
+    console = get_console()
+    if url is None:
+        url = typer.prompt("Proxy (ex: http://usuario:senha@host:8080 ou host:porta)")
+    try:
+        normalized = normalize_proxy_url(url)
+    except ProxyConfigError as exc:
+        console.print(f"[bold red]Proxy invalido:[/bold red] {exc}")
+        raise typer.Exit(2)
+    if normalized is None and url.strip().lower() not in ("direct", "direto"):
+        console.print("[yellow]Nada informado.[/yellow]")
+        raise typer.Exit(0)
+    exits = _load_proxy_list_or_exit(console, file)
+    if normalized in exits:
+        console.print(f"[yellow]Ja estava na lista:[/yellow] {mask_proxy(normalized)}")
+        return
+    exits.append(normalized)
+    try:
+        save_proxy_file(file, exits)
+    except OSError as exc:
+        console.print(f"[red]Erro ao gravar {file}: {exc}[/red]")
+        raise typer.Exit(1)
+    console.print(
+        f"[green]Adicionado:[/green] {mask_proxy(normalized)}  "
+        f"({len(exits)} saida(s) em {file})"
+    )
+
+
+@proxy_app.command("clear")
+def proxy_clear(
+    file: Path = _PROXY_FILE_OPTION,
+    yes: bool = typer.Option(False, "--yes", "-y", help="Pula confirmacao."),
+) -> None:
+    """Remove a lista de proxies (o extrator volta a usar a conexao direta)."""
+    console = get_console()
+    if not file.exists():
+        console.print("[green]Nenhum proxy configurado.[/green]")
+        return
+    if not yes and sys.stdin.isatty() and not typer.confirm(f"Apagar {file}?", default=False):
+        console.print("Cancelado.")
+        return
+    try:
+        file.unlink()
+    except OSError as exc:
+        console.print(f"[red]Erro ao remover {file}: {exc}[/red]")
+        raise typer.Exit(1)
+    console.print("[green]Lista de proxies removida.[/green] Conexao direta em uso.")
+
+
+async def _probe_exits(exits: list[str | None], url: str, timeout_ms: int) -> list[dict]:
+    """Abre `url` por cada saida de rede e reporta status/IP visto pelo servidor."""
+    from playwright.async_api import Error as PlaywrightError  # noqa: PLC0415
+    from playwright.async_api import async_playwright  # noqa: PLC0415
+
+    from .blocking import classify_response, short_error  # noqa: PLC0415
+
+    results: list[dict] = []
+    async with async_playwright() as playwright:
+        for item in exits:
+            entry = {"exit": mask_proxy(item), "status": None, "ip": "", "detail": "", "ok": False}
+            started = time.monotonic()
+            browser = None
+            try:
+                launch_kwargs: dict = {"headless": True, "channel": "chromium"}
+                settings = to_playwright_proxy(item)
+                if settings:
+                    launch_kwargs["proxy"] = settings
+                browser = await playwright.chromium.launch(**launch_kwargs)
+                context = await browser.new_context(
+                    user_agent=chrome_user_agent(browser.version),
+                )
+                page = await context.new_page()
+                response = await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                status = response.status if response is not None else None
+                try:
+                    text = await response.text() if response is not None else ""
+                except PlaywrightError:
+                    text = ""
+                match = re.search(r"^ip=(.+)$", text, re.MULTILINE)
+                block = classify_response(status, response.headers if response else {}, body=text[:4000])
+                entry.update(
+                    status=status,
+                    ip=match.group(1).strip() if match else "",
+                    ok=status is not None and status < 400 and block is None,
+                    detail=block.describe() if block else "",
+                )
+            except PlaywrightError as exc:
+                entry["detail"] = short_error(exc)
+            finally:
+                if browser is not None:
+                    try:
+                        await browser.close()
+                    except PlaywrightError:
+                        pass
+            entry["seconds"] = round(time.monotonic() - started, 1)
+            results.append(entry)
+    return results
+
+
+@proxy_app.command("test")
+def proxy_test(
+    file: Path = _PROXY_FILE_OPTION,
+    url: str = typer.Option(
+        "https://tdn.totvs.com/cdn-cgi/trace", "--url",
+        help="Endereco aberto no teste (1 request por saida de rede).",
+    ),
+    timeout_seconds: int = typer.Option(30, min=5, max=120, help="Timeout por saida."),
+) -> None:
+    """Testa cada proxy da lista (e a conexao direta, se nao houver lista):
+    faz UM request por saida e mostra o status e o IP visto pelo servidor.
+
+    E um teste de CONECTIVIDADE: o endereco padrao e servido pela borda do
+    Cloudflare e pode responder 200 mesmo para um IP que esteja banido (erro
+    1015) nas paginas da documentacao.
+    """
+    console = get_console()
+    exits = _load_proxy_list_or_exit(console, file) or [None]
+    console.print(f"Testando {len(exits)} saida(s) de rede em {url} ...")
+    try:
+        results = asyncio.run(_probe_exits(exits, url, timeout_seconds * 1000))
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[bold red]Falha no teste:[/bold red] {exc}")
+        _suggest_action_for_error(console, exc)
+        raise typer.Exit(1)
+    table = Table(title="Teste das saidas de rede", border_style="cyan")
+    table.add_column("Saida")
+    table.add_column("Resultado")
+    table.add_column("HTTP", justify="right")
+    table.add_column("IP visto pelo servidor")
+    table.add_column("Tempo", justify="right")
+    table.add_column("Detalhe", overflow="fold")
+    for item in results:
+        table.add_row(
+            item["exit"],
+            "[green]OK[/green]" if item["ok"] else "[red]FALHOU[/red]",
+            str(item["status"] or "-"),
+            item["ip"] or "-",
+            f"{item['seconds']}s",
+            item["detail"],
+        )
+    console.print(table)
+    console.print(
+        "[dim]OK = a saida conecta e chega ao servidor. Este teste nao garante que o IP "
+        "esteja livre de bloqueio (erro 1015) nas paginas da documentacao.[/dim]"
+    )
+    if not all(item["ok"] for item in results):
+        raise typer.Exit(1)
+
+
 @app.command()
 def jobs(
     output_dir: Path = typer.Option(
@@ -1125,10 +2001,16 @@ def jobs(
     json_output: bool = typer.Option(
         False, "--json", help="Saida em JSON (para scripts/integracao).",
     ),
+    all_jobs: bool = typer.Option(
+        False, "--all", help="Lista tambem os jobs ja concluidos.",
+    ),
 ) -> None:
     """Lista jobs incompletos detectados em pastas com manifest.json."""
     console = get_console()
-    pending = find_pending_jobs(output_dir)
+    # Com a pasta padrao, procura tambem na pasta atual: um job criado fora de
+    # output/ (pasta digitada sem o prefixo) tambem precisa aparecer.
+    roots = list(JOB_ROOTS) if output_dir == Path("output") else [output_dir]
+    pending = find_jobs(roots, include_complete=all_jobs)
 
     if json_output:
         import json as _json
@@ -1149,33 +2031,12 @@ def jobs(
         console.print("[green]Nenhum job incompleto encontrado.[/green]")
         return
 
-    table = Table(
-        title=f"Jobs incompletos em {output_dir}/", border_style="yellow",
-    )
-    table.add_column("#", justify="right", style="bold cyan")
-    table.add_column("Pasta", style="bold")
-    table.add_column("URL", overflow="fold")
-    table.add_column("Mapeadas", justify="right")
-    table.add_column("Fila", justify="right")
-    table.add_column("PDFs", justify="right")
-    table.add_column("Falhas", justify="right", style="red")
-    table.add_column("Atualizado")
-    for i, job in enumerate(pending, start=1):
-        status = "" if job.crawl_complete else "[yellow](crawl incompleto)[/yellow] "
-        table.add_row(
-            str(i),
-            f"{status}{job.display_name}",
-            job.start_url,
-            str(job.mapped_count),
-            str(job.queue_count),
-            str(job.exported_count),
-            str(job.failure_count),
-            job.last_updated.replace("T", " ").replace("+00:00", "Z"),
-        )
-    console.print(table)
+    where = "output/ e na pasta atual" if len(roots) > 1 else f"{output_dir}/"
+    title = ("Jobs" if all_jobs else "Jobs incompletos") + f" em {where}"
+    console.print(_jobs_table(pending, title))
     console.print(
-        "\nPara continuar um job: rode novamente com a MESMA URL e --output-dir "
-        "apontando para a subpasta. O resume eh automatico."
+        "\nPara continuar um job: opcao [1] do menu, ou "
+        "`python -m src.main resume --output-dir <pasta>` (a URL e lida do job)."
     )
 
 
@@ -1334,6 +2195,92 @@ def failures(
     for attempts, error, ts, url in rows:
         table.add_row(str(attempts), error, ts, url)
     console.print(table)
+
+
+@app.command()
+def reexport(
+    pages: list[int] = typer.Argument(
+        ..., help="Numeros das paginas a refazer: o prefixo NNNN do arquivo em pages/ "
+        "(ex: 110 para 0110-titulo.pdf).",
+    ),
+    output_dir: Path = typer.Option(
+        Path("output"), "--output-dir", help="Pasta do job (com manifest.json).",
+    ),
+) -> None:
+    """Marca paginas ja exportadas para serem geradas de novo.
+
+    Para quando um PDF saiu incompleto (ex: sem imagens por causa de um
+    bloqueio em runs antigos). So o manifest e alterado, com backup: o PDF
+    atual fica no disco ate ser substituido. Depois use a opcao [F] do menu
+    (ou `resume --mode retry-failed`) para gera-las.
+    """
+    console = get_console()
+    manifest_path = output_dir / MANIFEST_FILENAME
+    if not manifest_path.exists():
+        console.print(f"[red]manifest.json nao encontrado em {output_dir}[/red]")
+        raise typer.Exit(1)
+    try:
+        with manifest_path.open("r", encoding="utf-8") as fp:
+            data = json.load(fp)
+    except (OSError, ValueError) as exc:
+        console.print(f"[red]Erro ao ler manifest: {exc}[/red]")
+        raise typer.Exit(1)
+
+    numbers = list(dict.fromkeys(pages))
+    invalid = [n for n in numbers if n < 1 or n > 9999]
+    if invalid:
+        console.print(
+            "[bold red]Numero(s) invalido(s):[/bold red] "
+            + ", ".join(str(n) for n in invalid)
+        )
+        raise typer.Exit(2)
+
+    job_lock = JobLock(output_dir)
+    try:
+        job_lock.acquire()
+    except JobLockError as exc:
+        console.print(f"[bold red]Lock conflict:[/bold red] {exc}")
+        raise typer.Exit(2)
+    marked: list[tuple[str, str]] = []
+    not_found: list[int] = []
+    try:
+        checkpoint = Checkpoint(output_dir, str(data.get("start_url", "")))
+        exported = checkpoint.manifest.exported
+        for number in numbers:
+            # O numero e o prefixo do ARQUIVO: apos um re-mapeamento a posicao
+            # da pagina no mapa pode ser outra, mas o nome do arquivo nao muda.
+            prefix = f"{number:04d}-"
+            keys = [
+                url for url, entry in exported.items()
+                if str((entry or {}).get("filename", "")).startswith(prefix)
+            ]
+            if not keys:
+                not_found.append(number)
+                continue
+            for key in keys:
+                marked.append((str(exported.pop(key).get("filename", "")), key))
+        if marked:
+            backup = checkpoint.backup()
+            checkpoint.save()
+            if backup:
+                console.print(f"[dim]Backup do manifest: {backup}[/dim]")
+    finally:
+        job_lock.release()
+
+    for number in not_found:
+        console.print(
+            f"[yellow]{number:04d}: nenhum PDF registrado com esse prefixo "
+            f"em {output_dir / 'pages'}.[/yellow]"
+        )
+    if not marked:
+        console.print("Nada foi alterado.")
+        raise typer.Exit(2)
+    for filename, url in marked:
+        console.print(f"  [cyan]{filename}[/cyan] sera gerado de novo\n      {url}")
+    console.print(
+        f"\n[green]{len(marked)} pagina(s) marcada(s).[/green] Agora use a opcao [F] do menu "
+        f"ou: python -m src.main resume --output-dir \"{output_dir}\" --mode retry-failed"
+    )
 
 
 def _backup_and_remove_manifest(manifest_path: Path, output_dir: Path, console) -> None:

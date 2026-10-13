@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -19,21 +18,27 @@ from rich.progress import (
     TimeElapsedColumn,
     TimeRemainingColumn,
 )
-from tenacity import (
-    retry,
-    retry_if_exception,
-    stop_after_attempt,
-    wait_exponential,
-)
 
+from .blocking import (
+    RATE_LIMIT,
+    SERVER_ERROR,
+    is_transient_network_error,
+    short_error,
+)
 from .browser import (
     BrowserSession,
+    classify_page_block,
+    get_page_stats,
     is_browser_alive as _is_browser_alive_helper,
     launch_browser_session as _launch_browser_session_helper,
     new_page as _new_page,
+    note_exit_failure,
+    relaunch_session,
+    rotate_exit_after_block,
     safe_close_page as _safe_close_page,
     teardown_session as _teardown_session,
 )
+from .proxy import ProxyPool
 from .utils import (
     Checkpoint,
     MAX_RETRY_ATTEMPTS,
@@ -47,7 +52,6 @@ from .utils import (
     get_console,
     get_free_disk_bytes,
     is_blocking_error,
-    is_cloudflare_challenge,
     is_valid_pdf,
     sha256_file,
 )
@@ -176,9 +180,40 @@ _REVEAL_JS = """
 }
 """
 
+# Tentativas por URL dentro do mesmo run. Um bloqueio (429/1015) e do IP, nao
+# da pagina: a MESMA URL e repetida depois do cooldown em vez de ser dada como
+# falha e trocada pela proxima (que herdaria o cooldown no lugar dela).
+_MAX_ATTEMPTS_PER_URL = 4
+# Repescagens ao final do export para paginas que ainda falharam.
+_FINAL_RETRY_ROUNDS = 2
+_RETRY_ROUND_ATTEMPTS = 2
+
+_OK = "ok"
+_BLOCKED = "blocked"      # rate limit / desafio / 5xx: esperar cooldown e repetir
+_TRANSIENT = "transient"  # erro de rede do cliente: pausa curta e repetir
+_FAILED = "failed"        # erro inesperado: repetir uma vez
+_TIMEOUT = "timeout"      # pagina estourou o orcamento: fica para a repescagem
+_PERMANENT = "permanent"  # login / HTTP 4xx: repetir agora nao resolve
+
 
 class TransientHTTPError(RuntimeError):
-    """HTTP 5xx que merece retry."""
+    """HTTP 5xx/429 que merece nova tentativa apos cooldown."""
+
+    def __init__(self, message: str, retry_after: float | None = None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+class RateLimitedError(TransientHTTPError):
+    """HTTP 429 / Cloudflare 1015 — na pagina ou em recursos dela (imagens)."""
+
+
+class TransientNetworkError(RuntimeError):
+    """Recursos da pagina falharam por erro de rede do lado do cliente."""
+
+
+class PageHTTPError(RuntimeError):
+    """A pagina respondeu HTTP 4xx (removida, restrita): repetir nao resolve."""
 
 
 class LoginPageError(RuntimeError):
@@ -186,7 +221,11 @@ class LoginPageError(RuntimeError):
 
 
 class CloudflareChallengeError(RuntimeError):
-    """Pagina retornou desafio do Cloudflare (anti-bot)."""
+    """Pagina retornou desafio/bloqueio do Cloudflare (anti-bot)."""
+
+    def __init__(self, message: str, retry_after: float | None = None):
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 @dataclass
@@ -201,6 +240,32 @@ class ExportConfig:
     max_workers: int = 1
     state_path: Path | None = None
     proxy: str | None = None
+    pool: ProxyPool | None = None
+
+
+@dataclass
+class ExportOutcome:
+    """Resultado de UMA tentativa de exportar uma URL."""
+    status: str
+    error: str = ""
+    retry_after: float | None = None
+    phase: str | None = None
+    elapsed: float = 0.0
+    # Login/desafio anti-bot: conta no circuit breaker de sessao.
+    session_failure: bool = False
+    # Erro de conexao na NAVEGACAO (pode ser o proxy fora do ar).
+    exit_failure: bool = False
+
+
+@dataclass
+class _PageSlot:
+    """Page em uso por um worker + a geracao da sessao em que foi criada.
+
+    Quando o browser e relancado (crash ou troca de proxy) a geracao muda e a
+    page antiga deixa de valer: o slot pede uma nova no context atual.
+    """
+    page: Page | None
+    generation: int
 
 
 @dataclass
@@ -208,9 +273,15 @@ class ExportAccumulators:
     pages_dir: Path
     checkpoint: Checkpoint
     used_names: set[str] = field(default_factory=set)
-    # (path, title)
-    exported: list[tuple[Path, str]] = field(default_factory=list)
-    failures: list[tuple[str, str]] = field(default_factory=list)
+    # indice na lista de URLs -> (path, title). Indexado para que o merge siga
+    # a ordem da arvore mesmo com workers paralelos, retries e repescagens.
+    exported: dict[int, tuple[Path, str]] = field(default_factory=dict)
+    # url -> ultimo erro. Removida se a pagina for exportada numa nova tentativa.
+    failures: dict[str, str] = field(default_factory=dict)
+    # URLs cuja falha nao melhora repetindo agora (login, HTTP 4xx).
+    permanent: set[str] = field(default_factory=set)
+    # url -> nome de arquivo ja alocado (mesmo nome em todas as tentativas).
+    names_by_url: dict[str, str] = field(default_factory=dict)
     slow_records: list[SlowPageRecord] = field(default_factory=list)
     # Lock para mutacoes em paralelo (used_names, exported, failures, slow_records,
     # consecutive_session_failures, abort_requested).
@@ -222,27 +293,18 @@ class ExportAccumulators:
     # quando a sessao/proteção fica em estado ruim e nao adianta seguir.
     consecutive_session_failures: int = 0
     abort_requested: bool = False
+    # Requests reais ao servidor nas paginas exportadas (diagnostico de ritmo).
+    requests_total: int = 0
+
+    def ordered_exports(self) -> list[tuple[Path, str]]:
+        return [self.exported[index] for index in sorted(self.exported)]
+
+    def failure_list(self) -> list[tuple[str, str]]:
+        return list(self.failures.items())
 
 
 # Apos N failures consecutivos do tipo login ou CF challenge, aborta o pipeline.
 _SESSION_FAILURE_CIRCUIT_BREAKER = 5
-
-
-def _is_retryable(exc: BaseException) -> bool:
-    if isinstance(exc, (PlaywrightTimeoutError, LoginPageError)):
-        return False
-    if isinstance(exc, TransientHTTPError):
-        return True
-    return isinstance(exc, PlaywrightError)
-
-
-async def _is_cf_challenge_page(page: Page) -> bool:
-    """Verifica se a pagina retornou desafio do Cloudflare."""
-    try:
-        content = await page.content()
-    except PlaywrightError:
-        return False
-    return is_cloudflare_challenge(content.lower())
 
 
 async def _is_login_page(page: Page) -> bool:
@@ -286,22 +348,24 @@ async def _is_login_page(page: Page) -> bool:
     return score >= _LOGIN_SCORE_THRESHOLD
 
 
-@retry(
-    stop=stop_after_attempt(2),
-    wait=wait_exponential(multiplier=1, min=2, max=8),
-    retry=retry_if_exception(_is_retryable),
-    reraise=True,
-)
 async def _goto_dom_ready(page: Page, url: str, timeout_ms: int) -> None:
+    """Navega ate o DOM pronto e levanta o erro certo para cada tipo de resposta.
+
+    Sem retry automatico aqui: repetir um 429 dois segundos depois so acerta
+    o servidor de novo DENTRO do ban. Quem decide repetir e o loop por URL,
+    sempre passando pelo cooldown do RateLimiter.
+    """
+    get_page_stats(page).begin(url)
     response = await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-    # 429 (rate limit) precisa do mesmo tratamento que 5xx: aciona o cooldown
-    # do RateLimiter via TransientHTTPError. Sem isso, o exporter cai no
-    # catch-all generico (que nao chama report_block) e continua martelando
-    # o servidor no intervalo base, ignorando o bloqueio sinalizado.
-    if response and (response.status >= 500 or response.status == 429):
-        raise TransientHTTPError(f"HTTP {response.status}")
-    if response and response.status >= 400:
-        raise RuntimeError(f"HTTP {response.status}")
+    block = await classify_page_block(page, response)
+    if block is not None:
+        if block.kind == RATE_LIMIT:
+            raise RateLimitedError(block.describe(), retry_after=block.retry_after)
+        if block.kind == SERVER_ERROR:
+            raise TransientHTTPError(f"HTTP {block.status}", retry_after=block.retry_after)
+        raise CloudflareChallengeError(block.describe(), retry_after=block.retry_after)
+    if response is not None and response.status >= 400:
+        raise PageHTTPError(f"HTTP {response.status}")
 
 
 async def _prepare_page_for_pdf(
@@ -335,6 +399,64 @@ async def _prepare_page_for_pdf(
         await page.emulate_media(media="print")
     except PlaywrightError:
         pass
+
+
+async def _verify_page_assets(page: Page, logger, url: str, lenient: bool = False) -> None:
+    """Confere se os recursos da pagina carregaram ANTES de imprimir o PDF.
+
+    O HTML pode chegar com 200 e as imagens da mesma pagina ja serem
+    respondidas com 429: o rate limit estoura no meio do carregamento. Sem
+    esta checagem o PDF e gravado sem os prints de tela e registrado como
+    sucesso, e nenhum resume o refaz.
+
+      * HTTP 429 em qualquer recurso  -> RateLimitedError (cooldown + repete).
+        Nunca e tolerado.
+      * HTTP 5xx em imagem/CSS/fonte, ou queda de conexao no meio do download
+        -> TransientNetworkError: pausa curta e repete, SEM acionar o cooldown
+        de rate limit (nao e bloqueio do IP). Com lenient=True vira so aviso:
+        pode ser uma imagem quebrada na propria documentacao, e perder a
+        pagina inteira por causa dela seria pior.
+    """
+    stats = get_page_stats(page)
+    rate_limited = [item for item in stats.blocked if item[1] == 429]
+    if rate_limited:
+        raise RateLimitedError(
+            f"{len(rate_limited)} recurso(s) da pagina bloqueados com HTTP 429",
+            retry_after=stats.retry_after(),
+        )
+
+    problems: list[str] = []
+    server_errors = [item for item in stats.blocked if item[1] != 429]
+    if server_errors:
+        statuses = "/".join(sorted({str(status) for _u, status, _r in server_errors}))
+        problems.append(f"{len(server_errors)} recurso(s) da pagina com HTTP {statuses}")
+    # So quedas reais de rede contam; net::ERR_FAILED generico (CORS, bloqueio
+    # do proprio browser) acontece em paginas perfeitamente carregadas.
+    dropped = [
+        item for item in stats.failed
+        if is_transient_network_error(Exception(item[1]))
+    ]
+    if dropped:
+        problems.append(
+            f"{len(dropped)} imagem(ns)/estilo(s) falharam por erro de rede ({dropped[0][1]})"
+        )
+    if problems:
+        message = "; ".join(problems)
+        if not lenient:
+            raise TransientNetworkError(message)
+        logger.warning("%s em %s (PDF gerado mesmo assim).", message, url)
+
+    try:
+        broken = await page.evaluate(
+            "() => Array.from(document.images).filter("
+            "i => i.complete && i.naturalWidth === 0 && i.getAttribute('src')).length"
+        )
+    except PlaywrightError:
+        broken = 0
+    if broken:
+        logger.warning(
+            "%d imagem(ns) quebrada(s) na origem em %s (o PDF sai sem elas).", broken, url,
+        )
 
 
 async def _validate_generated_pdf(pdf_path: Path, max_retries: int = 8) -> int:
@@ -376,20 +498,35 @@ async def _validate_generated_pdf(pdf_path: Path, max_retries: int = 8) -> int:
     raise RuntimeError(f"PDF gerado nao e valido: {last_error}")
 
 
+
 async def _allocate_filename(
-    index: int, title: str, acc: ExportAccumulators,
+    index: int, title: str, acc: ExportAccumulators, url: str | None = None,
 ) -> str:
-    """Aloca nome de arquivo unico de forma thread-safe (com lock)."""
+    """Aloca nome de arquivo unico de forma thread-safe (com lock).
+
+    A mesma URL recebe sempre o mesmo nome dentro do run: uma nova tentativa
+    sobrescreve o arquivo da anterior em vez de criar "...-2.pdf".
+    """
     async with acc.lock:
-        file_name = build_pdf_file_name(index, title, acc.used_names)
+        if url is not None and url in acc.names_by_url:
+            return acc.names_by_url[url]
+        # Pagina que ja tem PDF registrado (--regenerate): regrava o MESMO
+        # arquivo. Um nome novo (o indice muda quando o mapa muda) deixaria o
+        # PDF antigo orfao na pasta.
+        existing = acc.checkpoint.get_exported_entry(url) if url is not None else None
+        file_name = str((existing or {}).get("filename") or "")
+        if not file_name or file_name in acc.used_names:
+            file_name = build_pdf_file_name(index, title, acc.used_names)
         acc.used_names.add(file_name)
+        if url is not None:
+            acc.names_by_url[url] = file_name
     return file_name
 
 
 async def _record_export_result(
     url: str, pdf_path: Path, title: str, file_name: str,
     size_bytes: int, elapsed_total: float, acc: ExportAccumulators, cfg: ExportConfig,
-    logger,
+    logger, index: int = 0,
 ) -> None:
     """Registra um PDF exportado com sucesso (thread-safe + integridade).
 
@@ -407,7 +544,9 @@ async def _record_export_result(
         pdf_hash = None
 
     async with acc.lock:
-        acc.exported.append((pdf_path, title))
+        acc.exported[index] = (pdf_path, title)
+        acc.failures.pop(url, None)
+        acc.permanent.discard(url)
         acc.checkpoint.record_export(
             url=url, filename=file_name, title=title,
             size_bytes=size_bytes, elapsed_seconds=elapsed_total,
@@ -426,16 +565,25 @@ async def _record_export_result(
 
 async def _record_export_failure(
     url: str, error: str, acc: ExportAccumulators, phase: str | None = None,
-    elapsed: float = 0.0,
+    elapsed: float = 0.0, permanent: bool = False,
 ) -> None:
-    """Registra falha de export (thread-safe)."""
+    """Registra a falha FINAL de uma URL neste passe (thread-safe).
+
+    Chamado so depois de esgotadas as tentativas da URL — um bloqueio que foi
+    resolvido repetindo a pagina nao aparece em failures.
+    """
     async with acc.lock:
-        acc.failures.append((url, error))
+        first_time = url not in acc.failures
+        acc.failures[url] = error
+        if permanent:
+            acc.permanent.add(url)
         if phase:
             acc.slow_records.append(
                 SlowPageRecord(url=url, elapsed_seconds=elapsed, phase=phase)
             )
-    acc.checkpoint.record_failure(url, error)
+    # Uma tentativa por run no manifest (repescagens nao inflam o contador).
+    if first_time:
+        acc.checkpoint.record_failure(url, error)
 
 
 async def _check_disk_or_abort(acc: ExportAccumulators, logger) -> None:
@@ -513,27 +661,41 @@ async def _generate_pdf(
         raise
 
 
+
+async def _fresh_page(page: Page | None, session: BrowserSession, cfg: ExportConfig) -> Page | None:
+    """Troca a page (estado incerto apos erro). None se o browser morreu ou foi
+    trocado: o slot cria outra na proxima tentativa."""
+    await _safe_close_page(page)
+    async with session.rotation_lock:
+        try:
+            return await _new_page(session.context, cfg.timeout_ms)
+        except (PlaywrightError, AttributeError):
+            return None
+
+
 async def _export_one(
     page: Page,
-    context,
+    session: BrowserSession,
     url: str,
     index: int,
     total: int,
     acc: ExportAccumulators,
     cfg: ExportConfig,
     logger,
-    limiter: RateLimiter,
-) -> Page:
-    """Exporta uma URL. Retorna a page (possivelmente recriada). Erros vao para acc.failures."""
+    lenient_assets: bool = False,
+) -> tuple[Page | None, ExportOutcome]:
+    """UMA tentativa de exportar a URL. Retorna (page, resultado).
+
+    Nao registra falha nem aciona cooldown: classifica o que aconteceu e
+    devolve para _export_with_retries decidir (esperar e repetir, ou desistir).
+    """
     page_start = time.monotonic()
+
+    def elapsed() -> float:
+        return time.monotonic() - page_start
+
     try:
         await _goto_dom_ready(page, url, cfg.dom_budget_ms)
-
-        # Detecta Cloudflare challenge antes de checar login (CF intercepta tudo)
-        if await _is_cf_challenge_page(page):
-            raise CloudflareChallengeError(
-                "Cloudflare challenge detectado — provavel rate limit"
-            )
 
         if await _is_login_page(page):
             raise LoginPageError(
@@ -541,6 +703,7 @@ async def _export_one(
             )
 
         await _prepare_page_for_pdf(page, page_start, cfg.timeout_ms, logger, url)
+        await _verify_page_assets(page, logger, url, lenient=lenient_assets)
 
         try:
             title = await page.title()
@@ -549,74 +712,229 @@ async def _export_one(
         if not title:
             title = f"pagina-{index}"
 
-        file_name = await _allocate_filename(index, title, acc)
+        file_name = await _allocate_filename(index, title, acc, url=url)
         pdf_path = acc.pages_dir / file_name
         size_bytes = await _generate_pdf(page, pdf_path)
-        elapsed_total = time.monotonic() - page_start
+        elapsed_total = elapsed()
 
         await _record_export_result(
             url, pdf_path, title, file_name, size_bytes, elapsed_total, acc, cfg, logger,
+            index=index,
         )
-        await limiter.report_success()
+        requests = get_page_stats(page).requests
         async with acc.lock:
             acc.consecutive_session_failures = 0  # sucesso reseta circuit breaker
+            acc.requests_total += requests
         logger.info(
-            "PDF gerado (%s/%s) em %.1fs (%.1f KB): %s",
-            index, total, elapsed_total, size_bytes / 1024, file_name,
+            "PDF gerado (%s/%s) em %.1fs (%.1f KB, %d requests): %s",
+            index, total, elapsed_total, size_bytes / 1024, requests, file_name,
         )
-        return page
+        return page, ExportOutcome(_OK, elapsed=elapsed_total)
 
     except LoginPageError as exc:
         logger.error("Login detectado em %s: %s", url, exc)
-        await _record_export_failure(url, "Pagina de login (Confluence privado)", acc)
-        await _bump_session_failures(acc, logger)
-        return page
+        return page, ExportOutcome(
+            _PERMANENT, "Pagina de login (Confluence privado)", elapsed=elapsed(),
+            session_failure=True,
+        )
+
+    except RateLimitedError as exc:
+        logger.warning("Rate limit em %s apos %.1fs: %s", url, elapsed(), exc)
+        outcome = ExportOutcome(
+            _BLOCKED, str(exc), retry_after=exc.retry_after, elapsed=elapsed(),
+        )
 
     except CloudflareChallengeError as exc:
-        elapsed = time.monotonic() - page_start
-        logger.error("Cloudflare challenge em %s: %s", url, exc)
-        await _record_export_failure(
-            url, "Cloudflare challenge (anti-bot ativo)", acc,
-            phase="pdf-cf-challenge", elapsed=elapsed,
+        logger.error("Bloqueio do Cloudflare em %s: %s", url, exc)
+        outcome = ExportOutcome(
+            _BLOCKED, f"Cloudflare: {exc}", retry_after=exc.retry_after,
+            phase="pdf-cf-challenge", elapsed=elapsed(), session_failure=True,
         )
-        # CF challenge = sinal forte de bloqueio. Aciona cooldown longo.
-        await limiter.report_block(logger, "Cloudflare challenge")
-        await _bump_session_failures(acc, logger)
-        await _safe_close_page(page)
-        return await _new_page(context, cfg.timeout_ms)
-
-    except PlaywrightTimeoutError:
-        elapsed = time.monotonic() - page_start
-        msg = f"TIMEOUT apos {elapsed:.1f}s (limite {cfg.timeout_ms/1000:.0f}s)"
-        logger.error("%s: %s", msg, url)
-        await _record_export_failure(url, msg, acc, phase="pdf-timeout", elapsed=elapsed)
-        await limiter.report_block(logger, "timeout no PDF")
-        await _safe_close_page(page)
-        return await _new_page(context, cfg.timeout_ms)
-
-    except PlaywrightError as exc:
-        elapsed = time.monotonic() - page_start
-        logger.error("Erro Playwright em %s apos %.1fs: %s", url, elapsed, exc)
-        await _record_export_failure(url, str(exc), acc)
-        if is_blocking_error(exc):
-            await limiter.report_block(logger, f"Playwright: {exc}")
-        await _safe_close_page(page)
-        return await _new_page(context, cfg.timeout_ms)
 
     except TransientHTTPError as exc:
-        elapsed = time.monotonic() - page_start
-        logger.error("HTTP transitorio em %s apos %.1fs: %s", url, elapsed, exc)
-        await _record_export_failure(url, str(exc), acc)
-        await limiter.report_block(logger, str(exc))
-        await _safe_close_page(page)
-        return await _new_page(context, cfg.timeout_ms)
+        logger.warning("HTTP transitorio em %s apos %.1fs: %s", url, elapsed(), exc)
+        outcome = ExportOutcome(
+            _BLOCKED, str(exc), retry_after=exc.retry_after, elapsed=elapsed(),
+        )
+
+    except TransientNetworkError as exc:
+        logger.warning("Erro de rede em %s apos %.1fs: %s", url, elapsed(), exc)
+        outcome = ExportOutcome(_TRANSIENT, str(exc), elapsed=elapsed())
+
+    except PageHTTPError as exc:
+        logger.error("%s ao abrir %s", exc, url)
+        return page, ExportOutcome(_PERMANENT, str(exc), elapsed=elapsed())
+
+    except PlaywrightTimeoutError:
+        msg = f"TIMEOUT apos {elapsed():.1f}s (limite {cfg.timeout_ms/1000:.0f}s)"
+        logger.error("%s: %s", msg, url)
+        outcome = ExportOutcome(_TIMEOUT, msg, phase="pdf-timeout", elapsed=elapsed())
+
+    except PlaywrightError as exc:
+        logger.error(
+            "Erro Playwright em %s apos %.1fs: %s", url, elapsed(), short_error(exc),
+        )
+        transient = is_transient_network_error(exc) or is_blocking_error(exc)
+        outcome = ExportOutcome(
+            _TRANSIENT if transient else _FAILED, short_error(exc), elapsed=elapsed(),
+            exit_failure=transient,
+        )
 
     except Exception as exc:  # noqa: BLE001
-        elapsed = time.monotonic() - page_start
-        logger.exception("Erro ao gerar PDF de %s apos %.1fs", url, elapsed)
-        await _record_export_failure(url, str(exc), acc)
-        await _safe_close_page(page)
-        return await _new_page(context, cfg.timeout_ms)
+        logger.exception("Erro ao gerar PDF de %s apos %.1fs", url, elapsed())
+        outcome = ExportOutcome(_FAILED, str(exc) or type(exc).__name__, elapsed=elapsed())
+
+    return await _fresh_page(page, session, cfg), outcome
+
+
+async def _slot_page(
+    slot: _PageSlot, session: BrowserSession, cfg: ExportConfig, adopt: bool = False,
+) -> Page:
+    """Devolve uma page utilizavel para o slot (recria se a sessao mudou).
+
+    Segura session.rotation_lock: a troca de browser (rodizio de proxy ou
+    recovery de crash) fecha o context antigo e so depois publica o novo;
+    criar page nesse intervalo falharia com "context has been closed".
+
+    adopt=True (modo sequencial): apos um relancamento usa a page que ja veio
+    com a nova sessao em vez de abrir outra.
+    """
+    async with session.rotation_lock:
+        stale = slot.generation != session.generation
+        closed = slot.page is None
+        if not closed and not stale:
+            try:
+                closed = slot.page.is_closed()
+            except PlaywrightError:
+                closed = True
+        if stale or closed:
+            if not stale:
+                await _safe_close_page(slot.page)
+            reusable = session.page if (adopt and stale) else None
+            try:
+                usable = reusable is not None and not reusable.is_closed()
+            except PlaywrightError:
+                usable = False
+            slot.page = reusable if usable else await _new_page(session.context, cfg.timeout_ms)
+            slot.generation = session.generation
+        return slot.page
+
+
+# Tentativas extras quando a page morre por causa de um relancamento do
+# browser feito por OUTRO worker (nao e falha da URL).
+_MAX_RELAUNCH_REPLAYS = 6
+
+
+async def _export_with_retries(
+    slot: _PageSlot,
+    session: BrowserSession,
+    url: str,
+    index: int,
+    total: int,
+    acc: ExportAccumulators,
+    cfg: ExportConfig,
+    logger,
+    limiter: RateLimiter,
+    max_attempts: int = _MAX_ATTEMPTS_PER_URL,
+    adopt_session_page: bool = False,
+) -> bool:
+    """Exporta a URL repetindo-a apos bloqueios/erros transitorios. True se gerou o PDF.
+
+    Bloqueio (429/1015/5xx/desafio): registra no limiter (que usa o Retry-After
+    do servidor), troca de proxy se houver outro livre e repete a MESMA URL —
+    limiter.wait() so libera depois do cooldown. Erro de rede: pausa curta e
+    repete. Login/HTTP 4xx/timeout: nao repete agora.
+    """
+    outcome = ExportOutcome(_FAILED, "nao processada")
+    attempt = 0
+    replays = 0
+    while attempt < max_attempts:
+        if acc.abort_requested:
+            if attempt == 0:
+                return False  # nem chegou a ser tentada: fica como pendente
+            break
+        attempt += 1
+        await _ensure_browser_alive(session, session.playwright, cfg, logger, acc)
+        await limiter.wait()
+        try:
+            page = await _slot_page(slot, session, cfg, adopt=adopt_session_page)
+        except PlaywrightError as exc:
+            # Browser caiu entre a checagem e a criacao da page: tenta de novo.
+            outcome = ExportOutcome(_FAILED, short_error(exc))
+            slot.page = None
+            replays += 1
+            if replays <= _MAX_RELAUNCH_REPLAYS:
+                attempt -= 1
+            continue
+        started_at = time.monotonic()
+        generation = session.generation
+        last_attempt = attempt >= max_attempts
+        slot.page, outcome = await _export_one(
+            page, session, url, index, total, acc, cfg, logger,
+            # A partir da 3a tentativa, problema em sub-recurso que NAO e rate
+            # limit vira aviso (imagem quebrada na origem nao pode custar a pagina).
+            lenient_assets=attempt >= 3 or last_attempt,
+        )
+        limiter.mark_done()
+
+        if outcome.status == _OK:
+            await limiter.report_success()
+            if session.pool is not None:
+                session.pool.mark_ok()
+            return True
+
+        if (
+            outcome.status in (_FAILED, _TRANSIENT)
+            and session.generation != generation
+            and replays < _MAX_RELAUNCH_REPLAYS
+        ):
+            # O browser foi relancado por outro worker (troca de proxy) no meio
+            # desta pagina: nao e falha da URL, repete sem gastar tentativa.
+            replays += 1
+            attempt -= 1
+            continue
+
+        if outcome.session_failure:
+            await _bump_session_failures(acc, logger)
+
+        if outcome.status == _BLOCKED:
+            cooldown = await limiter.report_block(
+                logger, outcome.error, retry_after=outcome.retry_after,
+                started_at=started_at,
+            )
+            await rotate_exit_after_block(
+                session, limiter, cooldown, logger, generation=generation,
+            )
+            if not last_attempt:
+                logger.info(
+                    "Pagina %s/%s sera repetida apos o bloqueio (tentativa %d/%d).",
+                    index, total, attempt + 1, max_attempts,
+                )
+            continue
+
+        if outcome.status in (_TRANSIENT, _FAILED):
+            if outcome.exit_failure:
+                await note_exit_failure(session, logger)
+            if last_attempt or (outcome.status == _FAILED and attempt >= 2):
+                break
+            pause = min(20.0, 4.0 * attempt)
+            logger.info(
+                "Pagina %s/%s sera repetida em %.0fs (tentativa %d/%d).",
+                index, total, pause, attempt + 1, max_attempts,
+            )
+            await asyncio.sleep(pause)
+            continue
+
+        if outcome.status == _TIMEOUT:
+            # Pagina pesada ou servidor lento: desacelera e deixa para a repescagem.
+            await limiter.report_block(logger, "timeout no PDF", started_at=started_at)
+        break
+
+    await _record_export_failure(
+        url, outcome.error, acc, phase=outcome.phase, elapsed=outcome.elapsed,
+        permanent=outcome.status == _PERMANENT,
+    )
+    return False
 
 
 def _expand_urls_with_retries(
@@ -662,12 +980,15 @@ async def export_pages_to_pdf(
     limiter: RateLimiter | None = None,
     state_path: Path | None = None,
     proxy: str | None = None,
+    pool: ProxyPool | None = None,
 ) -> tuple[list[tuple[Path, str]], list[tuple[str, str]], list[SlowPageRecord]]:
     """Exporta URLs para PDF. Retorna (exported_entries, failures, slow_records).
 
-    exported_entries: list of (path, title) tuples (para passar ao merger).
+    exported_entries: list of (path, title) tuples NA ORDEM de `urls` (para o
+    merger), mesmo com workers paralelos e paginas geradas em repescagem.
     Usa checkpoint para skip de URLs ja exportadas em runs anteriores.
-    URLs com failures de runs anteriores sao re-tentadas (ate MAX_RETRY_ATTEMPTS).
+    Paginas bloqueadas sao repetidas no proprio run; as que ainda falharem
+    passam por repescagens antes de retornar.
     """
     pages_dir, _ = ensure_output_dirs(output_dir)
     # DOM tem ate metade do orcamento, capado em 120s (paginas TDN pesadas).
@@ -684,6 +1005,7 @@ async def export_pages_to_pdf(
         max_workers=max(1, max_workers),
         state_path=state_path,
         proxy=proxy,
+        pool=pool,
     )
     acc = ExportAccumulators(pages_dir=pages_dir, checkpoint=checkpoint)
 
@@ -713,42 +1035,40 @@ async def export_pages_to_pdf(
             )
 
     # Reutiliza limiter se fornecido (preserva cooldown de fase anterior).
-    active_limiter = limiter if limiter is not None else RateLimiter(cfg.rate_limit)
-    limiter = active_limiter  # alias para nao quebrar usos internos abaixo
+    active_limiter = limiter if limiter is not None else RateLimiter(cfg.rate_limit, logger)
 
-    async with async_playwright() as playwright:
-        if cfg.max_workers > 1:
-            await _run_parallel(
-                playwright, urls, total, acc, cfg, logger, console, limiter,
-            )
-        else:
+    try:
+        async with async_playwright() as playwright:
             session = await _launch_browser_session(
                 playwright, headless, timeout_ms, logger,
-                state_path=state_path, proxy=proxy,
+                state_path=state_path, proxy=proxy, pool=pool, block_extras=True,
             )
             try:
-                await _run_export_loop(
-                    session, urls, total, playwright, acc, cfg, logger, console, limiter,
+                await _run_export(
+                    session, urls, total, acc, cfg, logger, console, active_limiter,
                 )
                 await _safe_close_page(session.page)
             finally:
                 await _teardown_session(session, logger)
+    finally:
+        # Grava o que ja foi exportado mesmo em Ctrl+C/erro: sem isto ate 19
+        # PDFs prontos ficavam fora do manifest e eram baixados de novo.
+        try:
+            checkpoint.flush()
+        except OSError as exc:
+            logger.warning("Falha ao gravar manifest ao final do export: %s", exc)
 
-    return acc.exported, acc.failures, acc.slow_records
+    if acc.exported:
+        logger.info(
+            "Export: %d pagina(s) geradas neste run com %d requests ao servidor.",
+            sum(1 for u in urls if u in acc.names_by_url and u not in acc.failures),
+            acc.requests_total,
+        )
+    return acc.ordered_exports(), acc.failure_list(), acc.slow_records
 
 
-async def _run_export_loop(
-    session: BrowserSession,
-    urls: list[str],
-    total: int,
-    playwright,
-    acc: ExportAccumulators,
-    cfg: ExportConfig,
-    logger,
-    console,
-    limiter: RateLimiter,
-) -> None:
-    progress = Progress(
+def _new_progress(console) -> Progress:
+    return Progress(
         SpinnerColumn(),
         TextColumn("[bold green]{task.description}"),
         BarColumn(bar_width=None),
@@ -761,24 +1081,9 @@ async def _run_export_loop(
         transient=False,
     )
 
-    with progress:
-        task = progress.add_task("Gerando PDFs", total=total)
-        for index, url in enumerate(urls, start=1):
-            if acc.abort_requested:
-                logger.warning("Export interrompido por circuit breaker.")
-                break
-            # Check de disco periodico: aborta antes de gerar PDF que vai falhar
-            if index % _DISK_CHECK_EVERY_N == 0:
-                await _check_disk_or_abort(acc, logger)
-            await _process_export_iteration(
-                session, url, index, total, playwright, acc, cfg, logger,
-                progress, task, limiter,
-            )
-            progress.advance(task)
 
-
-async def _run_parallel(
-    playwright,
+async def _run_export(
+    session: BrowserSession,
     urls: list[str],
     total: int,
     acc: ExportAccumulators,
@@ -786,57 +1091,161 @@ async def _run_parallel(
     logger,
     console,
     limiter: RateLimiter,
+) -> None:
+    """Passe principal + repescagens das paginas que falharam."""
+    items = list(enumerate(urls, start=1))
+    with _new_progress(console) as progress:
+        task = progress.add_task("Gerando PDFs", total=total)
+        await _run_pass(
+            session, items, total, acc, cfg, logger, progress, task, limiter,
+            max_attempts=_MAX_ATTEMPTS_PER_URL,
+        )
+
+        for round_number in range(1, _FINAL_RETRY_ROUNDS + 1):
+            pending = [
+                (index, url) for index, url in items
+                if url in acc.failures and url not in acc.permanent
+            ]
+            if not pending or acc.abort_requested:
+                break
+            logger.info(
+                "Repescagem %d/%d: %d pagina(s) que falharam serao tentadas de novo.",
+                round_number, _FINAL_RETRY_ROUNDS, len(pending),
+            )
+            retry_task = progress.add_task(
+                f"Repescagem {round_number}", total=len(pending),
+            )
+            await _run_pass(
+                session, pending, total, acc, cfg, logger, progress, retry_task, limiter,
+                max_attempts=_RETRY_ROUND_ATTEMPTS,
+            )
+
+
+async def _run_pass(
+    session: BrowserSession,
+    items: list[tuple[int, str]],
+    total: int,
+    acc: ExportAccumulators,
+    cfg: ExportConfig,
+    logger,
+    progress,
+    task,
+    limiter: RateLimiter,
+    max_attempts: int,
+) -> None:
+    if cfg.max_workers > 1 and len(items) > 1:
+        await _run_parallel(
+            session, items, total, acc, cfg, logger, progress, task, limiter,
+            max_attempts,
+        )
+    else:
+        await _run_export_loop(
+            session, items, total, acc, cfg, logger, progress, task, limiter,
+            max_attempts,
+        )
+
+
+async def _run_export_loop(
+    session: BrowserSession,
+    items: list[tuple[int, str]],
+    total: int,
+    acc: ExportAccumulators,
+    cfg: ExportConfig,
+    logger,
+    progress,
+    task,
+    limiter: RateLimiter,
+    max_attempts: int,
+) -> None:
+    slot = _PageSlot(page=session.page, generation=session.generation)
+    processed = 0
+    for index, url in items:
+        if acc.abort_requested:
+            logger.warning("Export interrompido por circuit breaker.")
+            break
+        # Check de disco periodico: aborta antes de gerar PDF que vai falhar
+        if index % _DISK_CHECK_EVERY_N == 0:
+            await _check_disk_or_abort(acc, logger)
+        short_url = url if len(url) <= 60 else url[:57] + "..."
+
+        if not cfg.force_reexport and acc.checkpoint.is_exported(url, acc.pages_dir):
+            await _resume_existing(url, short_url, index, total, acc, progress, task)
+            progress.advance(task)
+            continue
+
+        progress.update(task, description=f"PDF {index}/{total}: {short_url}")
+        if processed and processed % _PAGE_ROTATION_INTERVAL == 0:
+            logger.info("Rotacionando pagina apos %s URLs", processed)
+            await _safe_close_page(slot.page)
+            slot.page = None
+        await _export_with_retries(
+            slot, session, url, index, total, acc, cfg, logger, limiter,
+            max_attempts=max_attempts, adopt_session_page=True,
+        )
+        session.page = slot.page
+        processed += 1
+        progress.advance(task)
+    session.page = slot.page
+
+
+async def _run_parallel(
+    session: BrowserSession,
+    items: list[tuple[int, str]],
+    total: int,
+    acc: ExportAccumulators,
+    cfg: ExportConfig,
+    logger,
+    progress,
+    task,
+    limiter: RateLimiter,
+    max_attempts: int,
 ) -> None:
     """Paralelizacao com N workers, cada um com sua propria page.
 
     Compartilham 1 browser + 1 context para manter cookies/sessao. Cada worker
     consome URLs de uma fila comum. O limiter serializa o intervalo entre
-    requests entre todos os workers.
+    requests entre todos os workers: sob rate limit por IP, mais workers NAO
+    aumentam o ritmo permitido — so adiantam a renderizacao.
     """
-    session = await _launch_browser_session(
-        playwright, cfg.headless, cfg.timeout_ms, logger,
-        state_path=cfg.state_path, proxy=cfg.proxy,
-    )
     queue: asyncio.Queue[tuple[int, str] | None] = asyncio.Queue()
-    for idx, url in enumerate(urls, start=1):
-        queue.put_nowait((idx, url))
-    for _ in range(cfg.max_workers):
+    for item in items:
+        queue.put_nowait(item)
+    workers_count = min(cfg.max_workers, len(items))
+    for _ in range(workers_count):
         queue.put_nowait(None)  # sentinela para cada worker
 
-    progress = Progress(
-        SpinnerColumn(),
-        TextColumn("[bold green]{task.description}"),
-        BarColumn(bar_width=None),
-        MofNCompleteColumn(),
-        TextColumn("|"),
-        TimeElapsedColumn(),
-        TextColumn("|"),
-        TimeRemainingColumn(),
-        console=console,
-        transient=False,
-    )
-    try:
-        with progress:
-            task = progress.add_task(
-                f"Gerando PDFs (workers={cfg.max_workers})", total=total,
+    progress.update(task, description=f"Gerando PDFs (workers={workers_count})")
+    workers = [
+        asyncio.create_task(
+            _worker_loop(
+                wid, session, queue, total, acc, cfg, logger, limiter, progress, task,
+                max_attempts,
             )
-            workers = [
-                asyncio.create_task(
-                    _worker_loop(
-                        wid, session.context, queue, total,
-                        acc, cfg, logger, limiter, progress, task,
-                    )
-                )
-                for wid in range(cfg.max_workers)
-            ]
-            await asyncio.gather(*workers)
-    finally:
-        await _teardown_session(session, logger)
+        )
+        for wid in range(workers_count)
+    ]
+    # Erro fatal em um worker (ban acima do limite, proxies esgotados, Ctrl+C):
+    # para os demais em vez de deixa-los seguir ate esvaziar a fila.
+    try:
+        done, pending = await asyncio.wait(workers, return_when=asyncio.FIRST_EXCEPTION)
+    except BaseException:
+        # Ctrl+C/cancelamento chega aqui (na task principal): os workers nao
+        # podem continuar usando o browser enquanto ele e encerrado.
+        for worker in workers:
+            worker.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
+        raise
+    failed = next((t for t in done if not t.cancelled() and t.exception() is not None), None)
+    if failed is not None:
+        for worker in pending:
+            worker.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        raise failed.exception()
 
 
 async def _worker_loop(
     worker_id: int,
-    context,
+    session: BrowserSession,
     queue: asyncio.Queue,
     total: int,
     acc: ExportAccumulators,
@@ -845,107 +1254,47 @@ async def _worker_loop(
     limiter: RateLimiter,
     progress,
     task,
+    max_attempts: int,
 ) -> None:
     """Loop de um worker paralelo: pega URL da fila, exporta, repete."""
-    page = await _new_page(context, cfg.timeout_ms)
+    slot = _PageSlot(page=None, generation=session.generation)
     processed = 0
     try:
         while True:
-            if acc.abort_requested:
-                break
             item = await queue.get()  # propaga CancelledError naturalmente
             try:
                 if item is None:
                     break
+                if acc.abort_requested:
+                    continue  # esvazia a fila sem processar
                 index, url = item
-                try:
-                    page = await _process_worker_item(
-                        page, context, url, index, total, acc, cfg, logger,
-                        progress, task, limiter, worker_id,
+                short_url = url if len(url) <= 50 else url[:47] + "..."
+                if not cfg.force_reexport and acc.checkpoint.is_exported(url, acc.pages_dir):
+                    await _resume_existing(url, short_url, index, total, acc, progress, task)
+                else:
+                    progress.update(
+                        task, description=f"W{worker_id} {index}/{total}: {short_url}",
                     )
-                except Exception:  # noqa: BLE001
-                    # Erro inesperado em um item nao deve matar o worker
-                    logger.exception(
-                        "Worker %d: erro inesperado ao processar URL %s",
-                        worker_id, url,
+                    await _export_with_retries(
+                        slot, session, url, index, total, acc, cfg, logger, limiter,
+                        max_attempts=max_attempts,
                     )
+                    processed += 1
+                    # Rotacao periodica para liberar memoria
+                    if processed % _PAGE_ROTATION_INTERVAL == 0:
+                        logger.info(
+                            "Worker %d: rotacionando page apos %d URLs",
+                            worker_id, processed,
+                        )
+                        await _safe_close_page(slot.page)
+                        slot.page = None
                 progress.advance(task)
-                processed += 1
-                # Rotacao periodica para liberar memoria
-                if processed % _PAGE_ROTATION_INTERVAL == 0:
-                    logger.info(
-                        "Worker %d: rotacionando page apos %d URLs",
-                        worker_id, processed,
-                    )
-                    await _safe_close_page(page)
-                    page = await _new_page(context, cfg.timeout_ms)
             finally:
                 # Sempre marca task_done — sem isto, queue.join() trava forever
                 queue.task_done()
     finally:
-        await _safe_close_page(page)
-
-
-async def _process_worker_item(
-    page: Page,
-    context,
-    url: str,
-    index: int,
-    total: int,
-    acc: ExportAccumulators,
-    cfg: ExportConfig,
-    logger,
-    progress,
-    task,
-    limiter: RateLimiter,
-    worker_id: int,
-) -> Page:
-    """Processa uma URL no worker. Retorna a page atual (possivelmente nova)."""
-    short_url = url if len(url) <= 50 else url[:47] + "..."
-
-    if not cfg.force_reexport and acc.checkpoint.is_exported(url, acc.pages_dir):
-        await _resume_existing(url, short_url, index, total, acc, progress, task)
-        return page
-
-    progress.update(
-        task,
-        description=f"W{worker_id} {index}/{total}: {short_url}",
-    )
-    await limiter.wait()
-    return await _export_one(
-        page, context, url, index, total, acc, cfg, logger, limiter,
-    )
-
-
-async def _process_export_iteration(
-    session: BrowserSession,
-    url: str,
-    index: int,
-    total: int,
-    playwright,
-    acc: ExportAccumulators,
-    cfg: ExportConfig,
-    logger,
-    progress,
-    task,
-    limiter: RateLimiter,
-) -> None:
-    """Processa uma URL: resume, recovery de browser, rotacao, export."""
-    short_url = url if len(url) <= 60 else url[:57] + "..."
-
-    if not cfg.force_reexport and acc.checkpoint.is_exported(url, acc.pages_dir):
-        await _resume_existing(url, short_url, index, total, acc, progress, task)
-        return
-
-    progress.update(task, description=f"PDF {index}/{total}: {short_url}")
-
-    await _ensure_browser_alive(session, playwright, cfg, logger)
-    await _maybe_rotate_page(session, index, cfg, logger)
-    await limiter.wait()
-
-    session.page = await _export_one(
-        session.page, session.context, url, index, total, acc, cfg, logger, limiter,
-    )
+        if slot.generation == session.generation:
+            await _safe_close_page(slot.page)
 
 
 async def _resume_existing(
@@ -961,7 +1310,7 @@ async def _resume_existing(
     filename = entry.get("filename", "")
     title = entry.get("title", "")
     async with acc.lock:
-        acc.exported.append((acc.pages_dir / filename, title))
+        acc.exported[index] = (acc.pages_dir / filename, title)
         if filename:
             acc.used_names.add(filename)
     progress.update(
@@ -970,7 +1319,7 @@ async def _resume_existing(
 
 
 async def _ensure_browser_alive(
-    session: BrowserSession, playwright, cfg: ExportConfig, logger,
+    session: BrowserSession, playwright, cfg, logger,
     acc: ExportAccumulators | None = None,
 ) -> None:
     """Verifica e relanca browser se morreu. Usa lock se acc fornecido (paralelo).
@@ -993,26 +1342,21 @@ async def _ensure_browser_alive(
 
 
 async def _do_browser_recovery(
-    session: BrowserSession, playwright, cfg: ExportConfig, logger,
+    session: BrowserSession, playwright, cfg, logger,
 ) -> None:
-    """Executa o relancamento do browser (sem lock — caller decide)."""
-    logger.warning("Browser desconectou. Relancando...")
-    try:
-        if session.browser is not None:
-            await session.browser.close()
-    except PlaywrightError:
-        pass
-    new_session = await _launch_browser_session(
-        playwright, cfg.headless, cfg.timeout_ms, logger,
-        state_path=session.state_path, proxy=cfg.proxy,
-    )
-    session.browser = new_session.browser
-    session.context = new_session.context
-    session.page = new_session.page
+    """Relanca o browser. Serializado com a troca de proxy (rotation_lock):
+    as duas operacoes substituem browser/context da mesma sessao."""
+    async with session.rotation_lock:
+        if _is_browser_alive(session):
+            return  # outro worker ja relancou (ou trocou de proxy) enquanto esperavamos
+        logger.warning("Browser desconectou. Relancando...")
+        if session.playwright is None:
+            session.playwright = playwright
+        await relaunch_session(session, logger)
 
 
 async def _maybe_rotate_page(
-    session: BrowserSession, index: int, cfg: ExportConfig, logger,
+    session: BrowserSession, index: int, cfg, logger,
 ) -> None:
     if index <= 1 or (index - 1) % _PAGE_ROTATION_INTERVAL != 0:
         return

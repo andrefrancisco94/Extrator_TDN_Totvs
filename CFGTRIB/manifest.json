@@ -2,7 +2,7 @@
   "version": 2,
   "start_url": "https://tdn.totvs.com/display/public/PROT/CFGTRIB+-+Configurador+de+Tributos+-+P12",
   "started_at": "2026-10-13T13:52:27+00:00",
-  "last_updated": "2026-10-13T14:33:52+00:00",
+  "last_updated": "2026-10-13T16:37:28+00:00",
   "crawl_complete": true,
   "crawl_max_pages": null,
   "mapped_urls": [
@@ -987,49 +987,65 @@
       "size_bytes": 95735,
       "elapsed_seconds": 1.2961863999953493,
       "sha256": "91af92ee4e1396ae1a5b11c662f243892fc41f48c07998f7601071567dea47cc"
+    },
+    "https://tdn.totvs.com/pages/viewpage.action?pageId=676039354": {
+      "filename": "0008-cfgtrib-calculos-no-configurador-de-tributos-linha-microsiga-protheus-tdn.pdf",
+      "title": "CFGTRIB - Cálculos no Configurador de Tributos - Linha Microsiga Protheus - TDN",
+      "size_bytes": 131877,
+      "elapsed_seconds": 1.6299309999449179,
+      "sha256": "3aee25765595e4ac1b98d82c5a2feba9818291aea6ded5329d82eac9bbaaa5ff"
+    },
+    "https://tdn.totvs.com/pages/viewpage.action?pageId=906853167": {
+      "filename": "0009-cfgtrib-campos-do-cadastro-de-tipos-de-entrada-e-saida-descontinuados-e-8039c063.pdf",
+      "title": "CFGTRIB - Campos do cadastro de Tipos de Entrada e Saída descontinuados em favor do Configurador de Tributos - Linha Microsiga Protheus - TDN",
+      "size_bytes": 88819,
+      "elapsed_seconds": 0.685237199999392,
+      "sha256": "7354a3986e2db8d1f1b4f658a13b6624f428e846479781a045ec8eabca1bde7f"
+    },
+    "https://tdn.totvs.com/pages/viewpage.action?pageId=966220651": {
+      "filename": "0017-cfgtrib-guia-pratico-configurador-de-tributos-linha-microsiga-protheus-tdn.pdf",
+      "title": "CFGTRIB - Guia Prático Configurador de Tributos - Linha Microsiga Protheus - TDN",
+      "size_bytes": 85946,
+      "elapsed_seconds": 0.8030563000356779,
+      "sha256": "dcf0773f77feb34385ce282988b163b5769c560823864103e88bf9f61b67c297"
+    },
+    "https://tdn.totvs.com/pages/viewpage.action?pageId=877863294": {
+      "filename": "0026-cfgtrib-simulador-de-operacao-linha-microsiga-protheus-tdn.pdf",
+      "title": "CFGTRIB - Simulador de Operação - Linha Microsiga Protheus - TDN",
+      "size_bytes": 1254613,
+      "elapsed_seconds": 1.9795424999902025,
+      "sha256": "2a4987629af838d8e27e54b8cccd15e4d3bd7375ea1f13617df8024d3b0f6589"
+    },
+    "https://tdn.totvs.com/pages/viewpage.action?pageId=899211548": {
+      "filename": "0036-cfgtrib-fundos-e-contribuicoes-calculos-no-configurador-de-tributos-lin-e4eebb33.pdf",
+      "title": "CFGTRIB - Fundos e Contribuições - Cálculos no Configurador de Tributos - Linha Microsiga Protheus - TDN",
+      "size_bytes": 86397,
+      "elapsed_seconds": 0.7503224000101909,
+      "sha256": "d948f2e1db1488939c31e684533d414478a8c76567eebea63bcbc8641b3ba728"
+    },
+    "https://tdn.totvs.com/display/public/PROT/6.+Perfis": {
+      "filename": "0051-6-perfis-linha-microsiga-protheus-tdn.pdf",
+      "title": "6. Perfis - Linha Microsiga Protheus - TDN",
+      "size_bytes": 2060975,
+      "elapsed_seconds": 7.061345999944024,
+      "sha256": "4a776d2ffe6360a9d25ba96cb54494ee1a27385541063641d134b991e1ebc084"
+    },
+    "https://tdn.totvs.com/pages/viewpage.action?pageId=747332379": {
+      "filename": "0070-cfgtrib-credito-presumido-de-icms-linha-microsiga-protheus-tdn.pdf",
+      "title": "CFGTRIB - Crédito Presumido de ICMS - Linha Microsiga Protheus - TDN",
+      "size_bytes": 352034,
+      "elapsed_seconds": 2.0766927000368014,
+      "sha256": "952f02bf543fa5b284d9d82c1f1a259c993934a85aceeafde99164f114a7faff"
+    },
+    "https://tdn.totvs.com/pages/viewpage.action?pageId=819065304": {
+      "filename": "0080-cfgtrib-antecipacao-tributaria-icms-st-ricms-sp-2000-linha-microsiga-pr-1094c9a1.pdf",
+      "title": "CFGTRIB - Antecipação Tributária ICMS-ST RICMS-SP/2000 - Linha Microsiga Protheus - TDN",
+      "size_bytes": 1257980,
+      "elapsed_seconds": 5.130020000040531,
+      "sha256": "baad5daf0e34377d1742a0c5bbc2b145140b10ad31de9cf0daf0f1c102f90377"
     }
   },
   "failures": {
-    "https://tdn.totvs.com/pages/viewpage.action?pageId=676039354": {
-      "error": "HTTP 429",
-      "attempts": 1,
-      "last_attempt": "2026-10-13T14:21:36+00:00"
-    },
-    "https://tdn.totvs.com/pages/viewpage.action?pageId=906853167": {
-      "error": "HTTP 429",
-      "attempts": 1,
-      "last_attempt": "2026-10-13T14:22:13+00:00"
-    },
-    "https://tdn.totvs.com/pages/viewpage.action?pageId=966220651": {
-      "error": "HTTP 429",
-      "attempts": 1,
-      "last_attempt": "2026-10-13T14:23:53+00:00"
-    },
-    "https://tdn.totvs.com/pages/viewpage.action?pageId=877863294": {
-      "error": "HTTP 429",
-      "attempts": 1,
-      "last_attempt": "2026-10-13T14:24:43+00:00"
-    },
-    "https://tdn.totvs.com/pages/viewpage.action?pageId=899211548": {
-      "error": "HTTP 429",
-      "attempts": 1,
-      "last_attempt": "2026-10-13T14:25:52+00:00"
-    },
-    "https://tdn.totvs.com/display/public/PROT/6.+Perfis": {
-      "error": "HTTP 429",
-      "attempts": 1,
-      "last_attempt": "2026-10-13T14:27:02+00:00"
-    },
-    "https://tdn.totvs.com/pages/viewpage.action?pageId=747332379": {
-      "error": "Page.goto: net::ERR_NETWORK_ACCESS_DENIED at https://tdn.totvs.com/pages/viewpage.action?pageId=747332379\nCall log:\n  - navigating to \"https://tdn.totvs.com/pages/viewpage.action?pageId=747332379\", waiting until \"domcontentloaded\"\n",
-      "attempts": 1,
-      "last_attempt": "2026-10-13T14:29:02+00:00"
-    },
-    "https://tdn.totvs.com/pages/viewpage.action?pageId=819065304": {
-      "error": "HTTP 429",
-      "attempts": 1,
-      "last_attempt": "2026-10-13T14:29:37+00:00"
-    },
     "https://tdn.totvs.com/pages/viewpage.action?pageId=883676152": {
       "error": "HTTP 429",
       "attempts": 1,
@@ -1041,5 +1057,8 @@
       "last_attempt": "2026-10-13T14:31:45+00:00"
     }
   },
-  "exported_md": {}
+  "exported_md": {},
+  "page_ids": {},
+  "consolidated_name": "TDN_TOTVS_consolidado.pdf",
+  "crawl_leaves": []
 }

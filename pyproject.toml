@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "extrator-tdn-totvs"
-version = "0.10.0"
+version = "0.11.0"
 description = "Extrator de documentação Confluence/TDN TOTVS para PDF consolidado"
 authors = [{name = "Andre", email = "andre.fco94@gmail.com"}]
 license = {text = "MIT"}
@@ -56,6 +56,10 @@ addopts = [
     "-v",
     "--strict-markers",
     "--tb=short",
+    "-m", "not e2e",
+]
+markers = [
+    "e2e: ponta a ponta contra um Confluence falso local (precisa do Chromium; rode com `pytest -m e2e`)",
 ]
 filterwarnings = [
     "ignore::DeprecationWarning",

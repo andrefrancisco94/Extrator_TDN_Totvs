@@ -11,7 +11,7 @@ import threading
 import time
 import unicodedata
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
 from urllib.parse import parse_qs, urlparse, urlunparse
@@ -19,6 +19,8 @@ from urllib.parse import parse_qs, urlparse, urlunparse
 import colorama
 from rich.console import Console
 from rich.logging import RichHandler
+
+from .blocking import error_headline, short_error
 
 colorama.just_fix_windows_console()
 
@@ -30,6 +32,10 @@ STORAGE_STATE_FILENAME = "browser_state.json"
 # Maximo de tentativas por URL antes de desistir definitivamente. URLs em
 # failures com attempts < este valor sao re-enqueuadas no proximo run.
 MAX_RETRY_ATTEMPTS = 5
+
+# Prefixo do erro gravado em failures quando o crawl desiste de listar os
+# filhos de uma pagina (distingue de falhas de exportacao).
+CRAWL_GIVEUP_PREFIX = "crawl timeout"
 
 # Intervalo de rotacao de pagina Playwright (compartilhado entre crawler/exporter
 # para evitar memory leak em runs longos)
@@ -96,82 +102,227 @@ class RateLimitConfig:
     backoff_max_seconds: float = 900.0  # 15min teto
     backoff_multiplier: float = 2.0
     jitter_ratio: float = 0.2
+    # Ritmo adaptativo: cada bloqueio multiplica o intervalo entre requests
+    # (ate o teto); uma sequencia de sucessos o reduz devagar ate o base.
+    # Sem isto o extrator volta ao MESMO ritmo que acabou de ser bloqueado.
+    adaptive_multiplier: float = 2.0
+    adaptive_max_delay_seconds: float = 20.0
+    adaptive_recover_after: int = 12
+    adaptive_recover_factor: float = 0.8
+    # Folga somada ao Retry-After informado pelo servidor.
+    retry_after_margin_seconds: float = 2.0
+    # Espera maxima por UM bloqueio. Acima disso o run para de forma limpa
+    # (progresso salvo) em vez de dormir por horas.
+    max_block_wait_seconds: float = 7200.0
+
+
+class BlockedTooLongError(RuntimeError):
+    """O servidor impos um bloqueio mais longo que max_block_wait_seconds."""
+
+    def __init__(self, seconds: float):
+        self.seconds = seconds
+        super().__init__(
+            f"IP bloqueado pelo servidor por mais {format_duration(seconds)} "
+            "(acima do limite de espera configurado)."
+        )
 
 
 class RateLimiter:
-    """Throttle adaptativo: delay base entre requests + cooldown crescente em bloqueios.
+    """Throttle adaptativo: intervalo entre requests + cooldown em bloqueios.
 
     Uso:
-        await limiter.wait()           # antes de cada request
-        limiter.report_success()       # apos request bem-sucedido
-        await limiter.report_block(logger)  # apos 5xx/429/timeout consecutivo
+        await limiter.wait()                 # antes de cada request
+        limiter.mark_done()                  # ao terminar o trabalho da pagina
+        await limiter.report_success()       # apos request bem-sucedido
+        await limiter.report_block(logger, retry_after=segundos)  # apos 429/5xx
+
+    Comportamento:
+      * Retry-After do servidor, quando existe, define o cooldown exato. Sem
+        ele, usa backoff exponencial (30s, 60s, ... ate o teto).
+      * Cada bloqueio aumenta o intervalo entre requests; sucessos seguidos o
+        reduzem aos poucos (AIMD). O ritmo converge para logo abaixo do limite
+        do servidor em vez de bater na mesma parede a cada N paginas.
+      * wait() nunca libera um request dentro de um cooldown, mesmo que o
+        bloqueio tenha sido reportado enquanto ele ja estava dormindo.
 
     Thread-safe entre coroutines via asyncio.Lock. Nao protege contra threads,
     so contra concorrencia cooperativa de asyncio.
     """
 
-    def __init__(self, config: RateLimitConfig):
+    def __init__(self, config: RateLimitConfig, logger=None):
         self.config = config
+        self.logger = logger
         self._lock = asyncio.Lock()
         self._last_request_at: float = 0.0
         self._consecutive_blocks: int = 0
         self._cooldown_until: float = 0.0
+        self._last_block_at: float = float("-inf")
+        # Quando o cooldown foi substituido de fora (troca de proxy).
+        self._cooldown_overridden_at: float = float("-inf")
+        self._current_delay: float = max(0.0, config.base_delay_seconds)
+        self._success_streak: int = 0
+        # Metricas do run (mostradas no resumo final).
+        self.total_blocks: int = 0
+        self.total_wait_seconds: float = 0.0
+
+    @property
+    def current_delay(self) -> float:
+        """Intervalo atual entre requests (>= base_delay_seconds)."""
+        return self._current_delay
+
+    def cooldown_remaining(self) -> float:
+        return max(0.0, self._cooldown_until - time.monotonic())
 
     async def wait(self) -> None:
         """Bloqueia ate ser seguro fazer o proximo request.
 
-        IMPORTANTE: o lock so eh segurado para reservar o slot temporal
-        (atualizar _last_request_at e calcular sleep). O asyncio.sleep
-        em si acontece FORA do lock para permitir que outros workers
-        avancem em paralelo respeitando suas proprias reservas.
-        """
-        async with self._lock:
-            now = time.monotonic()
-            cooldown_sleep = max(0.0, self._cooldown_until - now)
-            # Calcula tempo desde o ultimo request reservado
-            elapsed_since_reserved = now - self._last_request_at
-            jitter = 1.0 + random.uniform(
-                -self.config.jitter_ratio, self.config.jitter_ratio,
-            )
-            target_delay = max(0.0, self.config.base_delay_seconds * jitter)
-            base_sleep = max(0.0, target_delay - elapsed_since_reserved)
-            # Reserva o slot: marca o tempo em que este request VAI ocorrer
-            total_sleep = cooldown_sleep + base_sleep
-            self._last_request_at = now + total_sleep
+        O lock so e segurado para reservar o slot temporal; o sleep acontece
+        fora dele. O slot e um instante ABSOLUTO (maior entre agora, fim do
+        cooldown e ultimo slot + intervalo): varios workers esperando o mesmo
+        cooldown saem em fila, espacados pelo intervalo, sem somar o cooldown
+        uma vez por worker. Ao acordar, re-checa o cooldown: se outro worker
+        reportou bloqueio nesse meio tempo, volta a esperar.
 
-        if total_sleep > 0:
-            await asyncio.sleep(total_sleep)
+        Levanta BlockedTooLongError se a espera exigida passar do limite.
+        """
+        while True:
+            async with self._lock:
+                now = time.monotonic()
+                jitter = 1.0 + random.uniform(
+                    -self.config.jitter_ratio, self.config.jitter_ratio,
+                )
+                target_delay = max(0.0, self._current_delay * jitter)
+                slot = max(now, self._cooldown_until, self._last_request_at + target_delay)
+                total_sleep = slot - now
+                cooldown_part = max(0.0, self._cooldown_until - now)
+                if cooldown_part > self.config.max_block_wait_seconds:
+                    raise BlockedTooLongError(cooldown_part)
+                self._last_request_at = slot
+
+            if total_sleep <= 0:
+                return
+            await self._sleep(total_sleep, announce=cooldown_part >= 60.0)
+            self.total_wait_seconds += total_sleep
+            if time.monotonic() >= self._cooldown_until:
+                return
+
+    async def _sleep(self, seconds: float, announce: bool) -> None:
+        """Dorme `seconds`. Em esperas longas avisa o horario de retomada e da
+        sinal de vida a cada 5 min (senao parece que o programa travou)."""
+        if not announce or self.logger is None:
+            await asyncio.sleep(seconds)
+            return
+        resume_at = datetime.now() + timedelta(seconds=seconds)
+        self.logger.warning(
+            "Aguardando %s ate o bloqueio expirar (retoma as %s). "
+            "Ctrl+C interrompe com seguranca: o progresso esta salvo.",
+            format_duration(seconds), resume_at.strftime("%H:%M:%S"),
+        )
+        deadline = time.monotonic() + seconds
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            await asyncio.sleep(min(remaining, 300.0))
+            remaining = deadline - time.monotonic()
+            if remaining > 5.0:
+                self.logger.info(
+                    "Ainda aguardando o bloqueio expirar: faltam %s.",
+                    format_duration(remaining),
+                )
+
+    def mark_done(self) -> None:
+        """Marca o fim do trabalho de uma pagina: o intervalo ate o proximo
+        request passa a contar daqui, e nao do inicio. Sem isto, paginas que
+        demoram mais que o intervalo saem coladas uma na outra, sem pausa."""
+        self._last_request_at = max(self._last_request_at, time.monotonic())
 
     async def report_success(self) -> None:
-        """Reseta o contador de bloqueios consecutivos (thread-safe)."""
+        """Zera os bloqueios consecutivos e recupera o ritmo aos poucos."""
         async with self._lock:
             self._consecutive_blocks = 0
+            self._success_streak += 1
+            base = max(0.0, self.config.base_delay_seconds)
+            if (
+                self._current_delay > base
+                and self._success_streak >= self.config.adaptive_recover_after
+            ):
+                self._success_streak = 0
+                self._current_delay = max(
+                    base, self._current_delay * self.config.adaptive_recover_factor,
+                )
 
-    async def report_block(self, logger=None, reason: str = "") -> float:
-        """Registra bloqueio e agenda cooldown exponencial. Retorna duracao do cooldown.
+    async def report_block(
+        self,
+        logger=None,
+        reason: str = "",
+        retry_after: float | None = None,
+        started_at: float | None = None,
+    ) -> float:
+        """Registra bloqueio e agenda o cooldown. Retorna sua duracao.
 
-        Jitter aplica APENAS aumento (0 a +25%) — nunca reduz cooldown abaixo
-        do calculado, evitando bater no servidor antes da hora.
+        retry_after: segundos do header Retry-After, se o servidor informou.
+            Nesse caso o cooldown e exatamente esse tempo (+ pequena folga).
+        started_at: time.monotonic() de quando o request bloqueado COMECOU. Se
+            ele ja estava em voo quando o ultimo bloqueio foi registrado, e o
+            mesmo evento visto por outro worker: nao escala o backoff de novo.
+
+        Sem Retry-After: backoff exponencial com jitter que so aumenta (1% a
+        25%), para nunca voltar ao servidor antes da hora.
         """
+        log = logger if logger is not None else self.logger
         async with self._lock:
+            now = time.monotonic()
+            if started_at is not None and started_at <= self._last_block_at:
+                if self._cooldown_until > now:
+                    return self._cooldown_until - now
+                if self._cooldown_overridden_at >= self._last_block_at:
+                    # O bloqueio ja foi tratado trocando de proxy; este request
+                    # ainda saiu pelo IP antigo. O IP novo nao deve esperar.
+                    return 0.0
+
             self._consecutive_blocks += 1
-            cooldown = min(
-                self.config.backoff_max_seconds,
-                self.config.backoff_initial_seconds
-                * (self.config.backoff_multiplier ** (self._consecutive_blocks - 1)),
+            self._success_streak = 0
+            self.total_blocks += 1
+            if retry_after is not None and retry_after > 0:
+                cooldown = retry_after + self.config.retry_after_margin_seconds
+                source = "informado pelo servidor"
+            else:
+                cooldown = min(
+                    self.config.backoff_max_seconds,
+                    self.config.backoff_initial_seconds
+                    * (self.config.backoff_multiplier ** (self._consecutive_blocks - 1)),
+                )
+                # Jitter SOMENTE aumenta (1% a 25%) para anti-sincronizacao garantida.
+                # `random.uniform(0, 0.25)` pode retornar 0 exato, causando workers
+                # bater no servidor no mesmo instante.
+                cooldown *= 1.0 + random.uniform(0.01, 0.25)
+                source = "estimado"
+            self._cooldown_until = max(self._cooldown_until, now + cooldown)
+            self._last_block_at = now
+
+            base = max(0.0, self.config.base_delay_seconds)
+            ceiling = max(base, self.config.adaptive_max_delay_seconds)
+            floor = base if base > 0 else 0.25
+            self._current_delay = min(
+                ceiling, max(self._current_delay, floor) * self.config.adaptive_multiplier,
             )
-            # Jitter SOMENTE aumenta (1% a 25%) para anti-sincronizacao garantida.
-            # `random.uniform(0, 0.25)` pode retornar 0 exato, causando workers
-            # bater no servidor no mesmo instante.
-            cooldown *= 1.0 + random.uniform(0.01, 0.25)
-            self._cooldown_until = time.monotonic() + cooldown
-            if logger is not None:
-                logger.warning(
-                    "Bloqueio detectado%s. Cooldown #%d: %.0fs",
+            if log is not None:
+                log.warning(
+                    "Bloqueio detectado%s. Cooldown #%d: %.0fs (%s). "
+                    "Intervalo entre requests ajustado para %.1fs.",
                     f" ({reason})" if reason else "",
-                    self._consecutive_blocks, cooldown,
+                    self._consecutive_blocks, cooldown, source, self._current_delay,
                 )
             return cooldown
+
+    async def set_cooldown(self, seconds: float) -> None:
+        """Substitui o cooldown atual (ex: apos trocar para outro proxy, cujo
+        IP nao esta bloqueado, a espera do IP antigo deixa de valer)."""
+        async with self._lock:
+            now = time.monotonic()
+            self._cooldown_until = now + max(0.0, seconds)
+            self._cooldown_overridden_at = now
 
     @property
     def consecutive_blocks(self) -> int:
@@ -207,6 +358,23 @@ def pick_user_agent() -> str:
     return random.choice(_REALISTIC_USER_AGENTS)
 
 
+def chrome_user_agent(browser_version: str | None) -> str:
+    """User-Agent de Chrome coerente com o Chromium realmente em uso.
+
+    O Chromium headless se identifica como "HeadlessChrome", que o TDN recusa.
+    Em vez de sortear um UA a cada launch (o pool tinha Firefox e Chrome
+    antigos, e os mesmos cookies eram reapresentados com identidades
+    diferentes), usa-se sempre o Chrome da versao instalada.
+    """
+    major = (browser_version or "").strip().split(".", 1)[0]
+    if not major.isdigit():
+        return _REALISTIC_USER_AGENTS[1]
+    return (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        f"(KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
+    )
+
+
 def pick_viewport() -> dict:
     """Retorna viewport realistico aleatorio."""
     return random.choice(_REALISTIC_VIEWPORTS)
@@ -215,10 +383,16 @@ def pick_viewport() -> dict:
 def build_browser_context_args(
     state_path: Path | None = None,
     proxy_url: str | None = None,
+    user_agent: str | None = None,
 ) -> dict:
-    """Argumentos comuns para new_context (UA, viewport, locale, storage_state, proxy)."""
+    """Argumentos comuns para new_context (UA, viewport, locale, storage_state, proxy).
+
+    proxy_url so e aplicado se informado explicitamente: quem decide a saida
+    de rede (flag, arquivo ou variavel de ambiente) e o chamador, que tambem
+    a registra no log. Nada de proxy implicito escondido aqui.
+    """
     args: dict = {
-        "user_agent": pick_user_agent(),
+        "user_agent": user_agent or pick_user_agent(),
         "viewport": pick_viewport(),
         "locale": "pt-BR",
         "timezone_id": "America/Sao_Paulo",
@@ -233,27 +407,29 @@ def build_browser_context_args(
             args["storage_state"] = str(state_path)
         except (OSError, ValueError):
             pass  # ignora storage_state corrompido
-    proxy_dict = parse_proxy_arg(proxy_url)
-    if proxy_dict:
-        args["proxy"] = proxy_dict
+    if proxy_url:
+        proxy_dict = parse_proxy_arg(proxy_url)
+        if proxy_dict:
+            args["proxy"] = proxy_dict
     return args
 
 
 def parse_proxy_arg(proxy: str | None) -> dict | None:
-    """Converte string de proxy em dict do Playwright. Suporta env var fallback."""
+    """Converte string de proxy em dict do Playwright. Suporta env var fallback.
+
+    Tolerante: devolve None para valor invalido. A validacao estrita (com
+    mensagem de erro para o usuario) e feita na CLI por src.proxy.
+    """
+    from .proxy import ProxyConfigError, to_playwright_proxy  # noqa: PLC0415
+
     if not proxy:
         proxy = os.environ.get("HTTP_PROXY") or os.environ.get("HTTPS_PROXY")
     if not proxy:
         return None
-    parsed = urlparse(proxy)
-    if parsed.scheme not in {"http", "https", "socks5"}:
+    try:
+        return to_playwright_proxy(proxy)
+    except ProxyConfigError:
         return None
-    result = {"server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port or 80}"}
-    if parsed.username:
-        result["username"] = parsed.username
-    if parsed.password:
-        result["password"] = parsed.password
-    return result
 
 
 _CF_CHALLENGE_INDICATORS = (
@@ -293,9 +469,10 @@ def is_blocking_error(exc: BaseException) -> bool:
     Cookie), e numeros de sessao/timestamp (ex: cookies _ga_*) podem
     coincidentemente conter "503" etc, causando falso positivo. Codigos
     HTTP numericos usam lookaround pra nao casar digitos embutidos em IDs
-    maiores (ex: "503" dentro de "1785936503").
+    maiores (ex: "503" dentro de "1785936503"). URLs sao removidas antes da
+    busca: um titulo de pagina como "Registro+C503" nao e um HTTP 503.
     """
-    headline = str(exc).split("\nCall log:", 1)[0].lower()
+    headline = error_headline(exc)
     if any(marker in headline for marker in _BLOCKING_TEXT_MARKERS):
         return True
     return any(
@@ -343,6 +520,15 @@ class Manifest:
     # url -> {filename, title, size_bytes, elapsed_seconds}. Espelha `exported`
     # mas para a exportacao em Markdown (pipeline independente do PDF).
     exported_md: dict[str, dict] = field(default_factory=dict)
+    # url -> pageId do Confluence, aprendido no crawl. Permite listar os filhos
+    # de uma pagina direto pela REST API, sem navegar ate ela (resume do crawl).
+    page_ids: dict[str, str] = field(default_factory=dict)
+    # Nome do PDF consolidado escolhido quando o job foi criado (o `resume`
+    # reutiliza o mesmo, sem adivinhar por arquivos da pasta).
+    consolidated_name: str = ""
+    # URLs da fila que a REST API ja informou nao terem filhos: ao retomar um
+    # crawl interrompido elas continuam sem custar request.
+    crawl_leaves: list[str] = field(default_factory=list)
 
 
 class Checkpoint:
@@ -417,8 +603,11 @@ class Checkpoint:
             )
             return self._fresh(start_url)
         prev_url = str(data.get("start_url", ""))
-        if prev_url and prev_url != start_url:
+        if prev_url and start_url_key(prev_url) != start_url_key(start_url):
             # Mudou a URL inicial — preserva info para alertar o caller.
+            # Diferencas cosmeticas (barra final, /display/public/ vs /display/,
+            # http vs https, caixa do host) NAO contam: descartar o checkpoint
+            # de centenas de paginas por causa de um caractere seria desastroso.
             self.previous_start_url = prev_url
             return self._fresh(start_url)
 
@@ -460,6 +649,13 @@ class Checkpoint:
             exported=dict(data.get("exported", {})),
             failures=failures,
             exported_md=dict(data.get("exported_md", {})),
+            page_ids={
+                str(url): str(pid)
+                for url, pid in (data.get("page_ids", {}) or {}).items()
+                if url and pid
+            },
+            consolidated_name=str(data.get("consolidated_name") or ""),
+            crawl_leaves=[u for u in (data.get("crawl_leaves") or []) if isinstance(u, str)],
         )
 
     @staticmethod
@@ -531,7 +727,12 @@ class Checkpoint:
             except OSError:
                 return None
 
-    def record_crawl_complete(self, urls: list[str], max_pages: int | None = None) -> None:
+    def record_crawl_complete(
+        self,
+        urls: list[str],
+        max_pages: int | None = None,
+        page_ids: dict[str, str] | None = None,
+    ) -> None:
         """Marca crawl como completo. Trim crawl_seen (info redundante apos completo).
 
         Quando crawl termina, `crawl_seen` eh redundante (== mapped_urls).
@@ -541,8 +742,28 @@ class Checkpoint:
         self.manifest.mapped_urls = list(urls)
         self.manifest.crawl_queue = []  # fila esvaziada — crawl terminou
         self.manifest.crawl_seen = []   # redundante apos completo
+        self.manifest.crawl_leaves = []
         self.manifest.crawl_max_pages = max_pages
+        if page_ids is not None:
+            self.manifest.page_ids = dict(page_ids)
+        # Mapa completo = todo no teve os filhos listados: desistencias de
+        # crawl registradas antes ficaram obsoletas (senao o job apareceria
+        # como "pendente" para sempre).
+        for url in self.crawl_giveups():
+            self.manifest.failures.pop(url, None)
         self.save()
+
+    def crawl_giveups(self) -> list[str]:
+        """URLs em failures por desistencia do CRAWL (filhos nao listados).
+
+        Versoes antigas desistiam de uma pagina apos 2 bloqueios e mesmo assim
+        marcavam o mapa como completo: se houver alguma aqui num job com
+        crawl_complete=True, o mapa pode estar sem as subarvores dessas paginas.
+        """
+        return [
+            url for url, entry in self.manifest.failures.items()
+            if str((entry or {}).get("error", "")).startswith(CRAWL_GIVEUP_PREFIX)
+        ]
 
     def save_crawl_progress(
         self,
@@ -550,20 +771,43 @@ class Checkpoint:
         queue: list[str],
         seen: list[str],
         max_pages: int | None = None,
+        page_ids: dict[str, str] | None = None,
+        leaves: list[str] | None = None,
     ) -> None:
         """Salva snapshot incremental do crawl (para resume parcial).
 
         Chamado periodicamente durante o crawl, NAO marca crawl_complete.
         """
+        self.manifest.crawl_complete = False
         self.manifest.mapped_urls = list(ordered_urls)
         self.manifest.crawl_queue = list(queue)
         self.manifest.crawl_seen = list(seen)
         self.manifest.crawl_max_pages = max_pages
+        if page_ids is not None:
+            self.manifest.page_ids = dict(page_ids)
+        if leaves is not None:
+            self.manifest.crawl_leaves = list(leaves)
         self.save()
+
+    def exported_key(self, url: str) -> str | None:
+        """Chave de `exported` para esta pagina, aceitando a outra forma da URL.
+
+        /display/public/X/Titulo e /display/X/Titulo sao a MESMA pagina.
+        Manifests antigos misturam as duas formas (links vindos do DOM nao
+        eram normalizados); sem esta tolerancia um re-mapeamento baixaria de
+        novo dezenas de paginas que ja tem PDF.
+        """
+        if url in self.manifest.exported:
+            return url
+        variant = display_url_variant(url)
+        if variant and variant in self.manifest.exported:
+            return variant
+        return None
 
     def is_exported(self, url: str, pages_dir: Path) -> bool:
         """True se URL tem PDF valido no disco. Valida header + EOF + tamanho minimo."""
-        entry = self.manifest.exported.get(url)
+        key = self.exported_key(url)
+        entry = self.manifest.exported.get(key) if key else None
         if not entry:
             return False
         filename = entry.get("filename", "")
@@ -735,7 +979,8 @@ class Checkpoint:
         return orphans
 
     def get_exported_entry(self, url: str) -> dict | None:
-        return self.manifest.exported.get(url)
+        key = self.exported_key(url)
+        return self.manifest.exported.get(key) if key else None
 
     def record_export(
         self,
@@ -759,6 +1004,11 @@ class Checkpoint:
         }
         if pdf_hash:
             entry["sha256"] = pdf_hash
+        # Uma pagina = uma chave: descarta a entrada antiga na outra forma de URL.
+        variant = display_url_variant(url)
+        if variant:
+            self.manifest.exported.pop(variant, None)
+            self.manifest.failures.pop(variant, None)
         self.manifest.exported[url] = entry
         # Remove de failures se estava la (re-tentativa bem-sucedida)
         self.manifest.failures.pop(url, None)
@@ -768,6 +1018,8 @@ class Checkpoint:
     def record_failure(self, url: str, error: str) -> None:
         existing = self.manifest.failures.get(url) or {}
         attempts = int(existing.get("attempts", 0)) + 1
+        # So a primeira parte do erro: o "Call log" do Playwright ecoa headers.
+        error = short_error(Exception(error), limit=500)
         self.manifest.failures[url] = {
             "error": error,
             "attempts": attempts,
@@ -814,6 +1066,15 @@ class PendingJob:
     def is_export_pending(self) -> bool:
         return self.exported_count < self.mapped_count or self.failure_count > 0
 
+    @property
+    def is_pending(self) -> bool:
+        return self.is_crawl_pending or self.is_export_pending
+
+    @property
+    def missing_count(self) -> int:
+        """Paginas mapeadas que ainda nao tem PDF."""
+        return max(0, self.mapped_count - self.exported_count)
+
 
 def _collect_manifest_candidates(root_dir: Path, max_depth: int = 3) -> list[Path]:
     """Lista paths candidatos a manifest (root + subpastas ate `max_depth` niveis).
@@ -838,8 +1099,16 @@ def _collect_manifest_candidates(root_dir: Path, max_depth: int = 3) -> list[Pat
     return unique
 
 
-def _read_manifest_for_job(manifest_path: Path) -> PendingJob | None:
-    """Le um manifest e retorna PendingJob se houver trabalho pendente."""
+def _read_manifest_for_job(
+    manifest_path: Path, include_complete: bool = False,
+) -> PendingJob | None:
+    """Le um manifest e retorna PendingJob se houver trabalho pendente.
+
+    Com include_complete=True devolve tambem jobs ja concluidos (usado para
+    escolher um job existente em "verificar atualizacoes"/"regenerar").
+    Arquivos manifest.json que nao sao do extrator (sem `mapped_urls`) sao
+    ignorados.
+    """
     if not manifest_path.exists():
         return None
     try:
@@ -847,19 +1116,28 @@ def _read_manifest_for_job(manifest_path: Path) -> PendingJob | None:
             data = json.load(fp)
     except (OSError, ValueError):
         return None
-    if not isinstance(data, dict):
+    if not isinstance(data, dict) or "mapped_urls" not in data:
         return None
 
     crawl_complete = bool(data.get("crawl_complete", False))
-    mapped = list(data.get("mapped_urls", []))
-    exported = dict(data.get("exported", {}))
-    failures = dict(data.get("failures", {}))
-    is_pending = (
-        not crawl_complete
-        or len(exported) < len(mapped)
-        or len(failures) > 0
-    )
-    if not is_pending:
+    try:
+        mapped = list(data.get("mapped_urls") or [])
+        exported = dict(data.get("exported") or {})
+        failures = dict(data.get("failures") or {})
+    except (TypeError, ValueError):
+        return None
+    # Conta paginas mapeadas ainda sem PDF pelo conjunto de URLs (e nao por
+    # len(exported) < len(mapped)): `exported` pode ter URLs que sairam do mapa.
+    def _has_pdf(url: str) -> bool:
+        return url in exported or (display_url_variant(url) or "") in exported
+
+    missing = sum(1 for url in mapped if not _has_pdf(url))
+    # Falha de uma pagina que JA tem PDF nao e trabalho pendente (registro
+    # antigo de desistencia do crawl, ou regeneracao que nao deu certo):
+    # conta-la manteria o job na lista de incompletos para sempre.
+    pending_failures = [url for url in failures if not _has_pdf(url)]
+    is_pending = not crawl_complete or missing > 0 or len(pending_failures) > 0
+    if not is_pending and not include_complete:
         return None
 
     return PendingJob(
@@ -869,25 +1147,106 @@ def _read_manifest_for_job(manifest_path: Path) -> PendingJob | None:
         mapped_count=len(mapped),
         queue_count=len(list(data.get("crawl_queue", []))),
         exported_count=len(exported),
-        failure_count=len(failures),
+        failure_count=len(pending_failures),
         last_updated=str(data.get("last_updated", "")),
         crawl_complete=crawl_complete,
     )
 
 
+# Pastas que nunca contem jobs do extrator (evita varrer venv/git/caches).
+_JOB_SCAN_SKIP_DIRS = frozenset({
+    ".venv", "venv", ".git", ".github", ".pytest_cache", ".mypy_cache",
+    "__pycache__", "node_modules", ".tasks",
+})
+# Pastas do proprio projeto: puladas so quando sao o 1o nivel da pasta atual
+# (um job em output\src ou output\tests e perfeitamente valido).
+_JOB_SCAN_PROJECT_DIRS = frozenset({"src", "tests", "build", "dist", "env"})
+
+
+def find_jobs(
+    roots: Iterable[Path], include_complete: bool = False, max_depth: int = 3,
+) -> list[PendingJob]:
+    """Encontra jobs do extrator (pastas com manifest.json) em varias raizes.
+
+    O menu procurava so em `output/`; um job criado em outra pasta (ex: o
+    usuario digitou `CFGTRIB` em vez de `output\\CFGTRIB`) ficava invisivel e
+    sem caminho para ser retomado. Aqui varias raizes sao varridas, pulando
+    pastas de infraestrutura. Ordenado por last_updated (mais recente antes).
+    """
+    jobs: list[PendingJob] = []
+    seen_dirs: set[Path] = set()
+    try:
+        cwd = Path.cwd().resolve()
+    except OSError:
+        cwd = None
+    for root in roots:
+        try:
+            root_is_cwd = cwd is not None and Path(root).resolve() == cwd
+        except OSError:
+            root_is_cwd = False
+        for manifest_path in _collect_manifest_candidates(Path(root), max_depth=max_depth):
+            try:
+                relative_parts = manifest_path.parent.relative_to(root).parts
+            except ValueError:
+                relative_parts = manifest_path.parent.parts
+            if any(part in _JOB_SCAN_SKIP_DIRS for part in relative_parts):
+                continue
+            if root_is_cwd and relative_parts and relative_parts[0] in _JOB_SCAN_PROJECT_DIRS:
+                continue
+            try:
+                key = manifest_path.parent.resolve()
+            except OSError:
+                key = manifest_path.parent
+            if key in seen_dirs:
+                continue
+            job = _read_manifest_for_job(manifest_path, include_complete=include_complete)
+            if job is not None:
+                seen_dirs.add(key)
+                jobs.append(job)
+    jobs.sort(key=lambda j: j.last_updated, reverse=True)
+    return jobs
+
+
 def find_pending_jobs(root_dir: Path) -> list[PendingJob]:
     """Encontra subpastas com manifest.json indicando trabalho incompleto.
 
-    Procura ate 2 niveis de profundidade em root_dir e na pasta atual.
+    Procura ate 3 niveis de profundidade em root_dir.
     Retorna ordenado pela data de last_updated (mais recente primeiro).
     """
-    jobs: list[PendingJob] = []
-    for manifest_path in _collect_manifest_candidates(root_dir):
-        job = _read_manifest_for_job(manifest_path)
-        if job is not None:
-            jobs.append(job)
-    jobs.sort(key=lambda j: j.last_updated, reverse=True)
-    return jobs
+    return find_jobs([root_dir], include_complete=False)
+
+
+def display_url_variant(url: str) -> str | None:
+    """Outra forma da mesma pagina: /display/public/X/... <-> /display/X/...
+
+    Retorna None para URLs que nao sao /display/ (ex: viewpage.action?pageId=).
+    """
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return None
+    path = parsed.path or ""
+    if path.startswith("/display/public/"):
+        new_path = "/display/" + path[len("/display/public/"):]
+    elif path.startswith("/display/"):
+        new_path = "/display/public/" + path[len("/display/"):]
+    else:
+        return None
+    return urlunparse(parsed._replace(path=new_path))
+
+
+def start_url_key(url: str) -> str:
+    """Chave para comparar URLs iniciais ignorando diferencas cosmeticas.
+
+    Trata como iguais: http/https, caixa do host, barra final, parametros de
+    query irrelevantes e /display/public/X vs /display/X (mesma pagina).
+    """
+    try:
+        parsed = urlparse(canonicalize_url(url or ""))
+    except ValueError:
+        return (url or "").strip()
+    path = parsed.path.replace("/display/public/", "/display/", 1).rstrip("/")
+    return f"{parsed.netloc.lower()}{path}?{parsed.query}"
 
 
 class InvalidStartUrlError(ValueError):
@@ -1447,9 +1806,14 @@ def parse_scope(start_url: str) -> CrawlScope:
     space_key = None
     path_prefix = "/"
 
-    if len(parts) >= 3 and parts[0] == "display":
+    if len(parts) >= 3 and parts[0] == "display" and parts[1] == "public":
         space_key = parts[2]
         path_prefix = f"/{parts[0]}/{parts[1]}/{parts[2]}/"
+    elif len(parts) >= 2 and parts[0] == "display":
+        # /display/ESPACO/Titulo (sem /public/): o espaco e o 2o segmento. Antes
+        # o TITULO era tomado como espaco e os filhos saiam todos do escopo.
+        space_key = parts[1]
+        path_prefix = f"/{parts[0]}/{parts[1]}/"
     elif len(parts) >= 2 and parts[0] == "spaces":
         space_key = parts[1]
         path_prefix = f"/{parts[0]}/{parts[1]}/"

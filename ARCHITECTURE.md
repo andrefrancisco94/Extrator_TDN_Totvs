@@ -6,12 +6,17 @@ Visão geral dos módulos e fluxo de execução do Extrator TDN TOTVS.
 
 ```
 src/
-├── main.py            CLI (typer) + orquestração do pipeline
-├── crawler.py         BFS pela árvore lateral do Confluence (REST API + DOM fallback)
-├── pdf_exporter.py    Exportação de cada URL para PDF via Playwright
-├── pdf_merge.py       Consolidação de PDFs individuais (pypdf) com bookmarks
-├── browser.py         Helpers compartilhados de Playwright (session/launch/teardown)
-└── utils.py           Manifest/Checkpoint, RateLimiter, JobLock, slugify, validações
+├── main.py              CLI (typer) + orquestração do pipeline (run, resume, proxy, jobs...)
+├── crawler.py           BFS pela árvore do Confluence (REST API por id; DOM como fallback)
+├── pdf_exporter.py      Exportação de cada URL para PDF (retry por URL + repescagens)
+├── markdown_exporter.py Exportação para Markdown (mesmo tratamento de bloqueio)
+├── pdf_merge.py         Consolidação de PDFs individuais (pypdf) com bookmarks
+├── browser.py           Sessão Playwright: launch/relaunch, proxy, bloqueio de requests
+│                        supérfluos (CDP), contabilidade de rede por página
+├── blocking.py          Classificação de bloqueios (429/1015, desafio, WAF, 5xx),
+│                        Retry-After e erros de rede transitórios
+├── proxy.py             Validação de proxies, arquivo de lista e rodízio (ProxyPool)
+└── utils.py             Manifest/Checkpoint, RateLimiter, JobLock, slugify, validações
 ```
 
 ## Fluxo de execução
@@ -64,25 +69,43 @@ src/
 ## Decisões arquiteturais
 
 ### Resume robusto via Checkpoint
-- `manifest.json` (v2) persiste após cada fase: `mapped_urls`, `crawl_queue`, `crawl_seen`, `exported{}`, `failures{}`
-- Batched saves (`_save_every_n=20`) evita O(N²) write em runs grandes
+- `manifest.json` (v2) persiste: `mapped_urls`, `crawl_queue`, `crawl_seen`, `page_ids`, `exported{}`, `failures{}`
+- Batched saves (`_save_every_n=20`) evita O(N²) write em runs grandes; `flush()` em `finally` (Ctrl+C não perde registros)
 - `reconcile_with_disk` no início do run remove entries cujo PDF sumiu
 - Backup rotativo (`.bak.1` ... `.bak.5`) antes de operações destrutivas
 - SHA-256 de cada PDF detecta corrupção pós-write
+- **Invariante de completude**: `crawl_complete=True` só com fila vazia E todos os nós com os filhos listados. Nó bloqueado/com erro fica em `crawl_queue`
+- **Re-mapeamento transacional** (`--update`): o mapa completo anterior só é substituído quando o novo termina
+- **Identidade de página**: `/display/public/X/T` e `/display/X/T` são a mesma página (`display_url_variant`); a URL inicial é comparada por `start_url_key` e uma pasta de outro job é recusada
 
-### Anti-bloqueio (Cloudflare 522, rate limit)
-- `RateLimiter` (utils.py) com cooldown exponencial (30s → 60s → 120s → ... até 15min)
-- Jitter **só aumenta** (0 a +25%) — não defeats purpose do backoff
-- Shared entre crawl e export (cooldown propaga)
-- User-Agent realista rotativo (Chrome/Edge/Firefox) + viewport variável
-- Detecção de Cloudflare challenge no DOM (cooldown imediato)
-- Circuit breaker: aborta após 5 failures consecutivas de sessão (login/CF)
-- Cookies persistentes (`browser_state.json`)
-- Suporte a proxy (`--proxy` + `HTTP_PROXY` env)
+### Bloqueio por IP (Cloudflare 1015 / HTTP 429)
+O limite do TDN é por IP e conta requests. A estratégia tem três partes:
+
+1. **Gastar menos requests**
+   - Crawl: 1 navegação + 1 request REST por nó com filhos (`/rest/api/content/{id}/child/page?expand=children.page`); folhas não custam nada
+   - REST via `fetch()` dentro da página (pilha de rede do Chromium); `APIRequestContext` como reserva
+   - Export: telemetria/polling/rastreadores bloqueados via CDP `Network.setBlockedURLs` (não `page.route`, que desliga o cache HTTP)
+2. **Reagir certo ao bloqueio** (`blocking.py` classifica; `RateLimiter` decide a espera)
+   - `Retry-After` do servidor = cooldown exato; sem ele, backoff exponencial (30s → ... → 15min)
+   - Nenhum request durante o cooldown; `wait()` re-checa ao acordar
+   - A MESMA URL/nó é repetida depois do cooldown (bloqueio é do IP, não da página)
+   - AIMD: bloqueio dobra o intervalo (teto 20s); 12 sucessos o reduzem 20% até o base
+   - Ban acima de `max_block_wait_seconds` → `BlockedTooLongError` → exit 3 com progresso salvo
+3. **Trocar de IP** (`proxy.py`)
+   - `ProxyPool`: cooldown por saída; em bloqueio a próxima saída livre assume e o browser é relançado (`relaunch_session`, `generation` invalida pages antigas)
+   - Proxy com 3 falhas de conexão seguidas é descartado; credenciais sempre mascaradas
+
+Não confundir: desafio anti-bot / bloqueio de WAF (403) e tela de login contam no circuit breaker (5 seguidos abortam). Rate limit não conta — ele é esperado e tratado.
+
+### Integridade do PDF
+- `PageNetStats` (browser.py) registra, por navegação, sub-recursos respondidos com 429/5xx ou que falharam por rede
+- `_verify_page_assets` roda antes de `page.pdf()`: imagem com 429 ⇒ página tratada como bloqueada e refeita. Na última tentativa da última repescagem, 5xx/erro de rede em recurso vira aviso (imagem quebrada na origem não pode custar a página); 429 nunca é tolerado
 
 ### Concorrência
-- Workers paralelos (`--max-workers N`): 1 browser, N pages, asyncio.Queue
-- Locks: `acc.lock` (mutações de accumulator), `browser_recovery_lock` (impede 2 workers relançarem), `_storage_state_lock` (escrita browser_state.json), `state_lock` (api_cache + attempts)
+- Workers paralelos (`--max-workers N`): 1 browser, N pages, asyncio.Queue. O limiter é único: workers não aumentam o ritmo por IP
+- `_PageSlot` por worker: page + geração da sessão (recriada após relaunch)
+- Resultado indexado pela posição da URL (`acc.exported[index]`): o merge segue a ordem do mapa
+- Locks: `acc.lock` (accumulators), `browser_recovery_lock`, `session.rotation_lock` (troca de proxy), `_storage_state_lock`, `state_lock` (api_cache + attempts)
 - `checkpoint._save_lock` (threading.Lock): manifest writes
 - `JobLock`: impede 2 processos no mesmo output_dir (PID detection)
 
@@ -94,43 +117,40 @@ src/
 ### Segurança
 - `validate_start_url`: bloqueia SSRF (localhost, 127.x, IPs privados, AWS metadata)
 - `validate_safe_path`: rejeita path > 240 chars (Windows MAX_PATH) e traversal
-- `sanitize_proxy_for_log`: mascara credenciais em log
+- Proxies: validação estrita na CLI, credenciais mascaradas em log/tela, `proxies.txt` e `browser_state.json` no `.gitignore`
 - `find_orphan_pdfs`: protege nomes reservados (manifest.json, .tmp)
 
 ## Lifecycle de uma URL
 
 ```
-1. crawl: REST API retorna webui link → canonicalize_url → enqueue
-2. process_url:
-   - rate limiter wait
-   - goto(url, dom_budget)
-   - detect Cloudflare challenge → report_block + recriar page
-   - extract children → enqueue novos URLs
-   - report_success no limiter
-3. export:
-   - rate limiter wait
-   - goto(url) + expand macros (Expand, Tabs) + emulate print
-   - page.pdf() em arquivo .tmp
-   - validate: header + EOF + size > 3KB + count_pdf_pages > 0
-   - sha256 do PDF
-   - atomic_replace .tmp → .pdf
-   - record_export no manifest (batched save)
-4. merge:
-   - pypdf.PdfWriter consolidando todos os PDFs
-   - bookmarks com title sanitizado
-   - compress_content_streams (skip se > 5000 paginas)
-   - atomic_replace
+1. crawl:
+   - nó com filhos conhecidos = 0 (folha) → resolvido sem request
+   - senão: limiter.wait → REST child/page (ou navegação+DOM se a API é negada)
+       OK        → filhos enfileirados (id + se é folha)
+       BLOCKED   → report_block(Retry-After) → [troca de proxy] → repete o MESMO nó
+       FAILED    → pausa curta, repete; persistindo fica pendente (crawl incompleto)
+2. export (por URL, até 4 tentativas + repescagens):
+   - limiter.wait → goto → classifica (429/desafio/5xx/login/4xx)
+   - expand macros (Expand, Tabs) + emulate print
+   - _verify_page_assets (imagens/CSS bloqueados?)
+   - page.pdf() em .tmp → valida → sha256 → rename → record_export
+       bloqueio/erro transitório → cooldown e repete a MESMA URL
+3. merge:
+   - entradas na ordem do mapa
+   - pypdf.PdfWriter + bookmarks + compress_content_streams (skip se > 5000 paginas)
+4. resumo:
+   - faltou página ou o mapa não fechou → quadro "DOCUMENTAÇÃO INCOMPLETA" + exit 3
 ```
 
 ## Estados do RateLimiter
 
 ```
-NORMAL ─────────► report_block ───► COOLDOWN (30s)
-   ▲                                     │
-   │   report_success                    │
-   └─────────────────────────────────────┘
-
-COOLDOWN ──► report_block (sucessivo) ──► COOLDOWN (60s, 120s, ..., 900s)
+NORMAL (intervalo = base) ──► report_block ──► COOLDOWN (Retry-After, ou 30s/60s/.../900s)
+   ▲                                              │  intervalo x2 (teto 20s)
+   │  12 sucessos seguidos: intervalo x0.8        │
+   └──────────────────────────────────────────────┘
+COOLDOWN > max_block_wait ──► BlockedTooLongError ──► exit 3 (progresso salvo)
+troca de proxy ──► set_cooldown(espera da nova saída, normalmente 0)
 ```
 
 ## Estados do Checkpoint

@@ -308,7 +308,9 @@ def test_pdf_set_metadata_uses_utc(tmp_path):
 # Version bump
 # =============================================================================
 
-def test_version_is_010():
+def test_version_command_prints_current_version():
+    from src.main import __version__
+
     result = runner.invoke(app, ["version"])
     assert result.exit_code == 0
-    assert "0.10.0" in result.stdout
+    assert __version__ in result.stdout

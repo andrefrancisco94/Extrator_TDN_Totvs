@@ -1,5 +1,116 @@
 # Changelog
 
+## [0.11.0] - 2026-10-13
+
+### Contexto
+Run de "Verificar atualizações" (131 páginas) levou 41min30s, terminou com 10 páginas
+faltando e código de saída 0. 70% do tempo foi espera de cooldown: o Cloudflare do TDN
+limita por IP (erro 1015 / HTTP 429) e o extrator batia no limite a cada ~9 páginas.
+
+### Mapeamento (crawl)
+- **REST API por id, sem navegar página a página**: uma navegação (página inicial) + um
+  request por página **com** filhos. Com `expand=children.page` as folhas (~85% da árvore)
+  não custam request. Antes: navegação completa + REST por página, só para ler o id
+- **`fetch()` de dentro da página** para a REST API (pilha de rede do Chromium); o
+  `APIRequestContext` (TLS do Node, que falha em redes com inspeção TLS) fica como reserva
+- **Bloqueio repete o MESMO nó** depois do cooldown — antes o nó ia para o fim da fila, outra
+  URL era usada como sonda e, após 2 tentativas, o nó era abandonado
+- **Subárvore nunca some em silêncio**: página cujos filhos não foram listados fica pendente
+  e o crawl **não** é marcado como completo (antes: `crawl_complete=true` mesmo com
+  desistências; um job antigo perdeu 14 páginas assim)
+- **Erros de rede não viram "página sem filhos"** (`ERR_NETWORK_ACCESS_DENIED` etc. agora são
+  repetidos)
+- **Resume não descarta nós que aguardavam nova tentativa** (estavam em `mapped_urls` e na
+  fila; eram tratados como já vistos)
+- **`--update` transacional**: o mapa completo anterior só é substituído se o re-mapeamento
+  terminar (e não é trocado por um mapa só com a página inicial); `--update` num job
+  incompleto grava um estado coerente em vez de mapa parcial com fila vazia
+- **Mapas antigos truncados são reparados**: job com `crawl_complete=true` mas com
+  desistências de crawl é re-mapeado automaticamente no resume
+- **`--max-pages`**: a página que bate no limite volta para a fila (antes ficava como
+  resolvida e um run posterior sem limite nunca listava a subárvore dela)
+- **Erro HTTP na página inicial** não vira mais "mapa completo de uma página"
+- Folhas já identificadas são persistidas: retomar um crawl interrompido não custa um
+  request por folha; falhas de exportação não são re-enfileiradas no crawl
+- Paginação da REST segue `limit`/`_links.next` da resposta (limite menor que o pedido não
+  trunca a lista de filhos); origem comparada por host (redirect http→https não força
+  uma navegação por página)
+- **Uma página, uma chave**: links do DOM e da REST saem na mesma forma
+  (`/display/public/X` vs `/display/X`); PDFs de manifests antigos na outra forma são reusados
+- `parse_scope` corrigido para URL inicial `/display/ESPACO/Titulo` (sem `/public/`)
+
+### Exportação
+- **Retry no mesmo run**: página com 429/1015/5xx/desafio/erro de rede é repetida após o
+  cooldown (até 4 tentativas) + 2 repescagens no final. Antes cada bloqueio custava uma página
+- **Sem retry cego**: removido o retry do tenacity que reenviava o request 2s depois, dentro
+  do ban
+- **Sub-recursos conferidos antes do PDF**: imagens/CSS respondidos com 429 fazem a página
+  ser refeita (antes o PDF saía sem imagens e era gravado como sucesso)
+- **Requests supérfluos bloqueados** (telemetria/polling do Confluence, rastreadores) via CDP,
+  mantendo o cache HTTP do navegador
+- **Consolidado na ordem do mapa** mesmo com workers paralelos e repescagens, e montado a
+  partir do manifest: run abortado ou `--regenerate` com falhas não o encolhe; páginas não
+  regeneradas são listadas e o run sai com código 3
+- Rodízio de proxy com workers paralelos: a troca de browser é atômica (antes derrubava o
+  run com "context has been closed")
+- **Manifest gravado em `finally`**: Ctrl+C não perde mais até 19 registros de PDFs prontos
+- Markdown: mesmos retries/repescagem; 429 em imagem/anexo refaz a página
+
+### Rate limiter
+- **`Retry-After` do servidor** define o cooldown (ban de 1h observado: `Retry-After: 3583`)
+- **Ritmo adaptativo**: cada bloqueio dobra o intervalo (teto 20s); 12 sucessos seguidos o
+  reduzem em 20% até o valor base
+- Intervalo contado a partir do **fim** da página (antes páginas lentas saíam coladas)
+- Workers: cooldown não é mais somado uma vez por worker; quem estava dormindo não sai
+  dentro de um ban reportado depois; o mesmo bloqueio visto por vários workers escala uma vez
+- **`--max-block-wait`** (default 2h): ban maior que isso encerra o run com progresso salvo
+
+### Proxies
+- **Lista de proxies com rodízio**: `--proxy` repetível, `--proxy-file`, comandos
+  `proxy add|list|test|clear`, opção **[P]** no menu. IP bloqueado descansa e o trabalho segue
+  por outro; proxy morto é descartado
+- Proxy inválido **aborta** (antes era ignorado em silêncio e o log dizia "Proxy configurado")
+- Aceita `host:porta` e `host:porta:usuario:senha`; portas padrão por esquema; credenciais
+  com caracteres especiais; SOCKS com senha recusado com mensagem clara
+- User-Agent único e coerente com o Chromium instalado (antes: sorteio por launch, incluindo
+  Firefox e Chrome antigos, com os mesmos cookies)
+
+### Orquestração / menu
+- **Código de saída 3 + quadro "DOCUMENTAÇÃO INCOMPLETA"** com a lista do que falta e como
+  terminar (antes: código 0 e consolidado silenciosamente incompleto)
+- **Comando `resume`**: escolhe o job numa lista e lê a URL do manifest. Menu: [1] continuar,
+  **[F] reprocessar só o que faltou**, [4] atualizar, [5] regenerar — sem redigitar URL/pasta
+- Jobs fora de `output/` são encontrados (pasta atual também é varrida; o seletor aceita o
+  caminho de qualquer pasta) e o seletor **sempre pergunta** — nunca dispara um run sozinho
+- Nome do consolidado gravado no manifest (o `resume` não adivinha por PDFs da pasta)
+- Código de saída 4 (`resume` sem nada a fazer) devolve o menu em vez de encerrar
+- `--dry-run` com mapeamento incompleto sai com código 3; diff de páginas novas/removidas só
+  num re-mapeamento real e por chave independente da forma da URL
+- Pasta com job de **outra** URL é recusada (antes o manifest era descartado sem aviso);
+  URLs equivalentes (barra final, `/public/`, http/https) reusam o job
+- Aviso quando já existe job para a mesma URL em outra pasta; no menu, nome simples de pasta
+  vira `output\<nome>`
+- **Comando `reexport N...`**: marca páginas já exportadas para serem refeitas (PDFs de runs
+  antigos que saíram sem imagens), sem regenerar o job inteiro
+- Mapas fechados por versões antigas com desistências de crawl geram aviso para re-mapear
+- `.gitignore`: `browser_state.json` (cookies), `manifest.json` e `proxies.txt` em qualquer pasta
+
+### Novos módulos
+- `src/blocking.py` — classificação de bloqueios (1015/desafio/WAF/5xx), `Retry-After`,
+  erros de rede transitórios
+- `src/proxy.py` — validação, arquivo de lista e rodízio de saídas de rede
+
+### Testes (210 → 313 unitários + 14 e2e)
+- `tests/test_v11_fixes.py` (67), `tests/test_proxy.py` (36)
+- `tests/test_e2e_fake_tdn.py` (14, opt-in: `pytest -m e2e`): pipeline completo contra um
+  Confluence falso local (`tests/fake_tdn.py`) com rate limit 429 + `Retry-After`, imagens
+  bloqueadas, 5xx, login, workers, proxies com rodízio (inclusive com workers paralelos),
+  `--update`, ban longo, interrupção no meio do mapeamento e retomada
+
+### Medido no servidor falso (30 páginas, mesmo rate limit)
+- Antes: 331 requests, 5 bans, **27/30 páginas**, 55s, código 0
+- Depois: 104 requests, 0 bans, **30/30 páginas**, 21s
+
 ## [0.10.0] - 2026-05-25
 
 ### Auditoria r3 (6 agents, 116 novos achados — 448 acumulado)
