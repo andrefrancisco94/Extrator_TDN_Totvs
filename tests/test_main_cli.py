@@ -38,6 +38,19 @@ def test_run_help_shows_new_flags():
         assert flag in result.stdout
 
 
+def test_cli_aceita_16_workers_e_recusa_acima_de_32(tmp_path, monkeypatch):
+    from src import main as main_module
+
+    launched = []
+    monkeypatch.setattr(main_module, "_launch_pdf_run", lambda console, **kwargs: launched.append(kwargs) or 0)
+    common = ["run", "https://tdn.totvs.com/display/public/PROT/Test", "--no-proxy", "--output-dir", str(tmp_path)]
+    result = runner.invoke(app, [*common, "--max-workers", "16"])
+    assert result.exit_code == 0, result.stdout
+    assert launched[0]["max_workers"] == 16
+    assert runner.invoke(app, [*common, "--max-workers", "33"]).exit_code == 2
+    assert len(launched) == 1
+
+
 def test_jobs_command_empty_dir():
     """`jobs` em pasta vazia."""
     with tempfile.TemporaryDirectory() as td:

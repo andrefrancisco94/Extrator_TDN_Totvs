@@ -331,7 +331,7 @@ if defined ADV_DELAY set "ADV_DELAY=%ADV_DELAY:"=%"
 if "%ADV_DELAY%"=="" set "ADV_DELAY=%REQUEST_DELAY%"
 
 set "ADV_WORKERS=%WORKERS%"
-set /p "ADV_WORKERS=Workers paralelos (1-8) [%WORKERS%]: "
+set /p "ADV_WORKERS=Workers paralelos (1-32) [%WORKERS%]: "
 if defined ADV_WORKERS set "ADV_WORKERS=%ADV_WORKERS:"=%"
 if "%ADV_WORKERS%"=="" set "ADV_WORKERS=%WORKERS%"
 
@@ -427,7 +427,7 @@ echo em paralelo; com varios proxies, cada saida tem navegador e espera proprios
 echo.
 echo   [1] Seguro               ^(2s/saida, 4 workers, timeout 180s^) - RECOMENDADO
 echo   [2] Medio                ^(1s/saida, 4 workers, timeout 150s^)
-echo   [3] Paralelo com proxies ^(2s/saida, 8 workers, timeout 120s^)
+echo   [3] Paralelo com proxies ^(2s/saida, 16 workers, timeout 120s^)
 echo   [4] Personalizado
 echo   [0] Voltar
 echo.
@@ -460,10 +460,10 @@ if "%SP%"=="3" (
     set "REQUEST_DELAY=2.0"
     set "BACKOFF_INITIAL=120"
     set "BACKOFF_MAX=1800"
-    set "WORKERS=8"
+    set "WORKERS=16"
     set "TIMEOUT=120"
     set "SLOW=60"
-    echo Modo paralelo ativado: ate 8 saidas simultaneas, preservando o intervalo por IP.
+    echo Modo paralelo ativado: ate 16 saidas simultaneas, preservando o intervalo por IP.
     goto MENU
 )
 if "%SP%"=="4" goto SPEED_CUSTOM
@@ -477,7 +477,7 @@ set "VAL="
 set /p "VAL=Delay entre requests em segundos [%REQUEST_DELAY%]: "
 if defined VAL if not "%VAL%"=="" set "REQUEST_DELAY=%VAL%"
 set "VAL="
-set /p "VAL=Workers paralelos (1-8) [%WORKERS%]: "
+set /p "VAL=Workers paralelos (1-32) [%WORKERS%]: "
 if defined VAL if not "%VAL%"=="" set "WORKERS=%VAL%"
 set "VAL="
 set /p "VAL=Timeout por pagina em segundos [%TIMEOUT%]: "

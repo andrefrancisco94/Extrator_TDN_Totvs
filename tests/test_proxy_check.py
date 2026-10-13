@@ -223,6 +223,23 @@ def test_estimativa_do_pior_caso():
     assert estimate_seconds(1, timeout=8, concurrency=100) == 8
 
 
+def test_rank_por_ip_mantem_mais_rapido_e_saidas_sem_ip_conhecido():
+    from src.proxy_check import ProbeResult
+
+    results = [
+        ProbeResult("http://lento:1", True, 3, ip="1.2.3.4"),
+        ProbeResult("http://rapido:1", True, 1, ip="1.2.3.4"),
+        ProbeResult("http://outro:1", True, 2, ip="5.6.7.8"),
+        ProbeResult("http://sem-ip:1", True, 4),
+        ProbeResult("http://sem-ip:2", True, 5),
+        ProbeResult("http://morto:1", False, 0, ip="9.9.9.9"),
+    ]
+    assert [r.proxy for r in rank_working(results, unique_ips=True)] == [
+        "http://rapido:1", "http://outro:1", "http://sem-ip:1", "http://sem-ip:2",
+    ]
+    assert len(rank_working(results)) == 5
+
+
 # ----------------------------------------------------------------------------
 # Triagem no inicio do run
 # ----------------------------------------------------------------------------

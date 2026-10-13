@@ -152,3 +152,37 @@ def test_deferral_preserves_attempt_limit(tmp_path, mock_logger, monkeypatch):
         assert acc.deferred_attempts == {}
 
     asyncio.run(run())
+
+
+def test_navegacoes_em_paralelo_respeitam_limite_de_impressao(tmp_path, mock_logger, monkeypatch):
+    async def run():
+        cfg, acc, sessions, _limiters = _resources(tmp_path, mock_logger)
+        acc.pdf_slots = asyncio.Semaphore(2)
+        active = 0
+        peak = 0
+
+        async def print_pdf(page, path):
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            try:
+                await asyncio.sleep(0.03)
+                return 4000
+            finally:
+                active -= 1
+
+        monkeypatch.setattr(exporter, "_goto_dom_ready", AsyncMock())
+        monkeypatch.setattr(exporter, "_is_login_page", AsyncMock(return_value=False))
+        monkeypatch.setattr(exporter, "_prepare_page_for_pdf", AsyncMock())
+        monkeypatch.setattr(exporter, "_verify_page_assets", AsyncMock())
+        monkeypatch.setattr(exporter, "_generate_pdf", print_pdf)
+        monkeypatch.setattr(exporter, "_record_export_result", AsyncMock())
+        pages = [MagicMock(title=AsyncMock(return_value=f"Pagina {i}")) for i in range(8)]
+        outcomes = await asyncio.gather(*(
+            exporter._export_one(page, sessions[0], f"url-{i}", i, 8, acc, cfg, mock_logger)
+            for i, page in enumerate(pages, 1)
+        ))
+        assert peak == 2
+        assert all(outcome.status == exporter._OK for _page, outcome in outcomes)
+
+    asyncio.run(run())

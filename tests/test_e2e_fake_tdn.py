@@ -464,6 +464,43 @@ def test_preparacao_espera_imagem_lazy_mas_nao_script_secundario(tmp_path):
     asyncio.run(run())
 
 
+def test_16_proxies_simultaneos_preservam_paginas_e_ordem(tmp_path, monkeypatch):
+    from src import pdf_exporter as exporter
+
+    srv = _server(leaves_per_branch=18, branches=1, deep=False)
+    proxies = [LocalProxy(f"127.0.0.{i}") for i in range(2, 18)]
+    original = exporter._export_one
+    active = set()
+    peak = 0
+    ready = None
+
+    async def observe(page, session, *args, **kwargs):
+        nonlocal peak, ready
+        if ready is None:
+            ready = asyncio.Event()
+        active.add(session.proxy)
+        peak = max(peak, len(active))
+        if peak == 16:
+            ready.set()
+        try:
+            await asyncio.wait_for(ready.wait(), timeout=30)
+            return await original(page, session, *args, **kwargs)
+        finally:
+            active.discard(session.proxy)
+
+    monkeypatch.setattr(exporter, "_export_one", observe)
+    try:
+        assert _run(srv, tmp_path, workers=16, proxies=[p.url for p in proxies]) == 0
+        assert peak == 16
+        assert len(_manifest(tmp_path)["exported"]) == len(srv.tree)
+        assert _consolidated_titles(tmp_path) == [f"{srv.tree[pid][0]} - Fake TDN" for pid in srv.bfs_order()]
+        assert _manifest(tmp_path)["failures"] == {}
+    finally:
+        for proxy in proxies:
+            proxy.stop()
+        srv.stop()
+
+
 def test_ctrl_c_no_meio_do_mapeamento_retoma_do_ponto_exato(tmp_path):
     """Run interrompido por excecao durante o crawl grava a fila; o seguinte
     conclui sem perder nenhuma pagina."""

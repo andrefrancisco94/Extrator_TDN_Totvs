@@ -58,7 +58,7 @@ from .utils import (
 
 from .utils import LARGE_BATCH_THRESHOLD  # re-export para retrocompat
 
-__version__ = "0.12.0"
+__version__ = "0.12.1"
 
 MIN_DISK_FREE_BYTES = 500 * 1024 * 1024  # 500MB minimo razoavel
 
@@ -210,16 +210,23 @@ async def _build_checked_pool(
     results = await probe_many(
         candidates, target, on_progress=_progress_printer(console, "testados"),
     )
-    working = rank_working(results)
+    responding = rank_working(results)
+    working = rank_working(results, unique_ips=True)
     logger.info(
         "Triagem de proxies: %d de %d responderam em ate %.0fs (levou %s).",
-        len(working), len(candidates), PROBE_TIMEOUT_SECONDS,
+        len(responding), len(candidates), PROBE_TIMEOUT_SECONDS,
         format_duration(time.monotonic() - started),
     )
     if not working:
         raise AllProxiesDeadError(
             f"Nenhum dos {len(candidates)} proxies da lista respondeu. Troque a lista "
             "(opcao [P] do menu) ou remova-a para usar a conexao direta."
+        )
+    if len(working) < len(responding):
+        logger.info(
+            "Triagem: %d enderecos com IP de saida repetido removidos; %d proxies "
+            "selecionados para nao compartilhar o limite entre workers.",
+            len(responding) - len(working), len(working),
         )
     console.print(
         f"[green]{len(working)} de {len(candidates)} proxies responderam[/green]; "
@@ -1044,7 +1051,7 @@ def run(
         help="Teto do cooldown (default 900s = 15min) apos bloqueios sucessivos.",
     ),
     max_workers: int = typer.Option(
-        4, min=1, max=8,
+        4, min=1, max=32,
         help="Workers paralelos para PDFs (default 4). Com varios proxies, usa saidas independentes.",
     ),
     proxy: list[str] | None = typer.Option(
@@ -1328,7 +1335,7 @@ def resume(
     backoff_max: float = typer.Option(
         900.0, min=60.0, max=7200.0, help="Teto do cooldown apos bloqueios sucessivos.",
     ),
-    max_workers: int = typer.Option(4, min=1, max=8, help="Workers paralelos para PDFs (default 4)."),
+    max_workers: int = typer.Option(4, min=1, max=32, help="Workers paralelos para PDFs (default 4; maximo 32)."),
     consolidated_name: str | None = typer.Option(
         None, "--consolidated-name",
         help="Nome do PDF consolidado. Padrao: o mesmo usado quando o job foi criado.",

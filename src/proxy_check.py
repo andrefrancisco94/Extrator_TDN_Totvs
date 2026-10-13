@@ -243,9 +243,22 @@ async def probe_many(
     return list(await asyncio.gather(*(one(item) for item in items)))
 
 
-def rank_working(results: Iterable[ProbeResult]) -> list[ProbeResult]:
+def rank_working(results: Iterable[ProbeResult], *, unique_ips: bool = False) -> list[ProbeResult]:
     """Proxies aprovados, do mais rapido ao mais lento (nao testados por ultimo)."""
-    return sorted((r for r in results if r.ok), key=lambda r: (not r.tested, r.seconds))
+    ranked = sorted((r for r in results if r.ok), key=lambda r: (not r.tested, r.seconds))
+    if not unique_ips:
+        return ranked
+    # Enderecos/portas diferentes podem sair pelo MESMO IP. Conserva o mais
+    # rapido para que workers independentes nao dividam o limite desse IP.
+    seen: set[str] = set()
+    distinct = []
+    for result in ranked:
+        if result.ip and result.ip in seen:
+            continue
+        if result.ip:
+            seen.add(result.ip)
+        distinct.append(result)
+    return distinct
 
 
 def estimate_seconds(count: int, timeout: float = DEFAULT_TIMEOUT_SECONDS,

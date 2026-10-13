@@ -49,7 +49,7 @@ src/
                              ▼ list[URL]
               ┌──────────────────────────────────┐
               │ pdf_exporter.export_pages_to_pdf │
-              │  - 4 workers (default), até 8    │
+              │  - 4 workers (default), até 32   │
               │  - sessões por grupo de proxies  │
               │  - HTML→PDF + SHA-256            │
               │  - circuit breaker login/CF      │
@@ -102,6 +102,8 @@ O limite do TDN é por IP e conta requests. A estratégia tem três partes:
 - Com uma saída, os workers compartilham contexto e limiter: sobrepõem carregamento/renderização sem multiplicar o ritmo permitido por IP
 - Os resultados continuam indexados pela posição original; conclusão fora de ordem não altera nomes nem ordem do consolidado. As métricas dos limiters são somadas no resumo
 - A preparação espera imagens e fontes do conteúdo, tornando imagens lazy eager depois de expandir seções, sem esperar scripts/iframes secundários do evento `load`
+- A etapa de impressão usa um semáforo com capacidade igual aos processadores lógicos. Assim, 16/32 workers podem carregar páginas sem imprimir todos os PDFs ao mesmo tempo
+- A triagem elimina IPs de saída repetidos, mantendo o endereço mais rápido; proxies que não informam IP continuam na lista
 
 Não confundir: desafio anti-bot / bloqueio de WAF (403) e tela de login contam no circuit breaker (5 seguidos abortam). Rate limit não conta — ele é esperado e tratado.
 

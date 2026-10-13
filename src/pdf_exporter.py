@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
@@ -306,6 +307,11 @@ class ExportAccumulators:
     # Sem proxies multiplos, os workers compartilham a sessao e o limiter.
     network_workers: list[tuple[BrowserSession, RateLimiter]] = field(default_factory=list)
     deferred_attempts: dict[str, int] = field(default_factory=dict)
+    # Navegacoes podem usar mais proxies que nucleos. A impressao em PDF
+    # usa CPU: limita so essa etapa, mantendo os downloads em paralelo.
+    pdf_slots: asyncio.Semaphore = field(
+        default_factory=lambda: asyncio.Semaphore(max(1, os.cpu_count() or 4)),
+    )
 
     def ordered_exports(self) -> list[tuple[Path, str]]:
         return [self.exported[index] for index in sorted(self.exported)]
@@ -748,7 +754,8 @@ async def _export_one(
 
         file_name = await _allocate_filename(index, title, acc, url=url)
         pdf_path = acc.pages_dir / file_name
-        size_bytes = await _generate_pdf(page, pdf_path)
+        async with acc.pdf_slots:
+            size_bytes = await _generate_pdf(page, pdf_path)
         elapsed_total = elapsed()
 
         await _record_export_result(

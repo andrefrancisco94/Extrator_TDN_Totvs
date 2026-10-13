@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.1] - 2026-10-13
+
+- CLI permite até 32 workers; perfil paralelo do menu passa de 8 para 16, com 2 s por saída
+- Impressão de PDFs limitada aos processadores lógicos, mantendo navegações/downloads em paralelo sem saturar essa etapa com todos os workers
+- Triagem elimina endereços com o mesmo IP de saída e mantém o mais rápido; evita somar o tráfego de workers independentes no mesmo IP
+- Validação de 16 proxies simultâneos, ordem do consolidado, limite de impressão e aceitação das novas opções pela CLI
+
 ## [0.12.0] - 2026-10-13
 
 - Exportação com proxies simultâneos: grupos exclusivos, navegador e rate limiter por worker. Trocas de proxy e cooldowns deixam de fechar/travar as páginas dos outros workers
