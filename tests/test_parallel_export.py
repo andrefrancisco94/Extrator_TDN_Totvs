@@ -186,3 +186,33 @@ def test_navegacoes_em_paralelo_respeitam_limite_de_impressao(tmp_path, mock_log
         assert all(outcome.status == exporter._OK for _page, outcome in outcomes)
 
     asyncio.run(run())
+
+
+def test_desafios_de_proxies_com_reserva_nao_acionam_breaker_global(tmp_path, mock_logger, monkeypatch):
+    async def run():
+        cfg, acc, sessions, limiters = _resources(tmp_path, mock_logger)
+        sessions[0].pool = ProxyPool(["http://proxy1:80", "http://reserva1:80"])
+        page = MagicMock()
+        monkeypatch.setattr(exporter, "_ensure_browser_alive", AsyncMock())
+        monkeypatch.setattr(exporter, "_slot_page", AsyncMock(return_value=page))
+        blocked = exporter.ExportOutcome(exporter._BLOCKED, "Cloudflare 403", session_failure=True)
+        one = AsyncMock(side_effect=[(page, blocked)] * 6 + [(page, exporter.ExportOutcome(exporter._OK))])
+        monkeypatch.setattr(exporter, "_export_one", one)
+        breaker = AsyncMock()
+        monkeypatch.setattr(exporter, "_bump_session_failures", breaker)
+        monkeypatch.setattr(limiters[0], "wait", AsyncMock())
+
+        async def rotate(session, limiter, *args, **kwargs):
+            await limiter.set_cooldown(0)
+            return True
+
+        monkeypatch.setattr(exporter, "rotate_exit_after_block", rotate)
+        assert await exporter._export_with_retries(
+            exporter._PageSlot(page, 0), sessions[0], "url", 1, 1,
+            acc, cfg, mock_logger, limiters[0], max_attempts=7,
+        )
+        breaker.assert_not_awaited()
+        assert one.await_count == 7
+        assert not acc.abort_requested
+
+    asyncio.run(run())

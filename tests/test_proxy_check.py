@@ -288,6 +288,30 @@ def test_lista_pequena_nao_passa_pela_triagem():
     assert len(pool) == 2
 
 
+def test_triagem_salva_lista_aprovada_sem_ips_repetidos(tmp_path, monkeypatch):
+    from src import main as main_module
+    from src.proxy import load_proxy_file
+    from src.proxy_check import ProbeResult
+
+    candidates = [f"http://proxy{i}:80" for i in range(6)]
+
+    async def fake_probe(*args, **kwargs):
+        return [
+            ProbeResult(candidates[0], True, 2, ip="1.2.3.4"),
+            ProbeResult(candidates[1], True, 1, ip="1.2.3.4"),
+            ProbeResult(candidates[2], True, 3, ip="5.6.7.8"),
+        ]
+
+    monkeypatch.setattr(main_module, "probe_many", fake_probe)
+    file = tmp_path / "aprovados.txt"
+    pool = asyncio.run(main_module._build_checked_pool(
+        candidates, None, "https://tdn.totvs.com/display/X/Pagina", LOGGER,
+        _quiet_console(), validated_file=file,
+    ))
+    assert load_proxy_file(file) == [candidates[1], candidates[2]]
+    assert len(pool) == 2
+
+
 # ----------------------------------------------------------------------------
 # Quarentena do proxy que falha
 # ----------------------------------------------------------------------------

@@ -74,6 +74,29 @@ def _valid_pdf(path: Path) -> None:
 # RateLimiter: Retry-After, ritmo adaptativo, workers
 # =============================================================================
 
+
+def test_troca_de_ip_restaura_ritmo_proprio_e_preserva_respostas_antigas():
+    async def run():
+        lim = RateLimiter(RateLimitConfig(base_delay_seconds=2))
+        started = time.monotonic()
+        await lim.report_block(retry_after=600)
+        await lim.report_block(retry_after=600)
+        assert lim.current_delay == 8
+        await lim.switch_exit("ip-a", "ip-b")
+        await lim.set_cooldown(0)
+        assert lim.current_delay == 2 and lim.consecutive_blocks == 0
+        # Um 429 do IP antigo nao altera o ritmo nem bloqueia o novo.
+        assert await lim.report_block(retry_after=600, started_at=started) == 0
+        assert lim.current_delay == 2 and lim.total_blocks == 2
+        await lim.report_block(retry_after=1)
+        assert lim.current_delay == 4
+        await lim.switch_exit("ip-b", "ip-a")
+        assert lim.current_delay == 8 and lim.consecutive_blocks == 2
+        await lim.switch_exit("ip-a", "ip-b")
+        assert lim.current_delay == 4 and lim.consecutive_blocks == 1
+
+    asyncio.run(run())
+
 def test_limiter_usa_retry_after_do_servidor():
     """O cooldown e o tempo informado pelo servidor (+ folga), nao um chute."""
     cfg = RateLimitConfig(base_delay_seconds=0.01, retry_after_margin_seconds=2.0)

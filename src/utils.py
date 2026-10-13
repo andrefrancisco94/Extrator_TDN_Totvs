@@ -163,6 +163,7 @@ class RateLimiter:
         self._wake = asyncio.Event()
         self._current_delay: float = max(0.0, config.base_delay_seconds)
         self._success_streak: int = 0
+        self._exit_rhythm: dict[str | None, tuple[float, int, int]] = {}
         # Metricas do run (mostradas no resumo final).
         self.total_blocks: int = 0
         self.total_wait_seconds: float = 0.0
@@ -331,6 +332,23 @@ class RateLimiter:
                     self._consecutive_blocks, cooldown, source, self._current_delay,
                 )
             return cooldown
+
+    async def switch_exit(self, previous: str | None, selected: str | None) -> None:
+        """Guarda o ritmo do IP anterior e restaura o da nova saida.
+
+        Um proxy livre nao herda a desaceleracao de um IP bloqueado. Quando
+        voltamos ao anterior, preservamos seu ajuste adaptativo. Timestamps
+        de bloqueio ficam intactos para reconhecer respostas antigas em voo.
+        """
+        if previous == selected:
+            return
+        async with self._lock:
+            self._exit_rhythm[previous] = (
+                self._current_delay, self._consecutive_blocks, self._success_streak,
+            )
+            self._current_delay, self._consecutive_blocks, self._success_streak = (
+                self._exit_rhythm.get(selected, (max(0.0, self.config.base_delay_seconds), 0, 0))
+            )
 
     async def set_cooldown(self, seconds: float) -> None:
         """Substitui o cooldown atual (ex: apos trocar para outro proxy, cujo

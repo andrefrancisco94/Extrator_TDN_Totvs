@@ -320,8 +320,11 @@ async def rotate_exit_after_block(
         if generation is not None and generation != session.generation:
             return True
         blocked_label = pool.current_label
+        previous_exit = pool.current
         pool.mark_blocked(cooldown)
         switched, wait = pool.pick_best()
+        if switched:
+            await limiter.switch_exit(previous_exit, pool.current)
         await limiter.set_cooldown(wait)
         if not switched:
             logger.warning(
@@ -358,10 +361,13 @@ async def note_exit_failure(
         if generation is not None and generation != session.generation:
             return True
         failed_label = pool.current_label
+        previous_exit = pool.current
         if not pool.mark_failed():
             return False
         switched, wait = pool.pick_best()
         if limiter is not None:
+            if switched:
+                await limiter.switch_exit(previous_exit, pool.current)
             await limiter.set_cooldown(wait)
         if switched:
             logger.warning(

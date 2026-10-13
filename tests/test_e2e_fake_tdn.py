@@ -501,6 +501,37 @@ def test_16_proxies_simultaneos_preservam_paginas_e_ordem(tmp_path, monkeypatch)
         srv.stop()
 
 
+def test_cinco_proxies_bloqueados_nao_abortam_16_workers_com_reservas(tmp_path, monkeypatch):
+    from src import pdf_exporter as exporter
+
+    srv = _server(leaves_per_branch=18, branches=1, deep=False)
+    proxies = [LocalProxy(f"127.0.0.{i}") for i in range(2, 34)]
+    original = exporter._export_one
+    injected = []
+
+    async def block_initial(page, session, *args, **kwargs):
+        if len(injected) < 5:
+            injected.append(session.proxy)
+            return page, exporter.ExportOutcome(
+                exporter._BLOCKED, "Cloudflare 403 simulado", session_failure=True,
+            )
+        await asyncio.sleep(0.1)
+        return await original(page, session, *args, **kwargs)
+
+    monkeypatch.setattr(exporter, "_export_one", block_initial)
+    try:
+        assert _run(srv, tmp_path, workers=16, proxies=[p.url for p in proxies]) == 0
+        assert len(set(injected)) == 5
+        assert len(_manifest(tmp_path)["exported"]) == len(srv.tree)
+        assert _manifest(tmp_path)["failures"] == {}
+        log = (tmp_path / "run.log").read_text(encoding="utf-8")
+        assert "Circuit breaker" not in log
+    finally:
+        for proxy in proxies:
+            proxy.stop()
+        srv.stop()
+
+
 def test_ctrl_c_no_meio_do_mapeamento_retoma_do_ponto_exato(tmp_path):
     """Run interrompido por excecao durante o crawl grava a fila; o seguinte
     conclui sem perder nenhuma pagina."""

@@ -104,6 +104,8 @@ O limite do TDN é por IP e conta requests. A estratégia tem três partes:
 - A preparação espera imagens e fontes do conteúdo, tornando imagens lazy eager depois de expandir seções, sem esperar scripts/iframes secundários do evento `load`
 - A etapa de impressão usa um semáforo com capacidade igual aos processadores lógicos. Assim, 16/32 workers podem carregar páginas sem imprimir todos os PDFs ao mesmo tempo
 - A triagem elimina IPs de saída repetidos, mantendo o endereço mais rápido; proxies que não informam IP continuam na lista
+- O `RateLimiter` guarda intervalo, sequência de sucessos e bloqueios por saída; uma troca usa o ajuste da nova saída. Timestamps de bloqueio permanecem disponíveis para reconhecer respostas antigas ainda em voo
+- Desafios de proxies com reservas são tratados pelo rodízio, sem somar falhas no circuit breaker global. Login e saídas sem alternativas mantêm essa proteção
 
 Não confundir: desafio anti-bot / bloqueio de WAF (403) e tela de login contam no circuit breaker (5 seguidos abortam). Rate limit não conta — ele é esperado e tratado.
 

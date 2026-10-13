@@ -951,7 +951,12 @@ async def _export_with_retries(
             attempt -= 1
             continue
 
-        if outcome.session_failure:
+        # Um desafio/403 vindo de um proxy nao descreve a sessao inteira:
+        # havendo outras saidas no grupo, o rodizio trata essa falha. Login
+        # e bloqueio sem alternativas continuam protegidos pelo breaker.
+        if outcome.session_failure and not (
+            outcome.status == _BLOCKED and session.pool is not None and session.pool.can_rotate
+        ):
             await _bump_session_failures(acc, logger)
 
         if outcome.status == _BLOCKED:

@@ -124,7 +124,10 @@ async def run_pipeline(
         # NAO chama release — lock nunca foi adquirido por este processo
         return 2
     try:
-        pool = await _build_checked_pool(proxies, proxy, start_url, logger, console)
+        pool = await _build_checked_pool(
+            proxies, proxy, start_url, logger, console,
+            validated_file=output_dir / "proxies_aprovados.txt",
+        )
         return await _run_pipeline_inner(
             start_url, output_dir, consolidated_name, headless, timeout_seconds,
             max_pages, slow_threshold_seconds, auto_confirm, force_recrawl,
@@ -188,6 +191,7 @@ def _progress_printer(console, label: str):
 
 async def _build_checked_pool(
     proxies: list[str | None] | None, proxy: str | None, start_url: str, logger, console,
+    validated_file: Path | None = None,
 ) -> ProxyPool:
     """Monta o rodizio; lista grande passa antes pela triagem.
 
@@ -233,7 +237,13 @@ async def _build_checked_pool(
         f"o run usa so esses, do mais rapido ({working[0].seconds:.1f}s) "
         f"ao mais lento ({working[-1].seconds:.1f}s)."
     )
-    return ProxyPool(_with_direct([item.proxy for item in working], exits))
+    approved = _with_direct([item.proxy for item in working], exits)
+    if validated_file is not None:
+        try:
+            save_proxy_file(validated_file, approved)
+        except OSError as exc:
+            logger.warning("Nao foi possivel salvar os proxies aprovados: %s", exc)
+    return ProxyPool(approved)
 
 
 def _resume_hint(force_recrawl: bool, force_reexport: bool) -> tuple[str, str]:

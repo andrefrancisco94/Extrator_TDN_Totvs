@@ -5,6 +5,9 @@
 - CLI permite até 32 workers; perfil paralelo do menu passa de 8 para 16, com 2 s por saída
 - Impressão de PDFs limitada aos processadores lógicos, mantendo navegações/downloads em paralelo sem saturar essa etapa com todos os workers
 - Triagem elimina endereços com o mesmo IP de saída e mantém o mais rápido; evita somar o tráfego de workers independentes no mesmo IP
+- Ajuste de velocidade guardado por saída: um proxy livre começa no intervalo base, sem herdar a desaceleração do IP bloqueado. Ao retornar a um IP anterior, recupera seu ajuste
+- Bloqueios/desafios de proxies com reservas deixam de acionar o circuit breaker global; login e sessões sem alternativas mantêm essa proteção
+- Grava `proxies_aprovados.txt` na pasta do job para retomadas com uma lista menor, revalidada antes do uso
 - Validação de 16 proxies simultâneos, ordem do consolidado, limite de impressão e aceitação das novas opções pela CLI
 
 ## [0.12.0] - 2026-10-13
