@@ -2,8 +2,9 @@
 
 ## [0.12.1] - 2026-10-13
 
-- CLI permite até 32 workers; perfil paralelo do menu passa de 8 para 16, com 2 s por saída
-- Impressão de PDFs limitada aos processadores lógicos, mantendo navegações/downloads em paralelo sem saturar essa etapa com todos os workers
+- CLI permite até 32 workers; perfil paralelo do menu passa de 8 para 12, com 2 s por saída
+- Impressão de PDFs limitada à metade dos processadores lógicos, mantendo capacidade para navegações/downloads em paralelo
+- Libera o conteúdo da aba depois de salvar o PDF e reutiliza a aba inicial das sessões independentes, reduzindo DOM, timers e abas vazias sem perder cookies/cache HTTP
 - Triagem elimina endereços com o mesmo IP de saída e mantém o mais rápido; evita somar o tráfego de workers independentes no mesmo IP
 - Ajuste de velocidade guardado por saída: um proxy livre começa no intervalo base, sem herdar a desaceleração do IP bloqueado. Ao retornar a um IP anterior, recupera seu ajuste
 - Bloqueios/desafios de proxies com reservas deixam de acionar o circuit breaker global; login e sessões sem alternativas mantêm essa proteção

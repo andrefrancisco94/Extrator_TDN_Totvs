@@ -310,7 +310,7 @@ class ExportAccumulators:
     # Navegacoes podem usar mais proxies que nucleos. A impressao em PDF
     # usa CPU: limita so essa etapa, mantendo os downloads em paralelo.
     pdf_slots: asyncio.Semaphore = field(
-        default_factory=lambda: asyncio.Semaphore(max(1, os.cpu_count() or 4)),
+        default_factory=lambda: asyncio.Semaphore(max(1, (os.cpu_count() or 4) // 2)),
     )
 
     def ordered_exports(self) -> list[tuple[Path, str]]:
@@ -770,6 +770,12 @@ async def _export_one(
             "PDF gerado (%s/%s) em %.1fs (%.1f KB, %d requests): %s",
             index, total, elapsed_total, size_bytes / 1024, requests, file_name,
         )
+        # PDF ja salvo: libera DOM, imagens e timers do Confluence durante a
+        # espera pela proxima URL. Cookies e cache HTTP ficam no context.
+        try:
+            await page.goto("about:blank", wait_until="commit", timeout=5_000)
+        except PlaywrightError:
+            pass
         return page, ExportOutcome(_OK, elapsed=elapsed_total)
 
     except LoginPageError as exc:
@@ -1383,7 +1389,8 @@ async def _worker_loop(
     max_attempts: int,
 ) -> None:
     """Loop de um worker paralelo: pega URL da fila, exporta, repete."""
-    slot = _PageSlot(page=None, generation=session.generation)
+    independent = len(acc.network_workers) > 1
+    slot = _PageSlot(page=session.page if independent else None, generation=session.generation)
     processed = 0
     try:
         while True:
@@ -1420,6 +1427,7 @@ async def _worker_loop(
                         await _export_with_retries(
                             slot, session, url, index, total, acc, cfg, logger, limiter,
                             max_attempts=max_attempts,
+                            adopt_session_page=independent,
                         )
                     except _DeferExport:
                         queue.put_nowait(item)

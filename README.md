@@ -54,7 +54,7 @@ py -m venv .venv
 - `--request-delay 2.0` — intervalo **inicial** entre requests; o extrator aumenta sozinho após um bloqueio e volta a reduzir aos poucos
 - `--backoff-initial 30` / `--backoff-max 900` — cooldown usado quando o servidor bloqueia **sem** informar `Retry-After`
 - `--max-block-wait 7200` — espera máxima por um único bloqueio; acima disso o run para com o progresso salvo (código de saída 3)
-- `--max-workers 4` — workers paralelos para PDFs (padrão 4; máximo 32). Com vários proxies, cada worker usa um grupo exclusivo de saídas, com navegador e espera próprios; sem eles, as abas compartilham o intervalo por IP. O perfil paralelo do menu usa 16; a impressão em PDF tem concorrência limitada aos processadores lógicos, permitindo mais downloads sem multiplicar as impressões simultâneas
+- `--max-workers 4` — workers paralelos para PDFs (padrão 4; máximo 32). Com vários proxies, cada worker usa um grupo exclusivo de saídas, com navegador e espera próprios; sem eles, as abas compartilham o intervalo por IP. O perfil paralelo do menu usa 12; a impressão em PDF usa até metade dos processadores lógicos (mínimo 1), reservando capacidade para carregar as próximas páginas
 - `--proxy URL` — proxy de saída; repita a flag (ou separe por vírgula) para vários
 - `--proxy-file proxies.txt` — arquivo com um proxy por linha
 - `--no-proxy` — ignora arquivo de proxies e variáveis `HTTP_PROXY`/`HTTPS_PROXY`
@@ -85,8 +85,8 @@ py -m venv .venv
 # Termina só o que faltou num job existente (URL lida do manifest)
 python -m src.main resume --output-dir output/area --mode retry-failed
 
-# Job grande: até 16 saídas em paralelo, mantendo 2s entre páginas por saída
-python -m src.main resume --output-dir "C:\Extrator" --max-workers 16 --request-delay 2 --proxy-file proxies.txt
+# Job grande: até 12 saídas em paralelo, mantendo 2s entre páginas por saída
+python -m src.main resume --output-dir "C:\Extrator" --max-workers 12 --request-delay 2 --proxy-file proxies.txt
 
 # Modo silencioso (suprime banners/progresso, só erros)
 python -m src.main run URL --quiet --yes
@@ -146,7 +146,8 @@ python -m src.main run URL --proxy-file proxies.txt
 - **Lista grande (6+ proxies) passa por triagem** no início de cada run: um request leve por proxy, em paralelo e sem browser (2000 proxies levam cerca de 2 a 3 min). Só entram os que respondem, do mais rápido ao mais lento. `python -m src.main proxy test` faz o mesmo teste e oferece regravar o `proxies.txt` só com os aprovados (`--prune`; o original fica em `proxies.txt.bak`). `TDN_SKIP_PROXY_CHECK=1` desliga a triagem.
 - A exportação PDF salva os selecionados em `<pasta do job>/proxies_aprovados.txt`. Para uma retomada próxima, use esse arquivo em `--proxy-file`: ele é revalidado, mas evita testar novamente milhares de endereços que já falharam. A lista original permanece disponível para uma nova triagem completa.
 - **Listas públicas/gratuitas de proxy rendem pouco**: a maioria dos endereços está morta, os vivos são lentos e instáveis, e muitos já estão banidos no Cloudflare. A triagem e a quarentena evitam que o run trave neles, mas poucos proxies bons (pagos ou seus) funcionam melhor que milhares de públicos.
-- **Intervalo por saída:** use inicialmente 2 s, inclusive com 16 workers. Os workers aumentam a concorrência entre saídas sem diminuir o intervalo de cada IP. No menu, o modo "Paralelo com proxies" configura 16 workers e 2 s. Se houver menos proxies utilizáveis que workers, usa uma sessão por proxy; sem proxies múltiplos, usa abas no mesmo navegador. A triagem mantém o proxy mais rápido quando vários endereços informam o mesmo IP de saída. O limite do servidor continua valendo por IP.
+- **Intervalo por saída:** use inicialmente 2 s, inclusive com 12 workers. Os workers aumentam a concorrência entre saídas sem diminuir o intervalo de cada IP. No menu, o modo "Paralelo com proxies" configura 12 workers e 2 s. Se houver menos proxies utilizáveis que workers, usa uma sessão por proxy; sem proxies múltiplos, usa abas no mesmo navegador. A triagem mantém o proxy mais rápido quando vários endereços informam o mesmo IP de saída. O limite do servidor continua valendo por IP.
+- Depois de salvar o PDF, o extrator descarrega o conteúdo da aba para liberar DOM, imagens e timers durante a espera. Cookies e cache HTTP permanecem disponíveis para a próxima navegação. Sessões independentes reutilizam a aba criada no lançamento, sem manter uma aba vazia adicional por worker.
 - `proxies.txt` pode conter senha: está no `.gitignore`. Nos logs as credenciais aparecem mascaradas.
 - O extrator não fornece proxies; use um serviço/servidor seu.
 

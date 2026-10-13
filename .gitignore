@@ -52,6 +52,7 @@ slow_pages.log
 
 # Lista de proxies (pode conter usuario/senha)
 proxies.txt
+proxies_aprovados.txt
 
 # Logs
 *.log

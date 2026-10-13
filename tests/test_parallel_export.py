@@ -177,7 +177,7 @@ def test_navegacoes_em_paralelo_respeitam_limite_de_impressao(tmp_path, mock_log
         monkeypatch.setattr(exporter, "_verify_page_assets", AsyncMock())
         monkeypatch.setattr(exporter, "_generate_pdf", print_pdf)
         monkeypatch.setattr(exporter, "_record_export_result", AsyncMock())
-        pages = [MagicMock(title=AsyncMock(return_value=f"Pagina {i}")) for i in range(8)]
+        pages = [MagicMock(title=AsyncMock(return_value=f"Pagina {i}"), goto=AsyncMock()) for i in range(8)]
         outcomes = await asyncio.gather(*(
             exporter._export_one(page, sessions[0], f"url-{i}", i, 8, acc, cfg, mock_logger)
             for i, page in enumerate(pages, 1)

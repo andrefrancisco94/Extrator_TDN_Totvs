@@ -427,7 +427,7 @@ echo em paralelo; com varios proxies, cada saida tem navegador e espera proprios
 echo.
 echo   [1] Seguro               ^(2s/saida, 4 workers, timeout 180s^) - RECOMENDADO
 echo   [2] Medio                ^(1s/saida, 4 workers, timeout 150s^)
-echo   [3] Paralelo com proxies ^(2s/saida, 16 workers, timeout 120s^)
+echo   [3] Paralelo com proxies ^(2s/saida, 12 workers, timeout 120s^)
 echo   [4] Personalizado
 echo   [0] Voltar
 echo.
@@ -460,10 +460,10 @@ if "%SP%"=="3" (
     set "REQUEST_DELAY=2.0"
     set "BACKOFF_INITIAL=120"
     set "BACKOFF_MAX=1800"
-    set "WORKERS=16"
+    set "WORKERS=12"
     set "TIMEOUT=120"
     set "SLOW=60"
-    echo Modo paralelo ativado: ate 16 saidas simultaneas, preservando o intervalo por IP.
+    echo Modo paralelo ativado: ate 12 saidas simultaneas, preservando o intervalo por IP.
     goto MENU
 )
 if "%SP%"=="4" goto SPEED_CUSTOM
